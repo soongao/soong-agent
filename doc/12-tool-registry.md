@@ -1,0 +1,282 @@
+# Tool Registry
+
+- 采用分层工具系统:
+	- 底层 `ToolAdapter`.
+	- 上层 `ToolRegistry` 负责权限、并发、查找、执行和 result normalize.
+- 所有 tool 来源进入 registry 后都转成统一 tool definition / tool result.
+- Tool canonical name:
+	- registry 内 canonical tool name 必须全局唯一.
+	- 对模型暴露点号命名, 例如 `code.read_file`, `mcp.<server_id>.<tool_name>`, `agent.create_sub_agent`, `internal.load_skill`.
+	- duplicate canonical name 在注册/启动时报错.
+	- 不覆盖、不自动加后缀.
+	- permission / hook / routing / replay 全部基于 canonical tool name.
+	- provider raw tool name 只保留在 metadata/debug.
+- Provider tool name mangling:
+	- 如果 provider 不支持点号工具名, adapter 做可逆 name mangling.
+	- core 内仍使用 canonical name.
+	- 发给 provider 前可转换成 provider-safe name, 例如 `internal__load_skill`.
+	- 收到 tool call 后必须映射回 canonical name.
+	- metadata 记录 raw provider tool name.
+- Tool definition 字段:
+	- name: canonical tool name.
+	- description.
+	- input_schema.
+	- permission: readonly / write.
+	- tags: set[str].
+	- metadata.
+- Tool tags 示例:
+	- internal
+	- readonly
+	- write
+	- agent
+	- mcp
+	- code
+	- declarative
+	- dangerous
+	- filesystem
+	- network
+- permission / hook / config 可按 canonical name pattern + tags 匹配.
+- 每个 run 计算 effective tool set:
+	- registry 保存所有已注册工具.
+	- run 启动前根据 agent_type, mode, permissions, config, task policy 选择本轮暴露给模型的 tools.
+	- AgentDefinition.suggested_tools 只作为工具偏好输入, 不作为权限授权.
+	- 未传 agent tool allowed_tools 时, 子 agent 使用其 agent type / mode / default policy 的默认工具集合.
+	- 子 agent 不直接继承父 agent 当前 effective tool set.
+	- sub agent 可以限制工具范围.
+	- 未进入 effective tool set 的工具不暴露给模型.
+- 内置 default_worker_agent 的默认 effective tool set 使用最小 worker 集合:
+	- `agent.task_get`
+	- `agent.task_query_steps`
+	- `agent.task_claim_step`
+	- `agent.task_update_step`
+	- 常规只读文件工具, 例如 `code.read_file`.
+- default_worker_agent 默认不暴露写文件工具.
+- worker run 需要写工具时, 必须通过 worker 配置 / dispatch allowed_tools 显式请求, 并且仍要通过 mode、role、config 和 permission policy 收敛.
+- sub/fork/worker agent 不允许直接写长期 memory.
+- `internal.recall_memory` 是只读 internal tool, 可以把选中的 memory 注入 `memory_context` node.
+- `internal.recall_memory` 默认只进入 main agent / Orchestrator 的 effective tool set; sub/fork/worker agent 永远不暴露该工具.
+- Memory Writer 不是普通 agent run 的 tool, 不进入 main/Orchestrator/sub/fork/worker 的 effective tool set.
+- Memory Writer 只供 Memory Extraction Job 使用, 写入边界固定为 `~/.agent/memory`.
+- 静态 system prompt 可以说明所有内置工具类别和使用规则.
+- provider 实际收到的 tool schema 只包含当前 run 的 effective tool set.
+- effective tool set 是权限硬边界, system prompt 只是行为指导.
+- 第一版不实现真实 `tool.select` / `toolSelect` 工具.
+- 模型通过 system prompt 自行选择工具; core 只负责暴露可用工具子集和校验调用.
+- 如果模型调用未进入 effective tool set 的工具, core 返回 `tool_not_available`.
+- sub agent / worker sub agent / fork agent 的黑名单规则写死在 effective tool set 计算中:
+	- 不暴露 plan tool.
+	- 不暴露 Task DAG 创建/内容修改工具.
+	- 不暴露 create_sub_agent / fork_agent / list_agent_definitions / list_workers / dispatch_worker.
+	- 只暴露其允许查询 ready step、claim step、读取或更新自己 claimed step 的 Task 工具.
+- Tool input schema:
+	- Registry 内部统一使用 JSON Schema dict.
+	- Python code tool 可以用 Pydantic model, 注册时导出 JSON Schema.
+	- `.agent/tools/*.json` 直接提供 JSON Schema.
+	- MCP tools 转成 JSON Schema.
+	- handler 执行前由 core 做参数校验.
+- Tool JSON Schema 使用 core 支持子集:
+	- 支持 object, string, number, integer, boolean, array.
+	- 支持 enum, required, description.
+	- 支持 nested object 和 nested array.
+	- 第一版不支持 oneOf / anyOf / allOf.
+	- 第一版不支持 `$ref`.
+	- 第一版不支持 if/then/else 等 conditionals.
+	- 第一版不支持 patternProperties.
+	- registry 在工具注册/启动时先校验 core schema 子集.
+	- provider/model 兼容性在 run 启动前、组装 `ModelRequest` 时校验.
+	- 如果当前 provider/model 不支持某个 schema, run 直接 failed, 不等到模型调用时失败.
+- Python code tool 注册方式:
+	- 支持显式 `registry.register_tool(...)`.
+	- 支持 decorator 语法糖.
+	- 复杂 tool 可以实现 `ToolAdapter`.
+- Tool handler 返回值:
+	- 复杂工具推荐返回 `ToolResult`.
+	- 简单工具可以返回 `str / dict / list / int / bool / None`.
+	- core 自动包装成统一 `ToolResult`.
+- `ToolResult` 必须关联 tool_call_id:
+	- 每个 tool result 都必须带 tool_call_id.
+	- tool_call_id 来自 provider tool call id 或 core 生成 id.
+	- assistant tool_call 和 tool result 通过 tool_call_id 稳定配对, 不按顺序猜测.
+	- `ToolResult.content` 复用通用 ContentBlock, 支持 text/json/artifact_ref 等.
+- readonly/write 权限只表示外部副作用或 workspace 修改风险; `load_skill` / `recall_memory` 这类 internal readonly tool 允许写 core 内部 context node, 不算 write.
+- Tool call id 由 adapter 映射:
+	- provider 有 tool_call_id 时映射到 core `tool_call_id`.
+	- provider 没有 id 时由 adapter/core 生成.
+	- provider raw id 保留到 metadata, 方便 debug/replay.
+- Tool 来源:
+	- code tools: SDK/CLI 代码注册的内置工具.
+	- MCP tools: 从用户级 MCP server 动态发现.
+	- agent tools: list_agent_definitions / create_sub_agent / fork_agent / list_workers / dispatch_worker / inspect_agent 等.
+	- plan/task tools: 内置 plan template tool 和 Task DAG tools.
+	- declarative tools: 用户级 `~/.agent/tools/*.json`.
+- Memory Writer 属于 Memory Extraction Job 的内部受限能力, 不注册成普通 provider-visible tool.
+- 内置 Task DAG tools 至少包括:
+	- agent.task_template
+	- agent.task_create
+	- agent.task_get
+	- agent.task_list
+	- agent.task_update
+	- agent.task_query_steps
+	- agent.task_claim_step
+	- agent.task_update_step
+	- agent.task_complete
+	- agent.task_fail
+	- agent.task_cancel
+- agent tools 对父/Orchestrator 表现为普通 tool call / ToolResult, 但 handler 内部可以启动 child/sub/worker agent run.
+- agent tools 启动子 agent 时通过 AgentDefinitionRegistry 解析 agent_definition_id.
+- 声明式 tools 只支持用户级 `~/.agent/tools/*.json`, 项目目录不声明 executable tool.
+- `.agent/tools/*.json` 执行协议:
+	- stdin JSON 输入.
+	- stdout JSON 输出, 必须复用 `ToolResult` schema.
+	- stderr 作为日志/错误信息.
+	- exit code 非 0 视为 tool error.
+- Command/declarative tool 执行环境:
+	- 默认 working directory 使用 session.cwd.
+	- tool definition 可以声明更具体的 `working_dir`, 但必须经过允许范围校验.
+	- 不允许模型在 tool call 中直接指定 cwd.
+	- 默认使用最小 env allowlist.
+	- 默认只传 PATH / HOME / TMPDIR 等必要环境变量和 config 显式允许的 env.
+	- secret env 不默认透传.
+	- tool 需要 secret/env 时必须通过配置显式声明.
+- Command/declarative tool timeout:
+	- config 提供 `tools.default_timeout_ms`.
+	- config 提供 `tools.max_timeout_ms`.
+	- tool definition 可以声明 `timeout_ms`.
+	- tool timeout override 不能超过 `tools.max_timeout_ms`.
+	- 不允许模型在 tool call 中提高 timeout.
+- Command output 处理:
+	- 小 stdout/stderr 可以进入 tool_result content 或 summary.
+	- 大 stdout/stderr 写 artifact.
+	- tool_result 只保留 summary + artifact_ref.
+	- stderr 默认作为日志/debug.
+	- exit code 非 0 时, stderr 摘要进入 error tool_result.
+- Command tool 支持两种模式:
+	- `command_type=exec`: 使用 argv list, 默认优先.
+	- `command_type=shell`: 允许复杂 shell 命令, 但必须标记 dangerous 或 write, 并经过 permission/hook.
+- Declarative command tool JSON schema:
+	- name.
+	- description.
+	- input_schema.
+	- permission.
+	- tags.
+	- command_type.
+	- command.
+	- args.
+	- working_dir.
+	- env_allowlist.
+	- timeout_ms.
+	- stdout_limit_bytes.
+	- stderr_limit_bytes.
+	- 未知字段默认报错.
+- Declarative command args 支持受限模板:
+	- 只允许 `{{args.field_name}}` 字段替换.
+	- 替换值来自已通过 tool input schema 校验的参数.
+	- `exec` 模式下每个 argv 独立替换, 不拼接 shell 字符串.
+	- `shell` 模式模板更严格, 且必须标记 dangerous 或 write.
+- Tool execution 写入时机:
+	- 执行前写 tool_started event.
+	- tool handler 可以异步执行, 期间通过 event stream 暴露进度.
+	- 当前 agent loop 必须等待本轮所有 tool calls 完成后, 才能继续下一次模型请求或结束本轮.
+	- tool 完成后, 在同一事务里写最终 tool result node 和 tool_completed/tool_failed event.
+	- context tree 只写最终 tool result node, 不写 pending tool result node.
+	- 第一版不支持 tool 调用脱离当前 loop 后台继续运行.
+- Tool abort:
+	- 用户 abort tool 时, 写 tool_result node.
+	- `is_error: true`.
+	- metadata 标记 aborted, partial, abort_reason.
+	- 大 partial stdout/stderr artifact 化.
+	- 写 aborted_tools / tool_failed event.
+	- run end_reason 为 aborted_tools.
+- Tool 权限第一版只分:
+	- readonly
+	- write
+- 文件系统写入边界:
+	- write tool 默认只能写 session.cwd 下的路径.
+	- 可通过配置增加 `allowed_write_roots`.
+	- `/tmp` / TMPDIR 是否允许写入作为独立配置项.
+	- 超出允许根目录的写入默认 deny, 或由调用方升级为显式用户确认.
+	- 所有写入目标必须先 normalize 并 resolve symlink.
+	- resolve 后再判断是否位于 allowed roots 下.
+	- 禁止通过软链逃逸写入边界.
+- 网络权限:
+	- 可能联网的工具使用 `network` tag 标记.
+	- MCP server 可以整体标记 network.
+	- config / permission policy 可以限制 network 工具是否启用.
+	- config / permission policy 可以要求 network 工具每次确认.
+	- config / permission policy 可以配置允许的 host/domain.
+- dangerous tag:
+	- 高风险工具或 shell command 使用 `dangerous` tag.
+	- dangerous 工具必须显式用户确认.
+	- dangerous 工具不允许 allow for session.
+	- hook / permission policy 可以按 dangerous tag 拦截.
+- 并发策略:
+	- 按模型输出顺序分组调度 tool calls.
+	- agent tools 是独立并发类别, 包括 create_sub_agent / fork_agent / dispatch_worker.
+	- 同一轮中相邻或可安全并行的多个 agent tools 可以并行启动 child/sub/worker agent run.
+	- agent tools 并发仍受 max_children_per_run、max_concurrent_children_per_session、worker pool 空闲状态和权限限制.
+	- 当前 agent loop 必须等待并行 agent tools 全部完成并写入最终 tool result 后, 才能继续下一次模型请求或结束本轮.
+	- 连续 readonly tool calls 批量并行.
+	- write tool call 是调度边界.
+	- write tool call 按模型输出顺序串行执行.
+	- write 前后的 readonly batch 不跨边界并行.
+- 同一轮 tool call 失败后的策略:
+	- 并行 agent tools 默认使用 wait_all failure policy.
+	- 某个 agent tool 失败时, 不自动取消同组其他并行 agent tools.
+	- core 等待同组 agent tools 全部完成后, 分别写入成功或失败的最终 tool result.
+	- 父/Orchestrator 在下一次模型请求中同时看到成功和失败结果, 由模型决定是否重试、改派或取消任务.
+	- readonly 失败继续执行后续安全 tool calls.
+	- write 失败停止后续 tool calls.
+	- 失败结果写入 `tool_result`, `is_error: true`, 并返回模型下一轮处理.
+- 模型调用未启用工具时:
+	- 如果 tool name 不在本轮 effective tool set, 写 `tool_result is_error=true`.
+	- error type 为 `tool_not_available`.
+	- 同时写 tool_failed / tool_denied event.
+	- 返回模型下一轮自我修正.
+	- 若反复发生, 由 max_turns / failed 等高层机制结束.
+- 权限确认:
+	- readonly 自动允许.
+	- write 默认询问用户.
+	- 支持 allow once / allow for session / deny once / deny for session.
+	- 授权/拒绝规则不持久化, 只在当前 session 内存保存.
+	- session 记忆按 canonical tool name + normalized target scope 记录.
+	- target scope 例如某个已 resolve 的目录、host/domain 或其他工具定义的资源范围.
+	- 不按 tool name 授权任意目标.
+	- deny 只有用户显式选择 deny for session 才写入 session 记忆.
+	- Permission prompt 由 SDK core 通过 callback 请求确认, 调用方负责展示 UI/CLI.
+	- main / Orchestrator / sub / worker / fork agent 的写工具权限确认都走同一个 SDK permission callback.
+	- 子 agent 触发的 permission request 必须包含 agent_id, run_id, parent_agent_id, parent_run_id 和 agent role, 方便调用方/UI 展示请求来源.
+	- 如果调用方没有提供 permission callback, 默认 deny write tool.
+	- Permission callback async-first: `permission_callback(request) -> Awaitable[PermissionDecision]`.
+	- CLI 可以用同步输入封装 async callback.
+	- Server/Web 可以挂起等待前端确认.
+	- Permission request 包含风险摘要和展示所需字段:
+		- canonical tool name.
+		- permission.
+		- tags.
+		- args 摘要.
+		- target scope.
+		- cwd.
+		- env 摘要.
+		- network host/domain.
+		- dangerous 标记.
+		- PreToolUse hook 结果.
+		- suggested decision.
+	- Permission decision 固定枚举:
+		- allow_once.
+		- allow_for_session.
+		- deny_once.
+		- deny_for_session.
+	- Permission decision 可带 reason 和 metadata.
+	- Permission callback 不允许 patch tool args, 不允许直接执行工具.
+	- Permission callback 超时或异常时默认 deny.
+	- callback 失败时写 permission_failed / tool_denied event.
+	- callback 失败时生成 `tool_result is_error=true`, 返回模型下一轮处理.
+	- permission deny 语义和 PreToolUse hook deny 一样: 写 `tool_result is_error=true`, 停止后续 tool calls, 返回模型.
+- Tool 执行顺序固定为 PreToolUse hook -> Permission callback -> tool execution.
+- Tool 执行前先跑 PreToolUse hook, hook allow 后再做 permission 判断.
+- PreToolUse hook deny 后的策略:
+	- 不再调用 Permission callback.
+	- readonly deny 继续执行后续安全 tool calls.
+	- write deny 停止后续 tool calls.
+	- 被 deny 的 tool 写入 `tool_result`, `is_error: true`, 同时写 denied event.
+- Tool 执行失败包装成 tool_result 交给模型处理.

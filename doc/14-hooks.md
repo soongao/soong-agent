@@ -1,0 +1,63 @@
+# Hooks
+
+- Hook 配置参考 Claude Code / Trae 风格, 使用 JSON:
+	- `~/.agent/hooks.json`
+	- `<project>/.agent/hooks.json`
+- 项目级 hooks 的安全边界:
+	- 项目级 hooks 默认受 config 开关控制.
+	- 调用方可以禁用项目级 hooks.
+	- 项目级 command hook 属于项目提供的可执行配置, 默认必须满足 trusted project mode 或运行时显式确认后才启用.
+	- hooks.json 只声明 hook 规则, 不绕过 permission / sandbox / timeout.
+	- hook command 复用 command/declarative tool 的 command runner、sandbox、env allowlist、working_dir 校验和 timeout 规则.
+- Hook 配置结构:
+	- 顶层 `version`.
+	- `hooks` 下按事件分组.
+	- 每个事件是规则数组.
+	- 规则可带 `matcher`.
+	- 规则内包含多个 hook.
+- Hook matcher 第一版只支持简单匹配:
+	- event type 精确匹配.
+	- canonical tool name 精确匹配.
+	- tag 精确匹配.
+	- path prefix 匹配.
+	- 不支持正则、glob 或复杂表达式.
+- 第一版 hook 类型主要是 command:
+	- `{ "type": "command", "command": "..." }`
+- Hook 协议:
+	- stdin JSON 输入.
+	- stdout JSON 输出, 格式为 `{ "decision": "allow" | "deny", "reason": "...", "metadata": {}, "logs": [] }`.
+	- stdout JSON 决定 allow / deny.
+	- exit code 非 0 才认为 hook failed.
+	- stderr 作为日志记录到 event/debug, stderr 非空不影响 hook decision.
+- Hook 触发点:
+	- SessionStart
+	- UserPromptSubmit
+	- PreToolUse
+	- PostToolUse
+	- Stop
+- Hook 能力边界:
+	- 第一版只允许阻止, 不允许 patch prompt/context/tool args/tool result.
+	- PreToolUse 可以 deny tool, 对应 tool_denied / hook_denied; 不直接产生 aborted_tools.
+	- Stop 可以 deny loop 结束, 对应 stop_hook_prevented.
+	- PostToolUse 第一版只观察, 不阻止、不 patch tool result.
+	- 其他 hook event 第一版只观察, 不阻止、不 patch.
+	- UserPromptSubmit 第一版不能阻止用户输入.
+- Plan 没有专门 hook:
+	- plan tool 只返回写作模板 context block.
+	- Plan 文件由普通 write/edit tool 创建.
+	- write/edit tool 的 PreToolUse / PostToolUse hook 已覆盖 Plan 文件写入.
+	- core 不定义 PlanModeComplete hook.
+- PostToolUse hook 输入:
+	- 小 tool result 传全文.
+	- 大 tool result 先 artifact 化, hook 只收到 summary + artifact_ref.
+- Stop hook deny 后:
+	- 写 hook_denied / stop_hook_prevented event.
+	- 不结束 loop.
+	- 写内部 system_note 或 hook_context node.
+	- 该 node 在下一轮映射为 synthetic user/context message.
+	- 内容说明 Stop hook prevented completion 和 hook reason.
+	- 不提升为 system 指令.
+	- 让模型根据 hook reason 继续执行.
+- Hook 默认串行执行, 按配置顺序.
+- Hook 支持 timeout.
+- Hook 失败默认记录错误但不中断 loop, 除非返回明确 deny.

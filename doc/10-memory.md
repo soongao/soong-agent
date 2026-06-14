@@ -1,0 +1,135 @@
+# Memory
+
+- Memory 是用户级长期知识.
+- 第一版只支持用户级 memory, 固定落在 `~/.agent/memory`.
+- 第一版不支持项目记忆:
+	- 不存在 `<project>/.agent/memory`.
+	- 不把项目文件、Task DAG、Plan 正文或完整 transcript 当作可恢复的项目记忆源.
+	- 项目级配置可以关闭当前项目的 memory 能力, 但不能声明项目 memory 目录.
+- Memory 自动提取自动写入, 但不是 fork agent / sub agent / child agent.
+- Memory Extraction Job:
+	- 是 core 内部的后台 job.
+	- 不创建 agent_id.
+	- 不创建 run_id.
+	- 不进入 agent tree.
+	- 不占用 child/sub/fork agent 并发名额.
+	- 不通过 `agent.create_sub_agent` 或 `agent.fork_agent` 创建.
+	- 使用独立可配置的模型配置 `memory.extract_model_profile`.
+	- `memory.extract_model_profile` 未配置时, 默认完全使用主模型配置.
+	- 可以像主模型一样配置 provider / base_url / api_key_env / model name / context window / output tokens / temperature / timeout / retry.
+	- 通过受限 Memory Writer 直接创建/更新 `~/.agent/memory` 下的 memory md 和 `MEMORY.md`.
+	- 不返回候选 memory 给 core 再由 core 改写或代写.
+	- core 仍负责路径、schema、敏感信息和写入边界校验.
+- Core 负责:
+	- 持久化 context.
+	- 根据触发条件调度 Memory Extraction Job.
+	- 提供待扫描 context range、`MEMORY.md` catalog 和现有 memory frontmatter.
+	- 为 Memory Extraction Job 构造模型请求.
+	- 提供只能写 `~/.agent/memory` 的受限 Memory Writer.
+	- 校验 memory 文件路径不能逃逸 `~/.agent/memory`.
+	- 校验 memory frontmatter 和 `source_node_ids`.
+	- 写 memory_extraction lifecycle event 和审计信息.
+- Memory Extraction Job 负责:
+	- 判断是否值得写入 memory.
+	- 判断类别: user / feedback / reference.
+	- 生成 memory md.
+	- 判断 new / duplicate / update / conflict / ignore.
+	- 维护 `MEMORY.md` 目录.
+	- 直接创建/更新 memory md 和 `MEMORY.md`.
+	- 输出 structured result, 包括 created memory ids, updated memory ids, ignored candidates, duplicate decisions, conflicts, source_node_ids, files changed.
+- Memory Extraction Job 扫描:
+	- scan cursor 存在 SQLite session metadata, 例如 last_memory_scanned_node_id 或 sequence.
+	- 下次扫描只处理 cursor 之后的新内容.
+	- 候选源主要是 cursor 之后的新 user messages.
+	- 附带这些 user messages 周边 assistant context, recent active path 摘要, 当前 compact summary.
+	- tool result 默认只给摘要/artifact refs.
+	- Memory Extraction Job 用周边上下文解释用户表达, 但避免把 assistant 未确认内容写进 memory.
+- Memory source 规则:
+	- `user` memory 必须能追溯到 user message.
+	- `feedback` memory 必须能追溯到 user message.
+	- `reference` memory 可以来自用户确认过的 tool/assistant context.
+	- 每条 memory 记录 `source_node_ids`.
+	- 如果 reference 来自 tool/assistant, 需要记录确认它的 user node id 或 evidence metadata.
+	- worker/sub/fork agent 的中间过程不能直接成为长期 memory.
+	- worker/sub/fork agent 结果如果需要写入 memory, 必须已经被 main/Orchestrator 可见, 并且能追溯到用户确认或用户显式偏好.
+	- 不写入 secret、credential、token、cookie、私钥或明显敏感的环境信息.
+	- 不写入 Task DAG 当前状态、Plan 正文、完整对话 transcript、临时命令输出或一次性调试过程.
+- Memory 去重和覆盖:
+	- 先读取 `MEMORY.md` 和所有 memory frontmatter.
+	- 根据 category, summary, tags, source 和语义相似度初筛疑似重复.
+	- 必要时读取疑似重复 memory 正文.
+	- Memory Extraction Job 决定 new / duplicate / update / conflict / ignore.
+	- conflict 第一版直接覆盖旧 memory.
+	- 覆盖时保留原 memory id 和文件路径, 更新 body/frontmatter/summary/tags/updated_at.
+	- 覆盖时 `source_node_ids` 替换成新来源.
+- Memory 落库策略:
+	- Memory md 和 `MEMORY.md` 是 source of truth.
+	- 不把 memory 正文存入 SQLite.
+	- 不把 memory 正文存入项目目录.
+	- Memory Writer 只能写 `~/.agent/memory/MEMORY.md` 和 `~/.agent/memory/{user,feedback,reference}/*.md`.
+	- 创建新 memory 时先写 memory md, 再更新 `MEMORY.md`.
+	- 更新已有 memory 时保留原文件路径, 原子更新 memory md 和 `MEMORY.md`.
+	- 任一文件写入或校验失败时, 本次 Memory Extraction Job 标记 failed, scan cursor 不推进.
+	- 本次扫描只有 duplicate / ignore 且没有文件变更时, 可以在记录 completed event 后推进 cursor.
+	- scan cursor 只在 Memory Extraction Job 完成且所有必要写入成功后推进.
+	- `memory_extraction_completed` event 记录 created / updated / ignored / duplicate / conflict / source_node_ids / files_changed.
+	- debug 模式可以保存 redacted model request/response artifact, 默认不保存原始 memory extraction prompt.
+- Memory 分类只保留:
+	- user
+	- feedback
+	- reference
+- Memory 触发条件:
+	- 新增消息数达到 N.
+	- 或新增 token 估算达到阈值.
+	- 或 session idle 超过一定时间.
+- Memory 文件结构:
+	- `~/.agent/memory/MEMORY.md`: 所有 memory md 的目录.
+	- `~/.agent/memory/user/*.md`
+	- `~/.agent/memory/feedback/*.md`
+	- `~/.agent/memory/reference/*.md`
+- Memory 文件命名:
+	- `<category>/<model-chosen-name>-<created_at>-<id>.md`
+	- category 只能是 `user / feedback / reference`.
+	- Memory Extraction Job 根据 memory 内容给出候选文件名.
+	- core 不从 summary 硬编码生成 slug.
+	- core 只校验模型给出的文件名安全性和冲突.
+	- created_at 文件名部分用紧凑日期, 例如 `YYYYMMDD`.
+	- id 使用 `mem_<YYYYMMDDHHMMSS>_<rand>`.
+- 每条 memory 是独立 md 文件, 带 frontmatter:
+	- id
+	- category
+	- summary
+	- tags
+	- created_at
+	- updated_at
+	- source_session_id
+	- source_node_ids
+- `MEMORY.md` catalog:
+	- 按 memory `created_at` 倒序排列.
+	- 如果太长, 第一版直接裁剪末尾.
+	- recall 是纯读取, 不更新 `created_at`, `updated_at`, `last_seen_at`.
+	- Memory Extraction Job 更新已有 memory 内容时允许更新 `updated_at`, 但不改变 `MEMORY.md` 的 created_at 排序.
+- Memory recall 也采用渐进式披露:
+	- `MEMORY.md` 是 main agent / Orchestrator 常驻 memory catalog, 放入 dynamic system prompt.
+	- `MEMORY.md` 只包含目录/摘要, 不包含 memory 全文.
+	- main agent / Orchestrator 模型根据 `MEMORY.md` 判断是否调用 `recall_memory`.
+	- `recall_memory` 是 readonly + internal tool, 不需要用户确认, event log 标记 internal.
+	- `recall_memory` 读取所有 memory md 的 frontmatter.
+	- Memory Recall Selector 使用 `memory.recall_model_profile`; 未配置时默认使用主模型配置.
+	- Recall Selector 基于 recall query, 当前用户请求, recent active path 摘要, `MEMORY.md`, 所有 memory frontmatter, 决定加载哪些 memory 全文.
+	- 加载 memory 全文使用 top K + memory_context_token_budget 双限制.
+	- 选中 memory 写入内部 node type `memory_context`.
+	- `memory_context` 发给模型时映射为 synthetic user/context message.
+	- `memory_context` 用带 ids/categories 的 XML-like 标签包裹, 例如 `<memory ids="..." categories="...">...</memory>`.
+	- `memory_context` metadata 记录 recalled_memory_ids, categories, query, selected_by_model, source_paths.
+	- 如果 active path 已有同 memory id 且文件 hash 未变, 返回 already_recalled, 不重复注入.
+	- 如果同 memory id 但文件 hash 变了, 重新读取并注入新版 memory_context.
+- Memory 写权限和召回权限:
+	- 普通 main/Orchestrator/sub/fork/worker agent 默认没有 memory write tool.
+	- sub/fork/worker agent 不允许直接写长期 memory.
+	- sub/fork/worker agent 不允许调用 `recall_memory`.
+	- compact fork 不允许新召回 memory; 它只能总结触发时 active path 已经可见的内容, 包括已经存在的 `memory_context`.
+	- Memory Writer 不是普通模型 run 的 effective tool set 成员.
+	- Memory Writer 只给 Memory Extraction Job 使用.
+	- `recall_memory` 是只读 internal tool, 只能把选中的 memory 写入 `memory_context` node.
+- 第一版只做内存 cache, 不做持久 embedding/index 数据库.

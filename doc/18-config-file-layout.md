@@ -1,0 +1,220 @@
+# Config & File Layout
+
+- 配置目录使用 `.agent/`.
+- 用户级和项目级配置同时存在.
+- 非安全字段默认项目级同名字段覆盖用户级.
+- 安全相关字段不能被项目级静默放宽:
+	- permissions
+	- dangerous
+	- network
+	- write roots
+	- command tool env / sandbox
+	- hook execution
+- 项目级安全配置只能收紧用户级策略.
+- 如果项目级配置想放宽安全策略, 必须满足其一:
+	- 用户级配置显式允许该项目 / workspace 放宽.
+	- 运行时 permission callback 明确确认.
+	- 调用方以 trusted project mode 启动.
+- trusted project mode:
+	- 默认关闭.
+	- 只能由用户级配置按绝对路径 / workspace id allowlist 开启.
+	- 项目自己的 `.agent/config.toml` 不能声明自己 trusted.
+	- trusted project mode 只影响配置合并和默认 permission 策略, 不绕过 dangerous 操作的显式规则.
+- 配置加载失败处理:
+	- 用户级配置解析或校验失败时, SDK 启动失败.
+	- 项目级配置解析或校验失败时, 当前项目启动失败.
+	- 不静默忽略错误配置文件.
+	- 错误信息必须包含文件路径、字段路径、错误原因.
+	- 调用方可以捕获 `ConfigError` 后决定如何展示或恢复.
+- 环境变量和 secret:
+	- 配置文件只保存环境变量名, 不直接保存 secret.
+	- 例如 `api_key_env = "OPENAI_API_KEY"`.
+	- core 运行时从进程环境读取 secret.
+	- secret 不写入 SQLite, event, artifact, raw debug artifact.
+	- debug/raw request 保存前必须做 secret redaction.
+	- 缺少必要环境变量时采用惰性校验:
+		- SDK 初始化不检查所有可能用到的 env var.
+		- 第一次实际使用对应 provider / tool / hook 时检查.
+		- 缺失时 fail fast, 错误标明 env var 名称、使用方和配置来源.
+- config merge 规则:
+	- 对象字段按项目级覆盖用户级.
+	- 数组字段如果项目级存在, 则完全替换用户级数组.
+	- 不做数组 merge.
+	- 安全相关字段使用专门 merge policy, 不套用普通覆盖规则.
+- 主配置文件使用 `config.toml`.
+- 用户级主配置为 `~/.agent/config.toml`.
+- 项目级主配置为 `<project>/.agent/config.toml`.
+- 第一版用 Python 3.11 内置 `tomllib` 读取 TOML.
+- `hooks.json` 和 `mcp.json` 第一版继续保留 JSON:
+	- `hooks.json` 更像可校验的规则列表, 不并入主配置.
+	- `mcp.json` 更像 server catalog, 不并入主配置.
+	- 主配置只负责启用/禁用、默认值和 override.
+- `config.toml` 第一版顶层 sections:
+	- runtime
+	- model
+	- model_overrides
+	- context
+	- compact
+	- memory
+	- agents
+	- plan
+	- task
+	- permissions
+	- hooks
+	- tools
+- `runtime` 配置:
+	- cancel_timeout_ms: 默认 10000.
+	- 控制 `await run.cancel()` 等待 run 进入终态的最长时间.
+	- child agent 取消仍使用 `agents.child_cancel_timeout_ms`.
+- `model` 合并 provider 和 model 配置:
+	- provider
+	- base_url
+	- api_key_env
+	- name
+	- context_window
+	- max_output_tokens
+	- temperature
+	- timeout_ms
+	- retry
+- `model_overrides` 是可选 role override:
+	- small
+	- compact
+	- override 继承默认 model, 只覆盖指定字段.
+- Memory Extraction Job 和 Memory Recall Selector 不使用 `model_overrides.memory`; 分别通过 `memory.extract_model_profile` 和 `memory.recall_model_profile` 配置.
+- `model_profile` 字段形态:
+	- 可以是字符串, 引用 `model_overrides.<name>` 中的命名 profile.
+	- 也可以是 inline partial model config.
+	- 解析后都叠加到主 `[model]`.
+- 模型解析顺序:
+	- 先使用主 `[model]`.
+	- 再叠加用途/角色 profile, 例如 `compact.model_profile`, `memory.extract_model_profile`, `memory.recall_model_profile`, `AgentDefinition.model_profile`.
+	- 最后 SDK/runtime policy 可以覆盖.
+	- 模型不能通过 create_sub_agent / fork_agent / dispatch_worker / dispatch task 等 tool 参数覆盖 model.
+- 项目级配置可以覆盖 compact / memory / AgentDefinition 的 model profile, 但 provider / base_url / api_key_env 等敏感字段仍受 trusted project 和安全 merge policy 约束.
+- `context` 配置:
+	- session_db_path
+	- active_path_only
+	- allow_branch_from: 第一版固定 user_message.
+	- branch_summary: 第一版 false.
+	- reserve_output_tokens
+	- dynamic_system_budget
+	- non_system_budget: 可选, 通常由 context window 减去 system/output 后计算.
+	- task_board_token_budget: 默认 1200.
+	- task_recent_changes_limit: 默认 20.
+	- task_recent_changes_window_minutes: 默认 30.
+- `compact` 配置:
+	- enabled
+	- reserve_tokens
+	- keep_recent_tokens
+	- auto_background
+	- recovery_sync
+	- model_profile: 引用 `model_overrides.compact`, 缺省回退默认 model.
+	- max_summary_tokens
+- `memory` 配置:
+	- enabled
+	- memory_dir: 用户级 memory 目录, 默认 `~/.agent/memory`; 第一版不支持项目级 memory 目录.
+	- categories
+	- extract_every_messages
+	- extract_every_tokens
+	- idle_seconds
+	- catalog_max_tokens
+	- recall_top_k
+	- memory_context_token_budget
+	- extract_model_profile: Memory Extraction Job 使用的模型配置; 缺省完全回退主模型配置.
+	- recall_model_profile: Memory Recall Selector 使用的模型配置; 缺省完全回退主模型配置.
+	- `extract_model_profile` / `recall_model_profile` 可以像主模型一样指定 provider / base_url / api_key_env / name / context_window / max_output_tokens / temperature / timeout_ms / retry.
+	- Memory Extraction Job 不是 fork/sub/child agent, 不引用 AgentDefinition, 不占用 agents child concurrency.
+	- Memory Writer 只允许写 `~/.agent/memory/MEMORY.md` 和 `~/.agent/memory/{user,feedback,reference}/*.md`.
+- `agents` 配置:
+	- max_children_per_run
+	- default_sub_agent_definition: 默认内置 default_sub_agent.
+	- default_fork_agent_definition: 默认内置 default_fork_agent.
+	- worker_pools: orchestrator 模式下的 worker pool 配置.
+		- pool_id.
+		- workers: 显式 worker 列表, 每个条目创建一个 worker.
+		- worker 条目字段:
+			- worker_id 可选; 缺省由 core 生成稳定运行时 id.
+			- agent_definition_id.
+			- allowed_tools 可选; 作为该 worker 的工具上限.
+		- 不支持 count 字段批量创建 worker.
+		- 需要多个同类型 worker 时, 写多个引用同一 agent_definition_id 的 worker 条目.
+		- 显式 worker_id 必须在同一个 pool 内唯一.
+		- 未显式配置 worker_id 时, core 按 pool_id、worker 条目顺序和 agent_definition_id 生成稳定运行时 id.
+		- 配置顺序变化可能改变自动 worker_id; 重要 worker 推荐显式配置 worker_id.
+		- orchestrator 模式要求至少一个有效 worker pool; 不配置或配置为空时启动失败.
+		- 第一版不提供隐式默认 worker pool.
+		- worker 可以引用 SDK 内置 AgentDefinition, 例如 default_worker_agent.
+	- max_concurrent_children_per_session
+	- default_child_timeout_ms
+	- child_cancel_timeout_ms: 默认 30000.
+- `plan` 配置:
+	- default_dir: 默认 `<project>/.agent/plans`.
+	- template_name: 默认内置 plan 模板.
+- `task` 配置:
+	- wal_dir: 默认 `<project>/.agent/tasks`.
+	- task_board_token_budget: 默认 1200.
+	- task_recent_changes_limit: 默认 20.
+	- task_recent_changes_window_minutes: 默认 30.
+	- step_lease_timeout_ms: 默认 300000.
+- Plan 不展示由 Task 反推的结构化进度; Task DAG 仅作为内部调度/debug 视图.
+- `permissions` 配置保持最小:
+	- readonly_default
+	- write_without_callback
+	- remember_scope: 第一版为 session.
+	- allow_for_session_enabled
+	- deny_for_session_enabled
+	- dangerous_allow_for_session: false.
+	- network_policy
+- `hooks` config 只放开关和默认值:
+	- enabled
+	- project_hooks_enabled
+	- default_timeout_ms
+	- 项目级 hooks 默认需要 trusted project mode 或运行时显式确认后启用.
+	- 具体 hook 规则仍在独立 `hooks.json`.
+- `tools` config 只做过滤和覆盖:
+	- disabled
+	- overrides
+	- allowed_write_roots
+	- allow_tmp_write
+	- default_timeout_ms
+	- max_timeout_ms
+	- env_allowlist
+	- stdout_limit_bytes
+	- stderr_limit_bytes
+	- network.allowed_hosts
+	- network.allowed_domains
+	- mcp.disabled_servers
+	- mcp.disabled_tools
+	- mcp.tool_overrides
+	- mcp.discovery_cache_ttl_ms
+	- tool 实现仍来自 code / MCP / agent tools / `~/.agent/tools/*.json`.
+- 用户级目录:
+	- `~/.agent/config.toml`
+	- `~/.agent/hooks.json`
+	- `~/.agent/mcp.json`
+	- `~/.agent/tools/*.json`
+	- `~/.agent/agents/*.md`
+	- `~/.agent/memory/MEMORY.md`
+	- `~/.agent/memory/user/*.md`
+	- `~/.agent/memory/feedback/*.md`
+	- `~/.agent/memory/reference/*.md`
+	- `~/.agent/skills/*.md`
+	- `~/.agent/sessions.sqlite`
+	- `~/.agent/sessions/<session_id>/artifacts/<artifact_id>/<filename>`
+- 项目级目录:
+	- `<project>/.agent/config.toml`
+	- `<project>/.agent/hooks.json`
+	- `<project>/.agent/plans/<model-chosen-name>.md`
+	- `<project>/.agent/tasks/<session_id>/<model-chosen-task-name>.wal.jsonl`
+	- `<project>/.agent/history/`
+	- `<project>/.agent/agents/*.md`
+	- `<project>/.agent/skills/*.md`
+	- `<project>/CLAUDE.md`
+	- `<project>/AGENTS.md`
+- 第一版项目级目录不包含 `.agent/memory`; memory 只保存在用户级 `~/.agent/memory`.
+- 不设置用户可见的 indexes 目录作为 source of truth.
+- Plan 是普通项目 Markdown 文件, 不建专门 Plan index source of truth.
+- Task DAG 的 source of truth 是项目级 Task WAL JSONL.
+- Plan 文件名和 Task WAL 文件名都由模型给出候选名, core 只做安全校验和 path_conflict 检查.
+- Memory 和 skills 的 md/frontmatter 是 source of truth.
+- 第一版只做进程内 cache, 退出后丢弃.
