@@ -32,20 +32,20 @@
 - main agent: 普通模式下的主 agent.
 - Orchestrator: 编排模式下的主 agent; 它同时负责 Task DAG 创建、任务拆解、worker pool 调度、任务下发和结果汇总.
 - sub agent: 执行具体 step 的 worker.
-- fork agent: 用于需要全量/同源上下文的后台分析 agent.
+- fork agent: 用于需要全量/同源上下文的并发分析 agent.
 - orchestrator 是运行 mode, 不是单独的 agent 角色.
 - orchestrator mode 不再拆出两层 agent; 运行时只有一个 Orchestrator agent 作为该模式的主 agent.
 - 能力矩阵:
-	- main agent: 可以使用 plan tool, 可以 list_agent_definitions, 可以 create_sub_agent, 可以 fork_agent.
-	- Orchestrator: 可以使用 plan tool, 可以 list_agent_definitions, 可以 list_workers, 可以使用 Task 内容创建/修改工具, 可以 dispatch worker run, 不能 fork_agent.
-	- sub agent: 不能使用 plan tool, 不能创建 Task DAG, 不能修改 Task 内容, 不能 create_sub_agent, 不能 fork_agent.
-	- fork agent: 不能使用 plan tool, 不能创建 Task DAG, 不能修改 Task 内容, 不能 create_sub_agent, 不能 fork_agent.
+		- main agent: 可以使用 `agent.plan_template`, 可以 list_agent_definitions, 可以 create_sub_agent, 可以 fork_agent.
+		- Orchestrator: 可以使用 `agent.plan_template`, 可以 list_agent_definitions, 可以 list_workers, 可以使用 Task 内容创建/修改工具, 可以 dispatch worker run, 不能 fork_agent.
+		- sub agent: 不能使用 `agent.plan_template`, 不能创建 Task DAG, 不能修改 Task 内容, 不能 create_sub_agent, 不能 fork_agent.
+		- fork agent: 不能使用 `agent.plan_template`, 不能创建 Task DAG, 不能修改 Task 内容, 不能 create_sub_agent, 不能 fork_agent.
 
 ## Agent Definition Registry
 - 子 agent 类型使用统一 `AgentDefinition` 描述.
 - `AgentDefinition` 来源包括:
 	- SDK 内置 sub agent definitions.
-	- 用户级 / 项目级 agent definition 文件.
+	- 用户级 agent definition 文件.
 	- SDK 调用方通过代码注册的 agent definition.
 - SDK 内置 definitions 至少包含:
 	- default_sub_agent: 普通 create_sub_agent 默认使用.
@@ -54,7 +54,7 @@
 - SDK 另有内部 `default_compact_agent`:
 	- 只供 runtime 内部 compact fork 使用.
 	- 不出现在 `agent.list_agent_definitions`.
-	- 不能被用户级、项目级或代码注册 AgentDefinition 覆盖.
+	- 不能被用户级或代码注册 AgentDefinition 覆盖.
 - default_worker_agent 默认只带最小 worker 工具集合:
 	- Task 读取 / ready step 查询 / claim step / 更新自己 claimed step.
 	- 常规只读文件工具.
@@ -62,8 +62,7 @@
 - 所有来源最终注册到同一个 AgentDefinitionRegistry.
 - `agent.create_sub_agent`, `agent.fork_agent`, worker pool 配置都引用 `agent_definition_id`.
 - 文件形式默认位置:
-	- `~/.agent/agents/*.md`
-	- `<project>/.agent/agents/*.md`
+		- `${SOONG_AGENT_HOME}/agents/*.md`
 - agent definition 文件使用 frontmatter + markdown body:
 	- frontmatter 是 metadata source of truth.
 	- body 是该 agent 的 system instructions.
@@ -87,10 +86,7 @@
 - overrides 是整份 AgentDefinition 替换, 不做字段级继承.
 - 覆盖 definition 的 body 为空时, 使用 SDK 内置 default sub-agent instructions, 不继承被覆盖 definition 的 body.
 - 文件来源 definition 不能覆盖 code 注册 definition.
-- project 文件 definition 可以显式覆盖 user 文件 definition.
-- project 文件 definition 可以显式覆盖 builtin definition.
 - user 文件 definition 可以显式覆盖 builtin definition.
-- user 文件 definition 不能覆盖 project 文件 definition.
 - code 注册 definition 可以显式覆盖任何来源的 definition.
 - 同一来源内 duplicate `agent_definition_id` 永远报错, 不允许 overrides.
 - 有效覆盖关系必须写入 registry inspect/debug 信息, 方便解释最终使用了哪份 definition.
@@ -125,8 +121,8 @@
 - 返回字段包括:
 	- agent_definition_id
 	- name
-	- description
-	- source: builtin / user / project / code
+		- description
+		- source: builtin / user / code
 	- suggested_tools: 每项包含 tool name, available, unavailable_reason 可选
 	- tags
 - `agent.list_agent_definitions` 不返回 worker runtime 状态.
@@ -190,7 +186,7 @@
 
 ## create_sub_agent
 - 普通模式仍支持 `create_sub_agent`.
-- `create_sub_agent` 是普通模式下创建一次性后台 child agent 的内置 agent tool.
+- `create_sub_agent` 是普通模式下创建一次性 child agent 的内置 agent tool.
 - 一次性 child agent 默认执行完即可进入 completed / failed / cancelled.
 - `create_sub_agent` 不继承完整父上下文, 只接收显式 context bundle.
 - `create_sub_agent` 不允许传 inline system instructions.

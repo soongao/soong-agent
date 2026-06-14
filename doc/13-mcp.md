@@ -1,11 +1,11 @@
 # MCP
 
 - MCP 配置只放用户级:
-	- `~/.agent/mcp.json`
+	- `${SOONG_AGENT_HOME}/mcp.json`
 - MCP server 属于用户信任的外部能力, 项目不直接声明 MCP server.
-- 项目可以通过 config 启用/禁用某些已存在的 MCP tools.
+- 用户级 config 可以启用/禁用某些已存在的 MCP tools.
 - MCP server 加载采用 lazy connect:
-	- SDK 启动时只读取 `~/.agent/mcp.json`, 形成 server catalog.
+		- SDK 启动时只读取 `${SOONG_AGENT_HOME}/mcp.json`, 形成 server catalog.
 	- run 需要 MCP tools 或 effective tool set 包含 MCP tools 时再连接 server.
 	- 连接后执行 tool discovery.
 	- 单个 server 失败只影响该 server 的 tools.
@@ -28,5 +28,5 @@
 	- 用户可在 config 里按 server/tool 覆盖 permission 和 tags.
 - MCP tool canonical name:
 	- 使用 `mcp.<server_id>.<tool_name>`.
-	- server_id 来自 `~/.agent/mcp.json` 的稳定 key.
+		- server_id 来自 `${SOONG_AGENT_HOME}/mcp.json` 的稳定 key.
 	- 避免跨 server tool name 撞名.

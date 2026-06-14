@@ -3,7 +3,7 @@
 - Task 是 orchestrator 模式下 Orchestrator 维护的内部执行 DAG.
 - Task 是内部对象, 默认不展示给用户.
 - Task 不使用 Markdown 文件.
-- Task 不写项目级 task md 文件, 不扫描 `.agent/tasks/*.md`, 不解析 Task frontmatter.
+- Task 不写项目级 task md 文件, 不扫描 `.soong-agent/tasks/*.md`, 不解析 Task frontmatter.
 - Task 不使用 SQLite `tasks` / `task_attempts` / `task_dependencies` 当前状态表.
 - Task 当前状态只存在于运行时内存中的 Task DAG.
 - Task 持久化依赖项目级 append-only WAL JSONL.
@@ -25,7 +25,7 @@
 - terminal Task 只保留只读查询 / inspect / replay 能力, 不再接受 step 更新.
 
 ## Storage
-- Task WAL 默认放在 `<project>/.agent/tasks/<session_id>/<model-chosen-task-name>.wal.jsonl`.
+- Task WAL 默认放在 `<project>/.soong-agent/tasks/<session_id>/<model-chosen-task-name>.wal.jsonl`.
 - 一个 session 对应一个 Task 目录.
 - 一个完整 Task DAG 对应一个 WAL JSONL 文件.
 - 同一个 session 允许多个 active Task DAG 同时存在.
@@ -42,7 +42,7 @@
 	- 不允许 `/`, `..`, hidden filename, 空文件名或绝对路径.
 	- 超过长度限制返回 validation_error.
 	- 文件已存在时返回 path_conflict, 由模型选择新名字或请求用户处理.
-- `<project>/.agent/tasks/<session_id>/` 目录只保存 Task WAL / 后续可选 snapshot, 不保存 Task Markdown.
+- `<project>/.soong-agent/tasks/<session_id>/` 目录只保存 Task WAL / 后续可选 snapshot, 不保存 Task Markdown.
 - 每一行 WAL 是一个独立 JSON object.
 - WAL event 必须包含:
 	- wal_seq
@@ -291,7 +291,7 @@
 
 ## Task Tools
 - Task tools 是内置 internal tools.
-- Task tools 不直接修改业务 workspace 文件.
+- Task tools 不直接修改业务项目文件.
 - Task tools 修改内存 DAG 并追加 WAL JSONL.
 - 所有 Task tool 输入都隐式携带 actor_agent_id / actor_run_id / session_id.
 - core 从当前 RunContext 注入 actor 字段, 不信任模型显式传入的 actor 字段.
@@ -480,7 +480,7 @@
 - 非 Orchestrator 如果越权修改 Task 内容, core 返回 `permission_denied`.
 - Orchestrator 的 Task 写入也必须通过状态、DAG 和 WAL 校验.
 - Task tools 是 internal context tools, 不触发面向用户的普通 file write permission prompt.
-- Task tools 不替代普通 file write permission; 它们不能写 workspace 文件.
+- Task tools 不替代普通 file write permission; 它们不能写业务项目文件.
 
 ## Prompt Context
 - prompt composer 可按需注入压缩后的 Task DAG summary.

@@ -35,7 +35,7 @@
 	- 普通模型 run 是否能调用 `agent.fork_agent`, 仍由 mode / role / effective tool set 控制.
 	- compact fork 是 runtime 内部能力, 不需要把 `agent.fork_agent` 暴露给当前模型.
 	- Orchestrator / sub / worker / fork agent 不能主动调用 `agent.fork_agent`, 但 runtime 仍可以为上下文恢复触发 compact fork.
-	- compact fork 不能再创建子 agent, 不能使用 plan tool, 不能创建或修改 Task DAG.
+	- compact fork 不能再创建子 agent, 不能使用 `agent.plan_template`, 不能创建或修改 Task DAG.
 	- compact fork 不允许调用 `recall_memory`; 它只总结触发时 active path 已经可见的内容.
 - Compact agent 权限:
 	- 只读 context.

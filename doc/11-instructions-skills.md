@@ -2,8 +2,8 @@
 
 - Prompt composer 区分 system prompt 和 non-system prompt.
 - System prompt 分为:
-	- static system blocks: core builtin instructions, agent role/mode, provider adaptation hints, tool catalog, tool protocol, permission/hook behavior, Todo 行为说明.
-	- dynamic system blocks: AgentDefinition body for child/sub/fork agents, project instructions snippets, skill catalog, `MEMORY.md` catalog, runtime state.
+	- static system blocks: core builtin instructions, agent role/mode, provider adaptation hints, tool catalog, tool protocol, permission/hook behavior, Todo 行为说明, instruction catalog.
+	- dynamic system blocks: AgentDefinition body for child/sub/fork agents, loaded instruction content, skill catalog, `MEMORY.md` catalog, runtime state.
 - Todo 只在 static system prompt 中说明:
 	- Todo 是模型内部 scratchpad.
 	- 没有 todo tool.
@@ -12,7 +12,7 @@
 - 静态 system prompt 可以描述所有内置工具类别, 但 provider 实际可调用工具只来自当前 run 的 effective tool set.
 - 第一版不实现真实 toolSelect 工具; 模型按 system prompt 自行选择工具.
 - 如果模型调用当前不可用工具, core 返回 `tool_not_available`.
-- Skill body 不进入 system prompt; skill 通过 `load_skill` tool 渐进式加载, 并作为 skill_context node 进入普通上下文.
+- Skill body 不进入 static system prompt; skill 通过 `load_skill` tool 渐进式加载, 并作为 skill_context node 进入普通上下文.
 - Memory 全文不直接进入 system prompt; memory 通过 `recall_memory` tool 渐进式加载, 并作为 memory_context node 进入普通上下文.
 - Non-system prompt 包括 active path messages, compaction summary, skill_context, memory_context, plan_instruction, task_instruction, task_board summary, child agent result, tool result summary, artifact preview, 当前 user message 附件摘要, 以及 hook 显式追加的执行提示.
 - AgentDefinition body:
@@ -21,9 +21,9 @@
 	- 优先级低于 core builtin system / safety / tool protocol.
 	- 父 agent 传入的 task / instruction / context 作为子 agent 的 user/context block 注入, 不进入 system prompt.
 - Plan instruction:
-	- plan tool 读取内置 Plan 写作模板.
-	- plan tool 返回 `node_type=plan_instruction` 的 synthetic user/context block.
-	- 模型根据该 block 选择文件名, 再调用普通 write/edit tool 写入 `<project>/.agent/plans/<model-chosen-name>.md`.
+	- `agent.plan_template` 读取内置 Plan 写作模板.
+	- `agent.plan_template` 返回 `node_type=plan_instruction` 的 synthetic user/context block.
+	- 模型根据该 block 选择文件名, 再调用普通 write/edit tool 写入 `<project>/.soong-agent/plans/<model-chosen-name>.md`.
 	- core 不自动读取 Plan Markdown.
 	- 模型需要计划内容时, 像处理普通文件一样调用内置 read tool 读取该 path.
 - Task instruction:
@@ -103,16 +103,45 @@
 	- debug 模式保存详细 report artifact.
 - 冲突优先级采用类系统消息优先级:
 	- core/builtin 永远最高.
-	- project / skills / memory 不能覆盖 safety, permission, tool protocol.
+	- instruction / skills / memory 不能覆盖 safety, permission, tool protocol.
 	- 用户可以覆盖偏好类内容, 但不能覆盖系统约束.
-- Project instructions:
-	- 从 cwd 向上查找 instructions.
-	- 每个目录优先读取 `CLAUDE.md`.
-	- 只有没有 `CLAUDE.md` 时才读 `AGENTS.md`.
-	- 按涉及文件路径加载局部 instructions 时也遵循同样优先级.
-	- cwd 向上的基础 instructions 自动纳入 dynamic system prompt 候选.
-	- 局部 instructions 由 prompt composer 根据用户显式提到的路径、tool args 中涉及的路径、最近读取/修改的文件路径自动选择.
-	- 局部 instructions 属于 dynamic system prompt, 需要相关性选择和预算约束.
+- Instructions 使用渐进式披露:
+	- static system prompt 不是代码硬编码的大字符串, 而是 runtime 启动 / run 开始时构造的 system blocks.
+	- core 会扫描 instruction 文件的 frontmatter 元信息, 构造 `instruction_catalog` system block.
+	- `instruction_catalog` 只包含路径和 frontmatter 元信息, 不包含正文.
+	- 没有 frontmatter 的 instruction 文件不跳过, catalog 使用相对路径作为基础元信息.
+	- 模型根据 `instruction_catalog` 判断是否需要读取具体 instruction 文件.
+	- 模型使用普通 `code.read_file` 读取 instruction 文件正文.
+	- core 不提供 `load_instruction` tool.
+	- core 不根据 path/glob 硬编码选择局部 instruction.
+	- core 不自动把所有 instruction 正文塞进 prompt.
+- Instruction 文件位置:
+	- 用户级:
+		- `${SOONG_AGENT_HOME}/CLAUDE.md`
+		- `${SOONG_AGENT_HOME}/AGENTS.md`
+		- `${SOONG_AGENT_HOME}/rules/**/*.md`
+	- 项目级:
+		- `<project>/CLAUDE.md`
+		- `<project>/AGENTS.md`
+		- `<project>/<subdir>/CLAUDE.md`
+		- `<project>/<subdir>/AGENTS.md`
+	- 不存在 `<project>/.soong-agent/rules`.
+	- 不存在项目级 skills / agents 目录.
+- Instruction 扫描:
+	- 每次 run 开始重新扫描 instruction catalog.
+	- 扫描项目下 `**/CLAUDE.md` / `**/AGENTS.md`.
+	- 扫描时跳过 `.git`, `node_modules`, `.venv`, `venv`, `dist`, `build`, `target`, `.next`, `.cache`, `__pycache__`.
+	- catalog 默认最多 200 个 instruction 文件; 超过时按路径排序截断并标记 catalog truncated.
+	- 同目录同时存在 `CLAUDE.md` 和 `AGENTS.md` 时, catalog 只展示 `CLAUDE.md`.
+	- `CLAUDE.md` 优先于 `AGENTS.md`.
+- Instruction 正文加载:
+	- 当 `code.read_file` 读取的路径被识别为 instruction 文件时, core 除返回普通 file read result 外, 还将该文件正文注册为 dynamic system block.
+	- 对普通业务 Markdown 文件调用 `code.read_file` 不会注册 dynamic system block.
+	- dynamic instruction block 也可以写入 SQLite node, `node_type=instruction_context`, 方便 replay/inspect.
+	- 重复读取同一 instruction 文件时, 如果 active path 已加载且文件 hash 未变, 不重复创建 instruction_context; tool result 标记 already_loaded.
+	- 已加载 instruction 文件在后续 prompt 构造时检查 mtime/hash; 文件变化后重新读取并更新 dynamic system block.
+	- instruction 正文过大时按 dynamic system budget 裁剪/摘要; 不 artifact 化全文, 因为原文件本身已经存在.
+	- 读到的 instruction 内容应遵守, 但不能覆盖 core safety、permission 和 tool protocol.
 - Skills 使用渐进式披露:
 	- 每个 skill 一个 md 文件.
 	- 不需要 `SKILLS.md`.
@@ -129,7 +158,6 @@
 	- skill context message 用固定 header/footer 包裹, 例如 `<skill name="...">...</skill>`.
 	- 重复调用 `load_skill(name)` 时, 如果 active path 已加载且 skill 文件 mtime/hash 未变, 返回 already_loaded, 不重复注入 body.
 	- 如果 skill 文件变了, 重新读取并注入新版 skill_context.
-- Skill 文件位置:
-	- `~/.agent/skills/*.md`
-	- `<project>/.agent/skills/*.md`
-- 第一版 skill catalog 只做内存 cache.
+	- Skill 文件位置:
+		- `${SOONG_AGENT_HOME}/skills/*.md`
+	- 第一版 skill catalog 只做内存 cache.

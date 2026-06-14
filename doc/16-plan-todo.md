@@ -19,7 +19,7 @@
 - Plan 没有独立状态机.
 - Plan 没有 SQLite 当前状态表.
 - Plan 没有专门的 PlanFileRef / plan index source of truth.
-- Plan 文件就是普通项目文件, 只约定默认放在 `<project>/.agent/plans/`.
+- Plan 文件就是普通项目文件, 只约定默认放在 `<project>/.soong-agent/plans/`.
 - Plan 文件名由模型根据本次计划内容生成候选名, 例如 `implement-auth-flow.md`; 不固定为 `plan.md`.
 - core 不从 title/summary 硬编码生成 slug.
 - core 只校验模型给出的文件名:
@@ -33,25 +33,26 @@
 - 高风险 write / dangerous 仍然走 permission.
 
 ## Plan Tool
-- 内置 plan tool 是模板/上下文工具, 不直接创建或修改文件.
-- plan tool 读取 SDK 内置的 Plan 写作模板.
-- plan tool 把 Plan 写作模板、当前用户目标、建议路径目录和必要约束组合成一个 synthetic user block.
-- plan tool 的返回形态类似 skill loading:
+- 内置 plan tool 的 canonical name 是 `agent.plan_template`.
+- `agent.plan_template` 是模板/上下文工具, 不直接创建或修改文件.
+- `agent.plan_template` 读取 SDK 内置的 Plan 写作模板.
+- `agent.plan_template` 把 Plan 写作模板、当前用户目标、建议路径目录和必要约束组合成一个 synthetic user block.
+- `agent.plan_template` 的返回形态类似 skill loading:
 	- tool 执行结果会作为 `node_type=plan_instruction` 的 user/context block 进入下一轮模型上下文.
 	- 它不是普通 assistant 文本, 也不是 system prompt.
 	- 它不自动常驻上下文; 只按普通上下文预算和节点选择规则进入后续 prompt.
-- 模型收到 plan instruction 后, 选择计划文件名, 再调用普通 write/edit tool 写入 `<project>/.agent/plans/<model-chosen-name>.md`.
-- plan tool 返回内容只指导写作, 不代表 Plan 已创建.
+- 模型收到 plan instruction 后, 选择计划文件名, 再调用普通 write/edit tool 写入 `<project>/.soong-agent/plans/<model-chosen-name>.md`.
+- `agent.plan_template` 返回内容只指导写作, 不代表 Plan 已创建.
 - Plan 是否成功创建以普通 write/edit tool 的结果为准.
-- plan tool 不解析、不校验、不索引已生成的 Plan Markdown.
+- `agent.plan_template` 不解析、不校验、不索引已生成的 Plan Markdown.
 - 已生成的 Plan 和其他 Markdown 文件一样, 后续需要读取时调用普通 read tool.
 
 ## Plan Tool Permission
-- plan tool 是 internal readonly/context tool.
-- plan tool 只允许 main agent / Orchestrator 使用.
-- sub agent / fork agent 不允许使用 plan tool.
-- sub agent / fork agent 的 effective tool set 中默认不包含 plan tool.
-- 如果模型仍然调用不可用的 plan tool, core 返回 `tool_not_available`.
+- `agent.plan_template` 是 internal readonly/context tool.
+- `agent.plan_template` 只允许 main agent / Orchestrator 使用.
+- sub agent / fork agent 不允许使用 `agent.plan_template`.
+- sub agent / fork agent 的 effective tool set 中默认不包含 `agent.plan_template`.
+- 如果模型仍然调用不可用的 `agent.plan_template`, core 返回 `tool_not_available`.
 
 ## Relationship
 - Plan / Todo / Task 是不同对象, 不做结构化关联:

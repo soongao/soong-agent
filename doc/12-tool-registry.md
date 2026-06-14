@@ -56,7 +56,7 @@
 - `internal.recall_memory` 是只读 internal tool, 可以把选中的 memory 注入 `memory_context` node.
 - `internal.recall_memory` 默认只进入 main agent / Orchestrator 的 effective tool set; sub/fork/worker agent 永远不暴露该工具.
 - Memory Writer 不是普通 agent run 的 tool, 不进入 main/Orchestrator/sub/fork/worker 的 effective tool set.
-- Memory Writer 只供 Memory Extraction Job 使用, 写入边界固定为 `~/.agent/memory`.
+- Memory Writer 只供 Memory Extraction Job 使用, 写入边界固定为 `${SOONG_AGENT_HOME}/memory`.
 - 静态 system prompt 可以说明所有内置工具类别和使用规则.
 - provider 实际收到的 tool schema 只包含当前 run 的 effective tool set.
 - effective tool set 是权限硬边界, system prompt 只是行为指导.
@@ -64,14 +64,14 @@
 - 模型通过 system prompt 自行选择工具; core 只负责暴露可用工具子集和校验调用.
 - 如果模型调用未进入 effective tool set 的工具, core 返回 `tool_not_available`.
 - sub agent / worker sub agent / fork agent 的黑名单规则写死在 effective tool set 计算中:
-	- 不暴露 plan tool.
+	- 不暴露 `agent.plan_template`.
 	- 不暴露 Task DAG 创建/内容修改工具.
 	- 不暴露 create_sub_agent / fork_agent / list_agent_definitions / list_workers / dispatch_worker.
 	- 只暴露其允许查询 ready step、claim step、读取或更新自己 claimed step 的 Task 工具.
 - Tool input schema:
 	- Registry 内部统一使用 JSON Schema dict.
 	- Python code tool 可以用 Pydantic model, 注册时导出 JSON Schema.
-	- `.agent/tools/*.json` 直接提供 JSON Schema.
+	- 用户级 `${SOONG_AGENT_HOME}/tools/*.json` 直接提供 JSON Schema.
 	- MCP tools 转成 JSON Schema.
 	- handler 执行前由 core 做参数校验.
 - Tool JSON Schema 使用 core 支持子集:
@@ -98,7 +98,7 @@
 	- tool_call_id 来自 provider tool call id 或 core 生成 id.
 	- assistant tool_call 和 tool result 通过 tool_call_id 稳定配对, 不按顺序猜测.
 	- `ToolResult.content` 复用通用 ContentBlock, 支持 text/json/artifact_ref 等.
-- readonly/write 权限只表示外部副作用或 workspace 修改风险; `load_skill` / `recall_memory` 这类 internal readonly tool 允许写 core 内部 context node, 不算 write.
+- readonly/write 权限只表示外部副作用或项目目录修改风险; `load_skill` / `recall_memory` 这类 internal readonly tool 允许写 core 内部 context node, 不算 write.
 - Tool call id 由 adapter 映射:
 	- provider 有 tool_call_id 时映射到 core `tool_call_id`.
 	- provider 没有 id 时由 adapter/core 生成.
@@ -107,9 +107,11 @@
 	- code tools: SDK/CLI 代码注册的内置工具.
 	- MCP tools: 从用户级 MCP server 动态发现.
 	- agent tools: list_agent_definitions / create_sub_agent / fork_agent / list_workers / dispatch_worker / inspect_agent 等.
-	- plan/task tools: 内置 plan template tool 和 Task DAG tools.
-	- declarative tools: 用户级 `~/.agent/tools/*.json`.
+	- plan/task tools: 内置 `agent.plan_template` 和 Task DAG tools.
+	- declarative tools: 用户级 `${SOONG_AGENT_HOME}/tools/*.json`.
 - Memory Writer 属于 Memory Extraction Job 的内部受限能力, 不注册成普通 provider-visible tool.
+- 内置 Plan tool:
+	- `agent.plan_template`
 - 内置 Task DAG tools 至少包括:
 	- agent.task_template
 	- agent.task_create
@@ -124,13 +126,82 @@
 	- agent.task_cancel
 - agent tools 对父/Orchestrator 表现为普通 tool call / ToolResult, 但 handler 内部可以启动 child/sub/worker agent run.
 - agent tools 启动子 agent 时通过 AgentDefinitionRegistry 解析 agent_definition_id.
-- 声明式 tools 只支持用户级 `~/.agent/tools/*.json`, 项目目录不声明 executable tool.
-- `.agent/tools/*.json` 执行协议:
+- 声明式 tools 只支持用户级 `${SOONG_AGENT_HOME}/tools/*.json`, 项目目录不声明 executable tool.
+- `${SOONG_AGENT_HOME}/tools/*.json` 执行协议:
 	- stdin JSON 输入.
 	- stdout JSON 输出, 必须复用 `ToolResult` schema.
 	- stderr 作为日志/错误信息.
 	- exit code 非 0 视为 tool error.
+- 内置 code tools 至少包括:
+	- `code.read_file`
+	- `code.list_dir`
+	- `code.search`
+	- `code.write_file`
+	- `code.edit_file`
+	- `code.run_command`
+- `code.read_file`:
+	- readonly.
+	- 按行读取.
+	- 输入包括 path, start_line, max_lines.
+	- 默认 max_lines=200.
+	- 最大 max_lines=1000.
+	- 每行最多返回 4096 bytes; 超过时截断该行并标记 truncated_lines.
+	- 文件未完整返回时标记 truncated=true, next_start_line.
+	- 读取超大文本不 artifact 化全文, 因为源文件本身已经存在.
+	- 二进制文件不直接返回内容, 返回 binary metadata / error result.
+	- file_not_found 返回 tool error, 不使 run failed.
+	- 读取 instruction 文件时, core 额外注册 dynamic system block, 详见 Instructions.
+- `code.list_dir`:
+	- readonly.
+	- 输入包括 path, recursive=false, limit.
+	- 默认非递归.
+	- 可列项目外目录, 但敏感路径需要 permission callback.
+- `code.search`:
+	- readonly.
+	- 基于 `rg` 实现.
+	- 输入包括 query, path, glob, limit.
+	- 默认搜索 `<project>`.
+	- 如果模型传项目外绝对路径, 需要敏感路径检查和 permission callback.
+- `code.write_file`:
+	- write.
+	- 输入包括 path, content, create_dirs=true, overwrite=false.
+	- 默认不覆盖已存在文件; 文件存在时返回 path_conflict.
+	- 覆盖必须显式 overwrite=true, 并走 write permission.
+- `code.edit_file`:
+	- write.
+	- 输入支持两种编辑形式:
+		- `edits`: old/new 精确替换列表.
+		- `unified_diff`: unified diff patch 字符串.
+	- `edits` 和 `unified_diff` 必须二选一, 不能同时提供.
+	- 共同输入包括 path, create_if_missing=false.
+	- 默认不创建文件.
+	- old text 必须唯一匹配; 找不到返回 text_not_found, 多处匹配返回 ambiguous_edit.
+	- replace_all=true 时允许替换所有匹配.
+	- unified_diff 必须只修改当前 path, 不支持 rename/delete/binary patch.
+	- unified_diff 只支持单文件 diff; 多文件修改必须由模型分别调用多次 `code.edit_file`.
+	- unified_diff 必须能干净应用到当前文件内容; context 不匹配返回 patch_apply_failed.
+	- 不提供 dry_run.
+- `code.run_command`:
+	- write + dangerous.
+	- 默认需要 permission.
+	- 第一版不提供 OS 级 sandbox / container sandbox.
+	- 第一版安全边界来自 argv list、cwd 限制、allowed roots、env allowlist、timeout、permission/hook、输出截断/artifact 和 secret redaction.
+	- 输入使用 argv list, 不提供通用 shell string.
+	- shell string 只能通过用户级 declarative tool 显式定义.
+	- 默认 cwd 为 `<project>`.
+	- 可选 cwd, 但必须位于 `<project>` 或 allowed roots 内.
+	- 模型不能传 env; env 只能来自 config/tool definition allowlist.
+	- 默认 timeout 120000ms, 最大 600000ms.
+	- stdout/stderr 过大时截断 + artifact.
+- 敏感路径策略:
+	- 适用于 `code.read_file`, `code.list_dir`, `code.search`.
+	- 默认敏感路径包括 `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `*.pem`, `*.key`, `.env`, `.env.*`.
+	- 命中敏感路径时触发 permission callback.
+	- 没有 permission callback 时 deny.
+- 其他 tool 大输出:
+	- 除 `code.read_file` 外, tool 输出过大时保存 artifact, tool_result 只返回截断摘要和 artifact_ref.
 - Command/declarative tool 执行环境:
+	- 第一版不提供 OS 级 sandbox / container sandbox.
 	- 默认 working directory 使用 session.cwd.
 	- tool definition 可以声明更具体的 `working_dir`, 但必须经过允许范围校验.
 	- 不允许模型在 tool call 中直接指定 cwd.
@@ -191,10 +262,10 @@
 	- readonly
 	- write
 - 文件系统写入边界:
-	- write tool 默认只能写 session.cwd 下的路径.
+	- write tool 默认只能写 `<project>` / session.cwd 下的路径.
 	- 可通过配置增加 `allowed_write_roots`.
 	- `/tmp` / TMPDIR 是否允许写入作为独立配置项.
-	- 超出允许根目录的写入默认 deny, 或由调用方升级为显式用户确认.
+	- 超出允许根目录的写入默认触发 permission callback; 没有 callback 时 deny.
 	- 所有写入目标必须先 normalize 并 resolve symlink.
 	- resolve 后再判断是否位于 allowed roots 下.
 	- 禁止通过软链逃逸写入边界.
@@ -207,7 +278,7 @@
 - dangerous tag:
 	- 高风险工具或 shell command 使用 `dangerous` tag.
 	- dangerous 工具必须显式用户确认.
-	- dangerous 工具不允许 allow for session.
+	- dangerous 工具允许 allow_for_session, 但 scope 必须足够窄.
 	- hook / permission policy 可以按 dangerous tag 拦截.
 - 并发策略:
 	- 按模型输出顺序分组调度 tool calls.
@@ -235,19 +306,21 @@
 	- 若反复发生, 由 max_turns / failed 等高层机制结束.
 - 权限确认:
 	- readonly 自动允许.
-	- write 默认询问用户.
-	- 支持 allow once / allow for session / deny once / deny for session.
-	- 授权/拒绝规则不持久化, 只在当前 session 内存保存.
-	- session 记忆按 canonical tool name + normalized target scope 记录.
+	- write / edit / run_command / declarative write / dangerous / network 工具默认询问用户.
+	- 敏感 read/list/search 默认询问用户.
+	- 支持 allow_once / allow_for_session / deny.
+	- 授权规则不持久化, 只在当前 session 内存保存.
+	- allow_for_session 按 canonical tool name + normalized target scope 记录.
 	- target scope 例如某个已 resolve 的目录、host/domain 或其他工具定义的资源范围.
 	- 不按 tool name 授权任意目标.
-	- deny 只有用户显式选择 deny for session 才写入 session 记忆.
+	- deny 只拒绝本次 tool call, 不写 session deny 记忆.
+	- `code.run_command` 的 allow_for_session scope 至少包含 executable + cwd.
 	- Permission prompt 由 SDK core 通过 callback 请求确认, 调用方负责展示 UI/CLI.
 	- main / Orchestrator / sub / worker / fork agent 的写工具权限确认都走同一个 SDK permission callback.
 	- 子 agent 触发的 permission request 必须包含 agent_id, run_id, parent_agent_id, parent_run_id 和 agent role, 方便调用方/UI 展示请求来源.
-	- 如果调用方没有提供 permission callback, 默认 deny write tool.
+	- 如果调用方没有提供 permission callback, 需要询问的工具默认 deny.
 	- Permission callback async-first: `permission_callback(request) -> Awaitable[PermissionDecision]`.
-	- CLI 可以用同步输入封装 async callback.
+		- CLI 第一版用最小 stdin 同步输入封装 async callback, 只提供 allow_once / allow_for_session / deny 三个选择.
 	- Server/Web 可以挂起等待前端确认.
 	- Permission request 包含风险摘要和展示所需字段:
 		- canonical tool name.
@@ -264,8 +337,7 @@
 	- Permission decision 固定枚举:
 		- allow_once.
 		- allow_for_session.
-		- deny_once.
-		- deny_for_session.
+		- deny.
 	- Permission decision 可带 reason 和 metadata.
 	- Permission callback 不允许 patch tool args, 不允许直接执行工具.
 	- Permission callback 超时或异常时默认 deny.

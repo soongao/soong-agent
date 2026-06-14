@@ -1,11 +1,11 @@
 # Memory
 
 - Memory 是用户级长期知识.
-- 第一版只支持用户级 memory, 固定落在 `~/.agent/memory`.
+- 第一版只支持用户级 memory, 固定落在 `${SOONG_AGENT_HOME}/memory`.
 - 第一版不支持项目记忆:
-	- 不存在 `<project>/.agent/memory`.
+	- 不存在 `<project>/.soong-agent/memory`.
 	- 不把项目文件、Task DAG、Plan 正文或完整 transcript 当作可恢复的项目记忆源.
-	- 项目级配置可以关闭当前项目的 memory 能力, 但不能声明项目 memory 目录.
+	- 不存在项目级 memory 配置.
 - Memory 自动提取自动写入, 但不是 fork agent / sub agent / child agent.
 - Memory Extraction Job:
 	- 是 core 内部的后台 job.
@@ -17,7 +17,7 @@
 	- 使用独立可配置的模型配置 `memory.extract_model_profile`.
 	- `memory.extract_model_profile` 未配置时, 默认完全使用主模型配置.
 	- 可以像主模型一样配置 provider / base_url / api_key_env / model name / context window / output tokens / temperature / timeout / retry.
-	- 通过受限 Memory Writer 直接创建/更新 `~/.agent/memory` 下的 memory md 和 `MEMORY.md`.
+		- 通过受限 Memory Writer 直接创建/更新 `${SOONG_AGENT_HOME}/memory` 下的 memory md 和 `MEMORY.md`.
 	- 不返回候选 memory 给 core 再由 core 改写或代写.
 	- core 仍负责路径、schema、敏感信息和写入边界校验.
 - Core 负责:
@@ -25,8 +25,8 @@
 	- 根据触发条件调度 Memory Extraction Job.
 	- 提供待扫描 context range、`MEMORY.md` catalog 和现有 memory frontmatter.
 	- 为 Memory Extraction Job 构造模型请求.
-	- 提供只能写 `~/.agent/memory` 的受限 Memory Writer.
-	- 校验 memory 文件路径不能逃逸 `~/.agent/memory`.
+		- 提供只能写 `${SOONG_AGENT_HOME}/memory` 的受限 Memory Writer.
+		- 校验 memory 文件路径不能逃逸 `${SOONG_AGENT_HOME}/memory`.
 	- 校验 memory frontmatter 和 `source_node_ids`.
 	- 写 memory_extraction lifecycle event 和审计信息.
 - Memory Extraction Job 负责:
@@ -66,7 +66,7 @@
 	- Memory md 和 `MEMORY.md` 是 source of truth.
 	- 不把 memory 正文存入 SQLite.
 	- 不把 memory 正文存入项目目录.
-	- Memory Writer 只能写 `~/.agent/memory/MEMORY.md` 和 `~/.agent/memory/{user,feedback,reference}/*.md`.
+		- Memory Writer 只能写 `${SOONG_AGENT_HOME}/memory/MEMORY.md` 和 `${SOONG_AGENT_HOME}/memory/{user,feedback,reference}/*.md`.
 	- 创建新 memory 时先写 memory md, 再更新 `MEMORY.md`.
 	- 更新已有 memory 时保留原文件路径, 原子更新 memory md 和 `MEMORY.md`.
 	- 任一文件写入或校验失败时, 本次 Memory Extraction Job 标记 failed, scan cursor 不推进.
@@ -83,10 +83,10 @@
 	- 或新增 token 估算达到阈值.
 	- 或 session idle 超过一定时间.
 - Memory 文件结构:
-	- `~/.agent/memory/MEMORY.md`: 所有 memory md 的目录.
-	- `~/.agent/memory/user/*.md`
-	- `~/.agent/memory/feedback/*.md`
-	- `~/.agent/memory/reference/*.md`
+		- `${SOONG_AGENT_HOME}/memory/MEMORY.md`: 所有 memory md 的目录.
+		- `${SOONG_AGENT_HOME}/memory/user/*.md`
+		- `${SOONG_AGENT_HOME}/memory/feedback/*.md`
+		- `${SOONG_AGENT_HOME}/memory/reference/*.md`
 - Memory 文件命名:
 	- `<category>/<model-chosen-name>-<created_at>-<id>.md`
 	- category 只能是 `user / feedback / reference`.

@@ -15,6 +15,10 @@
 	- `await run.inspect_child(child_run_id)`
 	- `async for event in run.child_events(child_run_id): ...`
 - `runtime.start(...)` 支持结构化 `UserMessage` 和指定/恢复 `session_id`.
+- `AgentRuntime(project_dir=None, ...)` 中 project_dir 省略时使用当前 cwd.
+- 如果 project_dir 指向文件, runtime 使用其父目录作为 `<project>`.
+- 如果 project_dir 不存在, runtime 启动失败.
+- 用户级 home 默认 `~/.soong-agent`, 可通过 `SOONG_AGENT_HOME` 覆盖.
 - `mode` 按 run 指定, 同一个 `AgentRuntime` 可以同时服务 normal run 和 orchestrator run.
 - `mode="normal"` 启动 main agent.
 - `mode="orchestrator"` 启动 Orchestrator agent; Orchestrator 是该模式的主 agent, 不再拆成两层 agent.

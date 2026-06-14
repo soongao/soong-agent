@@ -24,3 +24,4 @@ This document has been split into chapter files for easier editing.
 18. [Config & File Layout](18-config-file-layout.md)
 19. [Testing](19-testing.md)
 20. [Error Handling](20-error-handling.md)
+21. [Codegen Contract](21-codegen-contract.md)

@@ -16,7 +16,7 @@
 	- runtime shutdown 时统一调用 adapter `close()`, 关闭 HTTP client, SDK client, 连接池等资源.
 	- adapter `close()` 必须幂等.
 	- core loop 永远消费 `stream(...)`, 不维护独立 `complete(...)` 路径.
-	- mock/test provider 也实现 streaming 形态, 直接 yield 标准 `ModelEvent`.
+		- 测试内部 fake stream helper 也使用 streaming 形态, 直接 yield 标准 `ModelEvent`, 但不作为公开 provider adapter.
 	- adapter 负责把 provider 原始 streaming 协议转换成 core 标准事件.
 	- core 负责消费事件、写 SQLite、聚合最终 node、调度 tool call.
 - `ModelRequest` 只暴露 provider-neutral 字段:

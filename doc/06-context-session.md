@@ -1,7 +1,7 @@
 # Context & Session
 
 - Context 采用 Node 模型, 每个 conversation item 是一个树节点.
-- 使用 SQLite 持久化 conversation/session 数据, session 数据集中存放在用户级 `~/.agent/sessions.sqlite`.
+- 使用 SQLite 持久化 conversation/session 数据, session 数据集中存放在用户级 `${SOONG_AGENT_HOME}/sessions.sqlite`.
 - Session 是完整 agent tree 的持久化容器; run 是某个 agent 在该 session 内的一次 loop 执行.
 - 同一个 session 内, main/Orchestrator run 串行; child/sub/fork agent run 可以并发.
 - 同一个 session_id 覆盖主 agent 和 sub agent 的过程; 通过 agent_id / run_id 区分不同 agent 和 run.
@@ -28,7 +28,7 @@
 
 ## Task WAL
 - Task DAG 变更不写 SQLite 当前状态表.
-- Task DAG 变更写入 `<project>/.agent/tasks/<session_id>/<model-chosen-task-name>.wal.jsonl`.
+- Task DAG 变更写入 `<project>/.soong-agent/tasks/<session_id>/<model-chosen-task-name>.wal.jsonl`.
 - Task WAL 由 Task manager 单 writer 队列追加.
 - Task WAL append 成功后才更新内存 DAG.
 - runtime 恢复 session 时 replay 对应 WAL 文件重建 Task DAG.

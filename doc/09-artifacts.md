@@ -10,7 +10,7 @@
 	- 图片、PDF、screenshot、二进制文件.
 	- 大 JSON / CSV / profiling result.
 - Artifacts 按 session 存放:
-	- `~/.agent/sessions/<session_id>/artifacts/<artifact_id>/<filename>`
+		- `${SOONG_AGENT_HOME}/sessions/<session_id>/artifacts/<artifact_id>/<filename>`
 	- artifact_id 负责唯一性.
 	- filename 只做人读和下载展示, 不作为唯一标识.
 	- artifact registry 以 artifact_id 为主键.
@@ -36,7 +36,7 @@
 	- session 删除会清理 nodes, events, runs, agents, artifacts.
 	- session 删除默认不删除项目级 Plan Markdown 文件.
 	- Plan Markdown 是普通项目文件.
-	- Task WAL 是项目级文件; delete_session 第一版不自动删除 `<project>/.agent/tasks/<session_id>/*.wal.jsonl`.
+	- Task WAL 是项目级文件; delete_session 第一版不自动删除 `<project>/.soong-agent/tasks/<session_id>/*.wal.jsonl`.
 	- 如果调用方需要清理 Task WAL, 使用单独 project cleanup / session cleanup 选项.
 	- `cleanup_project_tasks(project, dry_run=True, include_failed=False, include_cancelled=False, older_than=None)` 用于清理 terminal Task WAL.
 	- `cleanup_project_tasks` 默认 `dry_run=true`.

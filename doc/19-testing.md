@@ -14,7 +14,7 @@
 	- 并行 agent tools wait_all failure policy: 单个失败不取消其他并行 agent tools.
 	- SQLite mapper / migration.
 	- plan template tool 返回 synthetic user block.
-	- 普通 write tool 写入模型选择的 `.agent/plans/<name>.md`.
+	- 普通 write tool 写入模型选择的 `.soong-agent/plans/<name>.md`.
 	- Task DAG tool schema、权限和状态约束.
 	- task_update 使用结构化 patch operations, 校验各 op 必填字段; 支持 update_task / add_step / update_step / delete_step / add_dependency / remove_dependency / cancel_step / reopen_step; operations 按模型顺序应用到临时 DAG, 最终整体校验后原子提交.
 	- 同一 session 多 active Task DAG, 每个 Task 独立 WAL, Task tools 按 task_id 定位.
@@ -71,12 +71,24 @@
 	- Task completeable diagnostic 不自动完成; `task_complete` 校验 required=true steps 全部 completed 且没有 claimed/running step.
 	- claim skipped / no_step_claimed 只写 runtime event, 不写 Task WAL.
 	- Task WAL JSONL append / replay / failure handling.
-	- AgentDefinitionRegistry 的内置 definition、文件 definition、代码注册 definition、显式 overrides、隐式覆盖拒绝和重复 id 校验.
+	- 配置加载:
+		- `SOONG_AGENT_HOME` 未设置时使用 `~/.soong-agent`.
+		- `SOONG_AGENT_HOME` 设置时只读写该目录下的用户级文件.
+		- `${SOONG_AGENT_HOME}/config.toml` 不存在、解析失败或 schema 校验失败时 runtime / CLI 启动失败.
+		- 不读取 `<project>/.soong-agent/config.toml`.
+		- 不读取项目级 hooks / tools / agents / skills / memory / rules.
+		- `<project>` 由 CLI `--path` 或 SDK `project_dir` 决定; 缺省为 cwd.
+		- `--path` / `project_dir` 指向文件时使用父目录作为 `<project>`, 不自动读取文件正文.
+		- `--path` / `project_dir` 不存在时启动失败.
+		- 启动时 resolve symlink, 后续路径边界判断使用 resolved path.
+	- AgentDefinitionRegistry 的内置 definition、用户级文件 definition、代码注册 definition、显式 overrides、隐式覆盖拒绝和重复 id 校验.
 	- SDK 内置 default_sub_agent / default_fork_agent / default_worker_agent 可被 list_agent_definitions 查询和 worker_pools 引用.
 	- default_worker_agent 默认暴露 Task 查询/claim/update 自己 step 和常规只读文件工具, 不默认暴露写文件工具.
 	- AgentDefinition overrides 是整份替换, 空 body 不继承被覆盖 definition body.
 	- AgentDefinition id 由 definition metadata / SDK code 注册显式提供, core 不自动生成 id 或 namespace.
-	- 文件 definition 不能覆盖 code 注册 definition; project 可显式覆盖 user / builtin; user 可显式覆盖 builtin; user 不能覆盖 project; code 注册 definition 可以显式覆盖任何来源.
+	- 用户级 AgentDefinition 文件只来自 `${SOONG_AGENT_HOME}/agents/*.md`; 不存在项目级 AgentDefinition 目录.
+	- 文件 definition 不能覆盖 code 注册 definition; user 可显式覆盖 builtin; code 注册 definition 可以显式覆盖任何来源.
+	- `agent.list_agent_definitions` 的 source 只允许 builtin / user / code.
 	- `agent.list_agent_definitions` 返回 AgentDefinition catalog, 不返回 worker runtime 状态.
 	- create_sub_agent 禁止 inline system instructions, 未指定 agent_definition_id 时使用 default_sub_agent.
 	- fork_agent 禁止 inline system instructions, 未指定 agent_definition_id 时使用 default_fork_agent.
@@ -96,7 +108,7 @@
 	- 未传 allowed_tools 时, 子 agent 使用自身 agent type / mode / default policy 的默认工具集合, 不继承父 effective tool set.
 	- AgentDefinition.model_profile 是偏好, 可被 runtime/config/SDK 策略覆盖; 模型不能通过 agent tool 参数覆盖.
 	- model_profile 支持字符串引用命名 profile 和 inline partial config; 解析顺序为主 model -> 用途/角色 profile -> SDK/runtime policy.
-	- 项目级 model profile 覆盖 provider/base_url/api_key_env 等敏感字段时受 trusted project / 安全 merge policy 约束.
+	- 项目目录不能声明 model profile, 不能改变 provider/base_url/api_key_env/default model.
 	- orchestrator worker pool 复用.
 	- orchestrator 模式没有有效 worker_pools 时启动失败, 不创建隐式默认 worker pool.
 	- worker pool 可以显式引用内置 default_worker_agent, 但 runtime 不自动创建未配置 worker.
@@ -122,13 +134,13 @@
 	- 自动 compact 达到阈值后创建后台 fork compact agent, 当前 loop 不阻塞.
 	- recovery compact 同步等待 fork compact agent 输出 compaction payload, 再重建上下文.
 	- 当前 agent 即使不能主动使用 `agent.fork_agent`, runtime 仍可触发 compact fork.
-	- fork compact agent 只读 context, 不能创建子 agent, 不能使用 plan tool, 不能创建或修改 Task DAG, 不能调用 recall_memory.
+		- fork compact agent 只读 context, 不能创建子 agent, 不能使用 `agent.plan_template`, 不能创建或修改 Task DAG, 不能调用 recall_memory.
 	- fork compact agent 正常写 agents/runs/events 且 purpose=compact; core 校验 payload 后写 compaction node.
 	- compact 完成时如果触发 active path 不再是当前 active path 前缀, 标记 stale, 不写 compaction node.
 	- Memory Extraction Job 不是 fork/sub/child agent, 不创建 agent_id / run_id, 不进入 agents 表, 不占用 child concurrency.
 	- Memory Extraction Job 使用 `memory.extract_model_profile`; 未配置时完全回退主模型配置.
 	- Memory Recall Selector 使用 `memory.recall_model_profile`; 未配置时完全回退主模型配置.
-	- Memory Writer 只能写 `~/.agent/memory/MEMORY.md` 和 `~/.agent/memory/{user,feedback,reference}/*.md`, 不能写项目 `.agent/memory` 或任意 workspace 路径.
+	- Memory Writer 只能写 `${SOONG_AGENT_HOME}/memory/MEMORY.md` 和 `${SOONG_AGENT_HOME}/memory/{user,feedback,reference}/*.md`, 不能写项目 `.soong-agent/memory` 或任意项目业务路径.
 	- 第一版不支持项目记忆; 项目级配置不能声明 memory source of truth 目录.
 	- sub/fork/worker agent 不能直接写长期 memory; Memory Writer 不进入普通 agent effective tool set.
 	- `internal.recall_memory` 只允许 main agent / Orchestrator 使用; sub/fork/worker 和 compact fork 不暴露.
@@ -138,21 +150,62 @@
 	- Memory 落库成功后才推进 scan cursor; 写文件或 schema 校验失败时不推进 cursor.
 	- duplicate / ignore 且无文件变更的扫描可以推进 cursor.
 	- memory_extraction_* event payload 必须 redacted, completed event 包含 created / updated / ignored / duplicate / conflict / source_node_ids / files_changed / scan_cursor 摘要.
-	- Project instructions 自动加载 cwd 向上链路, 并根据用户提到路径、tool args、最近读写文件选择局部 instructions; 同目录 CLAUDE.md 优先于 AGENTS.md.
-	- 项目级 hooks 需要 trusted project mode 或运行时显式确认后启用; hook command 复用 command runner 的 sandbox/env/timeout/path 校验.
+	- instruction_catalog:
+		- runtime / run 开始时扫描 `${SOONG_AGENT_HOME}/CLAUDE.md`, `${SOONG_AGENT_HOME}/AGENTS.md`, `${SOONG_AGENT_HOME}/rules/**/*.md`, `<project>/**/CLAUDE.md`, `<project>/**/AGENTS.md`.
+		- 不扫描 `<project>/.soong-agent/rules`.
+		- catalog 只包含 path 和 frontmatter 元信息, 不包含正文.
+		- 无 frontmatter 的 instruction 文件不跳过, 使用相对路径作为基础元信息.
+		- 同目录 `CLAUDE.md` 优先于 `AGENTS.md`, catalog 只展示胜出的文件.
+		- 扫描跳过 `.git`, `node_modules`, `.venv`, `venv`, `dist`, `build`, `target`, `.next`, `.cache`, `__pycache__`.
+		- catalog 最多 200 个文件, 超过时截断并标记 truncated.
+		- 模型通过普通 `code.read_file` 决定读取哪些 instruction 正文.
+		- `code.read_file` 读取 instruction 文件时注册 dynamic system block / instruction_context; 普通业务 md 不注册.
+		- 重复读取同 hash instruction 文件返回 already_loaded, 不重复注入.
+	- hooks 只来自用户级 `${SOONG_AGENT_HOME}/hooks.json`; runtime 不读取 `<project>/.soong-agent/hooks.json`.
 	- Hook matcher 只支持 event type / canonical tool name / tag 精确匹配和 path prefix 匹配.
 	- MCP lazy connect 失败时, 失败 server 的 tools 不进入 effective tool set, provider schema 和可用工具视图都隐藏.
+	- code tools:
+		- `code.read_file` 按行读取, 默认 200 行, 单次最多 1000 行, 每行最多 4096 bytes; 超过返回 truncated / next_start_line / truncated_lines.
+		- `code.read_file` 读取大文件不 artifact 化全文; 二进制文件不返回内容; file_not_found 是 tool error, 不使 run failed.
+		- `code.list_dir` 默认非递归, 支持 recursive / limit.
+		- `code.search` 基于 rg, 默认搜索 `<project>`, 支持 query / path / glob / limit.
+		- `code.write_file` 默认 create_dirs=true, overwrite=false; 已存在文件返回 path_conflict.
+		- `code.edit_file` 支持 old/new 精确替换和 unified_diff patch 两种形式; 两者必须二选一.
+		- old/new 要求 old text 唯一, 找不到 text_not_found, 多处匹配 ambiguous_edit; replace_all=true 时替换全部.
+		- unified_diff 必须只修改当前 path, 只支持单文件 diff, 不支持 rename/delete/binary patch; context 不匹配返回 patch_apply_failed.
+		- `code.edit_file` 不提供 dry_run.
+		- `code.run_command` 使用 argv list, 默认 cwd=`<project>`, 可选 cwd 必须位于 `<project>` 或 allowed roots; 模型不能传 env; 默认 timeout 120000ms, 最大 600000ms.
+		- command/declarative tools 第一版不提供 OS 级 sandbox / container sandbox; 测试覆盖 argv/cwd/env/timeout/permission/output 边界.
+		- stdout/stderr 过大时截断 + artifact.
+	- 权限:
+		- decision 只允许 allow_once / allow_for_session / deny.
+		- 没有 always_allow / deny_for_session.
+		- allow_for_session 只保存在当前 session 内存, 不写磁盘.
+		- allow_for_session scope 为 canonical tool name + normalized target scope; `code.run_command` 至少包含 executable + cwd.
+		- write / edit / run_command / declarative write / dangerous / network 工具默认询问.
+		- 普通 readonly 自动允许; 敏感 read/list/search 询问.
+		- 敏感路径包括 `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `*.pem`, `*.key`, `.env`, `.env.*`.
+		- 没有 permission callback 时, 需要询问的工具默认 deny.
+		- CLI permission callback 使用最小 stdin 交互, 只接受 allow_once / allow_for_session / deny; stdin 不可用或输入无效时 deny.
+		- hook deny 和 permission deny 都写 `tool_result is_error=true`; readonly deny 可继续后续安全 readonly, write/dangerous deny 停止后续 tool calls.
 	- delete_session 遇到 running/queued run 返回 session_active; cleanup_project_tasks 和 cleanup_artifacts 默认 dry_run=true.
 	- cleanup_project_tasks 默认只清 completed terminal Task WAL, failed/cancelled 需要显式 include.
 	- cleanup_artifacts 默认只清 debug/raw artifacts, 普通 artifacts 需要 include_all.
 	- Provider/model 不支持本轮 tools/schema 时 run failed, 不静默降级纯文本.
-- 单元测试默认不依赖真实模型和外部网络.
 - 单元测试内部可以使用最小 fake stream helper 提供确定性 `ModelEvent`, 但不作为 SDK adapter 暴露.
-- 提供 Ollama 本地模型集成测试:
-	- Ollama adapter 作为本地 provider 集成测试对象.
-	- 集成测试默认 skip, 只有检测到 Ollama 可用或显式设置环境变量时运行.
-	- Ollama 测试用于验证 streaming、tool call 协议映射、基础 loop 行为.
-	- provider 集成测试使用 Ollama, 不单独设计 Mock/Test provider adapter.
-	- CI 默认不要求机器安装 Ollama.
-- 测试数据使用临时目录、临时 SQLite DB 和临时项目 `.agent/tasks/<session_id>/*.wal.jsonl`.
-- 测试必须避免写入真实 `~/.agent`.
+- Ollama adapter 必须有真实本地模型测试:
+	- 测试时连接本机 Ollama; 如果未运行, 测试 fixture 自动启动 `ollama serve` 并等待健康检查.
+	- 自动启动 Ollama 仅限测试 fixture; 正常 CLI/runtime 不负责启动 Ollama 服务.
+	- 固定使用模型 `gemma4`.
+	- 用户环境已经 pull `gemma4`, 测试代码不负责 pull 模型.
+	- `gemma4` 被视为支持 tool call; tool-call 真实测试不降级、不 skip.
+	- 如果测试 fixture 启动了 Ollama 进程, 测试结束时只停止该进程; 不删除 test-runs 文件.
+	- Ollama 测试覆盖 streaming、tool call 协议映射、基础 loop 行为.
+	- provider 集成测试使用 Ollama, 不单独设计公开 Mock/Test provider adapter.
+- 测试数据使用真实但隔离的测试目录:
+	- `SOONG_AGENT_HOME=~/.soong-agent/test-runs/<run_id>/home`.
+	- `<project>=~/.soong-agent/test-runs/<run_id>/project`.
+	- 测试需要生成该 home 下的 `config.toml`.
+	- 测试可以真实写 `${SOONG_AGENT_HOME}` 和 `<project>/.soong-agent/tasks/<session_id>/*.wal.jsonl`.
+	- 测试结束默认不删除 test-runs, 方便人工查看和调试.
+	- 测试不能触碰 test-runs 之外的真实 `~/.soong-agent` 或其他用户文件.

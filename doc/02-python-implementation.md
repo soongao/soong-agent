@@ -2,6 +2,9 @@
 
 - Python 版本基线: Python 3.11+.
 - 包管理使用 `uv` + `pyproject.toml`.
+- Python distribution name 使用 `soong-agent`.
+- import package name 继续使用 `agent_core`.
+- CLI entry point 使用 `soong-agent`.
 - Core 直接使用实用依赖:
 	- `pydantic`
 	- `httpx`
@@ -66,11 +69,11 @@
 	- storage 到 runtime 的转换由 mapper 负责.
 	- runtime 类型不直接依赖 SQLite row shape.
 	- 类型文件按三层组织:
-		- `agent_core/types/protocol.py`
-		- `agent_core/types/runtime.py`
-		- `agent_core/types/storage.py`
-		- `agent_core/types/mappers.py`
-		- `agent_core/types/enums.py`
+		- `src/agent_core/types/protocol.py`
+		- `src/agent_core/types/runtime.py`
+		- `src/agent_core/types/storage.py`
+		- `src/agent_core/types/mappers.py`
+		- `src/agent_core/types/enums.py`
 	- `protocol.py` 只放 provider / tool / hook 稳定协议类型.
 	- `runtime.py` 放 SDK 调用方、loop、domain 使用的运行态类型.
 	- `storage.py` 放 SQLite row / record 类型.
@@ -91,7 +94,7 @@
 		- SQLite、JSON 和 Task WAL 中保存枚举值字符串.
 		- Python 代码中使用枚举成员, 避免散落硬编码字符串.
 		- 适用范围包括 run status, task status, task step status, event type, permission kind, hook phase, tool kind.
-		- 跨层共享枚举放在 `agent_core/types/enums.py`.
+			- 跨层共享枚举放在 `src/agent_core/types/enums.py`.
 	- storage/runtime mapper 保持轻量:
 		- 只负责字段命名转换、JSON parse/dump、枚举转换、默认值补齐.
 		- 不负责业务规则判断.
@@ -133,7 +136,7 @@
 	- runtime 启动 / 恢复 session 时 replay Task WAL 重建内存 DAG.
 	- Task WAL manager 使用单 writer 队列, 避免并发追加交错.
 	- Task WAL record 使用 Pydantic model 校验.
-	- Task WAL 文件路径默认 `<project>/.agent/tasks/<session_id>/<model-chosen-task-name>.wal.jsonl`.
+	- Task WAL 文件路径默认 `<project>/.soong-agent/tasks/<session_id>/<model-chosen-task-name>.wal.jsonl`.
 - HTTP/provider:
 	- provider adapter 内部可以用 `httpx` async client.
 	- 第一版内置多个常用 provider adapter:
@@ -185,14 +188,19 @@
 	- 使用 `asyncio.create_subprocess_shell` 或 `asyncio.create_subprocess_exec`.
 	- stdin/stdout 都走 JSON 协议.
 	- timeout 和 exit code 由 adapter 统一处理.
+- 项目代码结构按标准 Python 工程组织:
+	- 使用 `src/` layout.
+	- 包目录固定为 `src/agent_core/`.
+	- 测试目录使用 `tests/`.
+	- CLI entry point 在 `pyproject.toml` 中声明为 `soong-agent = "agent_core.cli:main"`.
 - SDK 包结构建议:
-	- `agent_core/runtime`: loop, run state, event stream.
-	- `agent_core/provider`: provider adapter 和统一协议.
-	- `agent_core/context`: SQLite session, node tree, replay.
-	- `agent_core/tools`: tool adapter, registry, permission, execution.
-	- `agent_core/hooks`: hooks config, command hook runner.
-		- `agent_core/memory`: Memory Extraction Job, restricted memory writer, memory file store, recall.
-	- `agent_core/agents`: child agent, fork agent, orchestrator mode.
-	- `agent_core/tasks`: in-memory Task DAG, Task tools, WAL JSONL replay.
-	- `agent_core/config`: `.agent` config loader and merge.
-	- `agent_core/skills`: skill metadata scan and progressive disclosure.
+	- `src/agent_core/runtime`: loop, run state, event stream.
+	- `src/agent_core/provider`: provider adapter 和统一协议.
+	- `src/agent_core/context`: SQLite session, node tree, replay.
+	- `src/agent_core/tools`: tool adapter, registry, permission, execution.
+	- `src/agent_core/hooks`: hooks config, command hook runner.
+	- `src/agent_core/memory`: Memory Extraction Job, restricted memory writer, memory file store, recall.
+	- `src/agent_core/agents`: child agent, fork agent, orchestrator mode.
+	- `src/agent_core/tasks`: in-memory Task DAG, Task tools, WAL JSONL replay.
+	- `src/agent_core/config`: 用户级 `${SOONG_AGENT_HOME}/config.toml` loader 和 schema 校验.
+	- `src/agent_core/skills`: skill metadata scan and progressive disclosure.
