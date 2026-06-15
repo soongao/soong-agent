@@ -7,6 +7,7 @@ import pytest
 from agent_core.cli import async_main, build_parser
 from agent_core.config import load_config
 from agent_core.permissions import stdin_permission_callback
+from agent_core.types.tools import ToolCall
 from tests.conftest import write_config
 from tests.fixtures.scripted_ollama import ScriptedOllama
 
@@ -91,6 +92,138 @@ async def test_cli_run_uses_ollama_provider(isolated_dirs, monkeypatch, capsys, 
     assert captured.err == ""
     assert len(scripted_ollama.requests) == 1
     assert scripted_ollama.requests[0]["model"] == "gemma4"
+
+
+@pytest.mark.asyncio
+async def test_cli_path_file_uses_parent_dir(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    source = project / "src" / "a.py"
+    source.parent.mkdir()
+    source.write_text("print('x')\n", encoding="utf-8")
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_text("file path ok")
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+
+    code = await async_main(["run", "--path", str(source), "hello from file path"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "file path ok" in captured.out
+    assert captured.err == ""
+    db_path = home / "sessions.sqlite"
+    assert db_path.exists()
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT cwd FROM sessions").fetchone()
+    assert row is not None
+    assert row[0] == str(source.parent.resolve())
+
+
+@pytest.mark.asyncio
+async def test_cli_permission_allow_once_writes_file(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="write", name="code.write_file", arguments={"path": "allowed.txt", "content": "ok"})]
+    )
+    scripted_ollama.enqueue_text("write done")
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+
+    from io import StringIO
+
+    monkeypatch.setattr("sys.stdin", StringIO("1\n"))
+    code = await async_main(["run", "--path", str(project), "write a file"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "allow once" in captured.out
+    assert "write done" in captured.out
+    assert captured.err == ""
+    assert (project / "allowed.txt").read_text(encoding="utf-8") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_cli_permission_deny_blocks_write(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="write", name="code.write_file", arguments={"path": "denied.txt", "content": "no"})]
+    )
+    scripted_ollama.enqueue_text("write denied")
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+
+    from io import StringIO
+
+    monkeypatch.setattr("sys.stdin", StringIO("3\n"))
+    code = await async_main(["run", "--path", str(project), "try writing a file"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "deny" in captured.out
+    assert "write denied" in captured.out
+    assert captured.err == ""
+    assert not (project / "denied.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_cli_orchestrator_dispatches_worker_with_ollama(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url, worker_pool=True)
+    scripted_ollama.enqueue_tool_calls(
+        [
+            ToolCall(
+                tool_call_id="create",
+                name="agent.task_create",
+                arguments={
+                    "task_id": "cli_task",
+                    "wal_name": "cli_task.wal.jsonl",
+                    "title": "CLI task",
+                    "summary": "",
+                    "steps": [{"step_id": "s1", "title": "Step 1"}],
+                },
+            )
+        ]
+    )
+    scripted_ollama.enqueue_tool_calls(
+        [
+            ToolCall(
+                tool_call_id="dispatch",
+                name="agent.dispatch_worker",
+                arguments={"task_id": "cli_task", "instruction": "finish it", "allowed_step_ids": ["s1"]},
+            )
+        ]
+    )
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="claim", name="agent.task_claim_step", arguments={"task_id": "cli_task", "step_id": "s1"})]
+    )
+    scripted_ollama.enqueue_tool_calls(
+        [
+            ToolCall(
+                tool_call_id="complete",
+                name="agent.task_update_step",
+                arguments={"task_id": "cli_task", "step_id": "s1", "status": "completed", "result_summary": "done"},
+            )
+        ]
+    )
+    scripted_ollama.enqueue_text("worker done")
+    scripted_ollama.enqueue_text("orchestrator done")
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+    from io import StringIO
+
+    monkeypatch.setattr("sys.stdin", StringIO("1\n1\n1\n"))
+
+    code = await async_main(["run", "--path", str(project), "--orchestrator", "orchestrate cli task"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "orchestrator done" in captured.out
+    assert captured.err == ""
+    assert len(scripted_ollama.requests) == 6
+    wal_files = list((project / ".soong-agent" / "tasks").glob("*/cli_task.wal.jsonl"))
+    assert len(wal_files) == 1
+    wal_text = wal_files[0].read_text(encoding="utf-8")
+    assert "task_step_completed" in wal_text
 
 
 @pytest.mark.asyncio
