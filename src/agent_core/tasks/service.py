@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from agent_core.config.paths import expand_config_path
 from agent_core.errors import AgentCoreError
@@ -48,6 +48,7 @@ class TaskRecord:
         if not entries:
             return
         next_seq = self.wal_seq
+        batch_created_at = utc_iso()
         payloads: list[dict[str, Any]] = []
         for entry in entries:
             next_seq += 1
@@ -62,7 +63,7 @@ class TaskRecord:
                     "task_id": self.task.task_id,
                     "step_id": entry.get("step_id"),
                     "payload": entry["payload"],
-                    "created_at": utc_iso(),
+                    "created_at": entry.get("created_at") or batch_created_at,
                 }
             )
         self.writer.append_many(payloads)
@@ -84,20 +85,36 @@ class TaskService:
         task: Task | None = None
         session_id: str | None = None
         wal_seq = 0
+        first_created_at: str | None = None
+        last_created_at: str | None = None
         for line in wal_path.read_text(encoding="utf-8", errors="replace").splitlines():
             if not line.strip():
                 continue
             event = json.loads(line)
             wal_seq = max(wal_seq, int(event.get("wal_seq") or 0))
             session_id = event.get("session_id") or session_id
+            created_at = event.get("created_at")
+            if created_at:
+                first_created_at = first_created_at or str(created_at)
+                last_created_at = str(created_at)
             payload = event.get("payload") or {}
             event_type = event.get("event_type")
             if event_type == "task_created":
                 task = Task.model_validate(payload["task"])
+                task.wal_path = str(wal_path)
+                task.created_at = task.created_at or first_created_at
+                task.updated_at = task.updated_at or last_created_at or task.created_at
+                _sync_task_roots(task)
+                for step in task.steps:
+                    step.updated_at = step.updated_at or task.created_at
             elif task is not None:
-                self._replay_event(task, event_type, event.get("step_id"), payload)
+                self._replay_event(task, event_type, event.get("step_id"), payload, created_at=created_at)
         if task is None or session_id is None:
             return None
+        task.wal_path = str(wal_path)
+        _sync_task_roots(task)
+        task.created_at = task.created_at or first_created_at
+        task.updated_at = task.updated_at or last_created_at or task.created_at
         record = TaskRecord(task=task, wal_path=wal_path)
         record.wal_seq = wal_seq
         self._records[(session_id, task.task_id)] = record
@@ -109,20 +126,28 @@ class TaskService:
         if key in self._records and self._records[key].task.status not in TERMINAL_TASK_STATUSES:
             raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"active task_id already exists: {task_id}")
         wal_name = _safe_wal_name(str(args["wal_name"]))
-        steps = [_step_from_input(raw) for raw in args.get("steps", [])]
-        _validate_steps(steps)
-        task = Task(
-            task_id=task_id,
-            wal_name=wal_name,
-            title=str(args["title"]),
-            summary=str(args.get("summary", "")),
-            steps=steps,
-        )
-        ready_transitions = self._promote_ready(task)
         wal_dir = _task_wal_dir(context) / context.session_id
         wal_path = wal_dir / wal_name
         if wal_path.exists():
             raise AgentCoreError(ErrorCode.PATH_CONFLICT, f"task WAL already exists: {wal_name}")
+        steps = [_step_from_input(raw) for raw in args.get("steps", [])]
+        _validate_steps(steps)
+        created_at = utc_iso()
+        task = Task(
+            task_id=task_id,
+            wal_name=wal_name,
+            wal_path=str(wal_path),
+            title=str(args["title"]),
+            summary=str(args.get("summary", "")),
+            created_by_agent_id=context.agent_id,
+            created_by_run_id=context.run_id,
+            created_at=created_at,
+            updated_at=created_at,
+            steps=steps,
+        )
+        _sync_task_roots(task)
+        _touch_steps(task, [step.step_id for step in steps], created_at)
+        ready_transitions = self._promote_ready(task)
         record = TaskRecord(task=task, wal_path=wal_path)
         previous_task_status = self._promote_running(task)
         entries = [
@@ -147,6 +172,7 @@ class TaskService:
                     },
                 }
             )
+        _stamp_entries(entries, created_at)
         record.append_many(session_id=context.session_id, entries=entries)
         self._records[key] = record
         return {"task": task.model_dump(mode="json"), "wal_path": str(record.wal_path)}
@@ -175,6 +201,7 @@ class TaskService:
             if not include_terminal and record.task.status in TERMINAL_TASK_STATUSES:
                 continue
             tasks.append(record.task)
+        tasks.sort(key=lambda task: _task_updated_sort_key(task, self._record(context.session_id, task.task_id).wal_path), reverse=True)
         sliced = tasks[offset : offset + limit]
         return {"tasks": [task.model_dump(mode="json") for task in sliced], "truncated": offset + limit < len(tasks)}
 
@@ -225,6 +252,7 @@ class TaskService:
         next_task = task.model_copy(deep=True)
         previous_task_status = task.status
         reopen_events: list[dict[str, Any]] = []
+        task_reopened: dict[str, Any] | None = None
         for op in operations:
             if op.get("op") == "reopen_step":
                 previous_step = _find_step(task, str(op["step_id"]))
@@ -236,10 +264,18 @@ class TaskService:
                             "reason": op.get("reason"),
                         }
                     )
+            elif op.get("op") == "update_task" and op.get("status") == "pending" and next_task.status == "blocked":
+                task_reopened = {"previous_status": next_task.status, "reason": op.get("reason")}
             self._apply_operation(next_task, op)
         _validate_steps(next_task.steps)
         ready_transitions = self._promote_ready(next_task)
         task_running_previous = self._promote_running(next_task)
+        updated_at = utc_iso()
+        _sync_task_roots(next_task)
+        next_task.updated_at = updated_at
+        touched_step_ids = _operation_step_ids(operations)
+        touched_step_ids.extend(step.step_id for step, _previous in ready_transitions)
+        _touch_steps(next_task, touched_step_ids, updated_at)
         entries = [
             {
                 "event_type": "task_updated",
@@ -266,6 +302,19 @@ class TaskService:
                     },
                 }
             )
+        if task_reopened is not None:
+            entries.append(
+                {
+                    "event_type": "task_reopened",
+                    "actor_agent_id": context.agent_id,
+                    "actor_run_id": context.run_id,
+                    "payload": {
+                        "previous_status": task_reopened["previous_status"],
+                        "status": "pending",
+                        "reason": task_reopened["reason"],
+                    },
+                }
+            )
         entries.extend(self._ready_event_entries(context, ready_transitions))
         if task_running_previous is not None and next_task.status == "running":
             entries.append(
@@ -280,6 +329,7 @@ class TaskService:
                     },
                 }
             )
+        _stamp_entries(entries, updated_at)
         record.append_many(session_id=context.session_id, entries=entries)
         record.task = next_task
         return {"task": next_task.model_dump(mode="json")}
@@ -320,6 +370,7 @@ class TaskService:
     ) -> list[TaskStep]:
         record = self._record(context.session_id, task_id)
         self._reconcile_leases(context, record)
+        self._ensure_dispatchable(record.task)
         allowed = set(allowed_step_ids) if allowed_step_ids is not None else None
         steps: list[TaskStep] = []
         for step in record.task.steps:
@@ -353,9 +404,11 @@ class TaskService:
         step.claimed_by_agent_id = context.agent_id
         step.claimed_by_run_id = context.run_id
         step.lease_expires_at = _lease_expires_at(context)
-        record.append_many(
-            session_id=context.session_id,
-            entries=[
+        updated_at = utc_iso()
+        next_task.updated_at = updated_at
+        step.updated_at = updated_at
+        _stamp_entries(
+            entries := [
                 {
                     "event_type": "task_step_claimed",
                     "actor_agent_id": context.agent_id,
@@ -369,6 +422,11 @@ class TaskService:
                     },
                 }
             ],
+            updated_at,
+        )
+        record.append_many(
+            session_id=context.session_id,
+            entries=entries,
         )
         record.task = next_task
         return {"step": step.model_dump(mode="json")}
@@ -420,6 +478,9 @@ class TaskService:
                 raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"unsupported step status: {status}")
         ready_transitions = self._promote_ready(next_task)
         task_running_previous = self._promote_running(next_task)
+        updated_at = utc_iso()
+        next_task.updated_at = updated_at
+        _touch_steps(next_task, [step.step_id, *(transition.step_id for transition, _previous in ready_transitions)], updated_at)
         entries = [
             {
                 "event_type": event_type,
@@ -450,6 +511,7 @@ class TaskService:
                     },
                 }
             )
+        _stamp_entries(entries, updated_at)
         record.append_many(session_id=context.session_id, entries=entries)
         record.task = next_task
         return {"step": step.model_dump(mode="json")}
@@ -465,23 +527,40 @@ class TaskService:
             if step.required and step.status != "completed":
                 raise AgentCoreError(ErrorCode.TASK_NOT_DISPATCHABLE, "required steps are not completed")
         cancelled_optional: list[str] = []
+        entries: list[dict[str, Any]] = []
         for step in next_task.steps:
             if not step.required and step.status not in TERMINAL_STEP_STATUSES:
+                previous = step.status
                 step.status = "cancelled"
                 step.reason = "task_completed"
                 cancelled_optional.append(step.step_id)
+                entries.append(
+                    {
+                        "event_type": "task_step_cancelled",
+                        "actor_agent_id": context.agent_id,
+                        "actor_run_id": context.run_id,
+                        "step_id": step.step_id,
+                        "payload": {
+                            "previous_status": previous,
+                            "reason": "task_completed",
+                            "result_summary": step.result_summary,
+                        },
+                    }
+                )
         next_task.status = "completed"
-        record.append_many(
-            session_id=context.session_id,
-            entries=[
-                {
-                    "event_type": "task_completed",
-                    "actor_agent_id": context.agent_id,
-                    "actor_run_id": context.run_id,
-                    "payload": {"result_summary": args.get("result_summary"), "cancelled_optional_step_ids": cancelled_optional},
-                }
-            ],
+        updated_at = utc_iso()
+        next_task.updated_at = updated_at
+        _touch_steps(next_task, cancelled_optional, updated_at)
+        entries.append(
+            {
+                "event_type": "task_completed",
+                "actor_agent_id": context.agent_id,
+                "actor_run_id": context.run_id,
+                "payload": {"result_summary": args.get("result_summary"), "cancelled_optional_step_ids": cancelled_optional},
+            }
         )
+        _stamp_entries(entries, updated_at)
+        record.append_many(session_id=context.session_id, entries=entries)
         record.task = next_task
         return {"task": next_task.model_dump(mode="json")}
 
@@ -498,33 +577,52 @@ class TaskService:
         next_task = task.model_copy(deep=True)
         changed: list[str] = []
         worker_run_ids: list[str] = []
+        entries: list[dict[str, Any]] = []
         for step in next_task.steps:
             if step.status not in TERMINAL_STEP_STATUSES:
                 if step.claimed_by_run_id:
                     worker_run_ids.append(step.claimed_by_run_id)
+                previous = step.status
                 step.status = step_status
                 step.reason = reason
+                step.result_summary = reason
                 step.claimed_by_agent_id = None
                 step.claimed_by_run_id = None
                 step.lease_expires_at = None
                 changed.append(step.step_id)
+                entries.append(
+                    {
+                        "event_type": f"task_step_{step_status}",
+                        "actor_agent_id": context.agent_id,
+                        "actor_run_id": context.run_id,
+                        "step_id": step.step_id,
+                        "payload": {
+                            "previous_status": previous,
+                            "reason": reason,
+                            "result_summary": step.result_summary,
+                            "artifact_ids": step.artifact_ids,
+                        },
+                    }
+                )
         next_task.status = status
+        updated_at = utc_iso()
+        next_task.updated_at = updated_at
+        _touch_steps(next_task, changed, updated_at)
         terminated = sorted(set(worker_run_ids))
-        record.append_many(
-            session_id=context.session_id,
-            entries=[
-                {
-                    "event_type": event_type,
-                    "actor_agent_id": context.agent_id,
-                    "actor_run_id": context.run_id,
-                    "payload": {
-                        "reason": args.get("reason"),
-                        f"{step_status}_step_ids": changed,
-                        "terminated_worker_run_ids": terminated,
-                    },
-                }
-            ],
+        entries.append(
+            {
+                "event_type": event_type,
+                "actor_agent_id": context.agent_id,
+                "actor_run_id": context.run_id,
+                "payload": {
+                    "reason": args.get("reason"),
+                    f"{step_status}_step_ids": changed,
+                    "terminated_worker_run_ids": terminated,
+                },
+            }
         )
+        _stamp_entries(entries, updated_at)
+        record.append_many(session_id=context.session_id, entries=entries)
         record.task = next_task
         return {"task": next_task.model_dump(mode="json"), "terminated_worker_run_ids": terminated}
 
@@ -535,6 +633,14 @@ class TaskService:
                 task.title = str(op["title"])
             if "summary" in op:
                 task.summary = str(op["summary"])
+            if "status" in op:
+                status = str(op["status"])
+                if status == "blocked":
+                    task.status = "blocked"
+                elif status == "pending" and task.status == "blocked":
+                    task.status = "pending"
+                else:
+                    raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"unsupported task status update: {status}")
         elif kind == "add_step":
             step = _step_from_input(op["step"])
             if any(existing.step_id == step.step_id for existing in task.steps):
@@ -545,8 +651,13 @@ class TaskService:
             for field in ("title", "summary", "worker_pool_id", "required"):
                 if field in op:
                     setattr(step, field, op[field])
+            if "depends_on_step_ids" in op:
+                step.depends_on_step_ids = [validate_safe_id(str(dep), field_name="depends_on_step_id") for dep in op.get("depends_on_step_ids") or []]
         elif kind == "delete_step":
             step_id = str(op["step_id"])
+            step = _find_step(task, step_id)
+            if step.status not in {"pending", "ready", "cancelled"}:
+                raise AgentCoreError(ErrorCode.TASK_NOT_DISPATCHABLE, f"cannot delete {step.status} step")
             if any(step_id in step.depends_on_step_ids for step in task.steps):
                 raise AgentCoreError(ErrorCode.STEP_HAS_DEPENDENTS, "step has dependents")
             task.steps = [step for step in task.steps if step.step_id != step_id]
@@ -766,20 +877,48 @@ class TaskService:
             raise AgentCoreError(ErrorCode.TASK_NOT_FOUND, f"task not found: {task_id}")
         return self._records[key]
 
-    def _replay_event(self, task: Task, event_type: str, step_id: str | None, payload: dict[str, Any]) -> None:
+    def _replay_event(self, task: Task, event_type: str, step_id: str | None, payload: dict[str, Any], *, created_at: str | None = None) -> None:
         if event_type == "task_updated":
-            for op in payload.get("operations") or []:
-                self._apply_operation(task, op)
-            self._promote_ready(task)
-            self._promote_running(task)
+            if payload.get("task_summary"):
+                _replace_task(task, Task.model_validate(payload["task_summary"]))
+            else:
+                for op in payload.get("operations") or []:
+                    self._apply_operation(task, op)
+                self._promote_ready(task)
+                self._promote_running(task)
         elif event_type == "task_running":
             task.status = "running"
+        elif event_type == "task_reopened":
+            task.status = "pending"
+            self._promote_ready(task)
+            self._promote_running(task)
         elif event_type == "task_completed":
             task.status = "completed"
+            for cancelled_step_id in payload.get("cancelled_optional_step_ids") or []:
+                step = _find_step(task, str(cancelled_step_id))
+                step.status = "cancelled"
+                step.reason = "task_completed"
+                step.claimed_by_agent_id = None
+                step.claimed_by_run_id = None
+                step.lease_expires_at = None
         elif event_type == "task_failed":
             task.status = "failed"
+            for failed_step_id in payload.get("failed_step_ids") or []:
+                step = _find_step(task, str(failed_step_id))
+                step.status = "failed"
+                step.reason = "task_failed"
+                step.claimed_by_agent_id = None
+                step.claimed_by_run_id = None
+                step.lease_expires_at = None
         elif event_type == "task_cancelled":
             task.status = "cancelled"
+            for cancelled_step_id in payload.get("cancelled_step_ids") or []:
+                step = _find_step(task, str(cancelled_step_id))
+                step.status = "cancelled"
+                step.reason = "task_cancelled"
+                step.claimed_by_agent_id = None
+                step.claimed_by_run_id = None
+                step.lease_expires_at = None
         elif event_type in {
             "task_step_claimed",
             "task_step_started",
@@ -833,6 +972,9 @@ class TaskService:
                 step.reason = payload.get("reason")
             self._promote_ready(task)
             self._promote_running(task)
+            step.updated_at = created_at or step.updated_at
+        if created_at:
+            task.updated_at = created_at
 
 
 def _step_from_input(raw: dict[str, Any]) -> TaskStep:
@@ -845,6 +987,55 @@ def _step_from_input(raw: dict[str, Any]) -> TaskStep:
         required=bool(raw.get("required", True)),
         worker_pool_id=raw.get("worker_pool_id"),
     )
+
+
+def _stamp_entries(entries: list[dict[str, Any]], created_at: str) -> None:
+    for entry in entries:
+        entry["created_at"] = created_at
+
+
+def _touch_steps(task: Task, step_ids: Iterable[str], updated_at: str) -> None:
+    wanted = {str(step_id) for step_id in step_ids}
+    if not wanted:
+        return
+    for step in task.steps:
+        if step.step_id in wanted:
+            step.updated_at = updated_at
+
+
+def _sync_task_roots(task: Task) -> None:
+    task.root_step_ids = [step.step_id for step in task.steps if not step.depends_on_step_ids]
+
+
+def _operation_step_ids(operations: list[dict[str, Any]]) -> list[str]:
+    step_ids: list[str] = []
+    for operation in operations:
+        kind = operation.get("op")
+        if kind == "add_step" and isinstance(operation.get("step"), dict):
+            raw_step_id = operation["step"].get("step_id")
+            if raw_step_id is not None:
+                step_ids.append(str(raw_step_id))
+        for field in ("step_id", "depends_on_step_id"):
+            if operation.get(field) is not None:
+                step_ids.append(str(operation[field]))
+    return step_ids
+
+
+def _replace_task(target: Task, source: Task) -> None:
+    for field_name in source.__class__.model_fields:
+        setattr(target, field_name, getattr(source, field_name))
+
+
+def _task_updated_sort_key(task: Task, wal_path: Path) -> float:
+    if task.updated_at:
+        try:
+            return _parse_utc(task.updated_at).timestamp()
+        except ValueError:
+            pass
+    try:
+        return wal_path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def _validate_steps(steps: list[TaskStep]) -> None:

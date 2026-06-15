@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent_core import AgentRuntime
+from agent_core.cli import async_main
 from tests.conftest import write_config
 from tests.fixtures.ollama import ollama_server
 
@@ -10,11 +11,9 @@ from tests.fixtures.ollama import ollama_server
 @pytest.mark.asyncio
 async def test_ollama_gemma4_simple_run(isolated_dirs, ollama_server) -> None:
     home, project = isolated_dirs
-    write_config(home, provider="ollama")
+    write_config(home, provider="ollama", base_url=ollama_server, model_name="gemma4")
     config_path = home / "config.toml"
     text = config_path.read_text(encoding="utf-8")
-    text = text.replace('base_url = ""', f'base_url = "{ollama_server}"')
-    text = text.replace('name = "fake-model"', 'name = "gemma4"')
     text = text.replace("timeout_ms = 1000", "timeout_ms = 60000")
     config_path.write_text(text, encoding="utf-8")
     async with AgentRuntime(project_dir=project) as runtime:
@@ -24,14 +23,23 @@ async def test_ollama_gemma4_simple_run(isolated_dirs, ollama_server) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cli_run_uses_local_ollama(isolated_dirs, ollama_server, capsys) -> None:
+    home, project = isolated_dirs
+    write_config(home, provider="ollama", base_url=ollama_server, model_name="gemma4")
+    code = await async_main(["run", "--path", str(project), "Reply with exactly: cli-pong"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.err == ""
+    assert "cli-pong" in captured.out
+
+
+@pytest.mark.asyncio
 async def test_ollama_gemma4_tool_call_list_dir(isolated_dirs, ollama_server) -> None:
     home, project = isolated_dirs
-    write_config(home, provider="ollama")
+    write_config(home, provider="ollama", base_url=ollama_server, model_name="gemma4")
     (project / "marker_tool_file.txt").write_text("marker\n", encoding="utf-8")
     config_path = home / "config.toml"
     text = config_path.read_text(encoding="utf-8")
-    text = text.replace('base_url = ""', f'base_url = "{ollama_server}"')
-    text = text.replace('name = "fake-model"', 'name = "gemma4"')
     text = text.replace("timeout_ms = 1000", "timeout_ms = 60000")
     config_path.write_text(text, encoding="utf-8")
 

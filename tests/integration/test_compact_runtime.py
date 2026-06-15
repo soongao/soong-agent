@@ -3,24 +3,30 @@ from __future__ import annotations
 import pytest
 
 from agent_core import AgentRuntime
-from agent_core.providers import ProviderRegistry
 from tests.conftest import write_config
-from tests.fixtures.fake_provider import FakeProvider
+from tests.fixtures.scripted_ollama import ScriptedOllama
+
+
+def _write_ollama_config(home, scripted_ollama: ScriptedOllama, **kwargs):
+    return write_config(home, base_url=scripted_ollama.base_url, **kwargs)
+
+
+def _runtime(project, scripted_ollama: ScriptedOllama, **kwargs) -> AgentRuntime:
+    return AgentRuntime(project_dir=project, provider_registry=scripted_ollama.provider_registry(), **kwargs)
 
 
 @pytest.mark.asyncio
-async def test_runtime_compact_agent_writes_compaction_node(isolated_dirs) -> None:
+async def test_runtime_compact_agent_writes_compaction_node(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    config_path = write_config(home)
+    config_path = _write_ollama_config(home, scripted_ollama)
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
         + "\n[model_overrides.compact]\nname = \"compact-model\"\nmax_output_tokens = 64\n\n",
         encoding="utf-8",
     )
-    provider = FakeProvider(final_text="compact summary")
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
-    async with AgentRuntime(project_dir=project, provider_registry=registry) as runtime:
+    scripted_ollama.enqueue_text("main")
+    scripted_ollama.enqueue_text("compact summary")
+    async with _runtime(project, scripted_ollama) as runtime:
         handle = await runtime.start("remember this context", session_id="sess_compact")
         _events = [event async for event in handle.events()]
         result = await runtime.run_compact_agent(session_id="sess_compact", reason="test")
@@ -34,16 +40,15 @@ async def test_runtime_compact_agent_writes_compaction_node(isolated_dirs) -> No
     assert compaction_nodes[-1].content[0].text == "compact summary"  # type: ignore[union-attr]
     compact_events = [event for event in replay.events if event.event_type == "compact_completed"]
     assert compact_events and compact_events[-1].payload["stale"] is False
-    compact_requests = [request for request in provider.requests if request.metadata.get("purpose") == "compact"]
+    compact_requests = [request for request in scripted_ollama.requests if request.get("model") == "compact-model"]
     assert compact_requests
-    assert compact_requests[-1].model == "compact-model"
-    assert compact_requests[-1].tools == []
+    assert compact_requests[-1].get("tools") is None
 
 
 @pytest.mark.asyncio
-async def test_runtime_auto_background_compact_after_completed_run(isolated_dirs) -> None:
+async def test_runtime_auto_background_compact_after_completed_run(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    config_path = write_config(home)
+    config_path = _write_ollama_config(home, scripted_ollama)
     text = config_path.read_text(encoding="utf-8")
     text = text.replace("context_window = 8192", "context_window = 80")
     text = text.replace("max_output_tokens = 1024", "max_output_tokens = 16")
@@ -54,10 +59,9 @@ async def test_runtime_auto_background_compact_after_completed_run(isolated_dirs
     text += "\n[compact]\nenabled = true\nreserve_tokens = 0\nkeep_recent_tokens = 5\nauto_background = true\nrecovery_sync = true\nmodel_profile = \"compact\"\nmax_summary_tokens = 64\n\n"
     text += "[model_overrides.compact]\nname = \"compact-model\"\nmax_output_tokens = 64\n\n"
     config_path.write_text(text, encoding="utf-8")
-    provider = FakeProvider(final_text="background compact summary")
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
-    async with AgentRuntime(project_dir=project, provider_registry=registry) as runtime:
+    scripted_ollama.enqueue_text("main")
+    scripted_ollama.enqueue_text("background compact summary")
+    async with _runtime(project, scripted_ollama) as runtime:
         handle = await runtime.start("x" * 400, session_id="sess_auto_compact")
         _events = [event async for event in handle.events()]
         for _ in range(20):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 
 import pytest
 
@@ -11,9 +10,6 @@ from agent_core.agents.workers import WorkerPoolRuntime
 from agent_core.artifacts import ArtifactManager
 from agent_core.config import load_runtime_config
 from agent_core.permissions import PermissionSessionCache
-from agent_core.providers import ModelEvent, ModelRequest, ProviderAdapter, ProviderRegistry
-from agent_core.providers.base import StopReason
-from agent_core.types.content import TextBlock
 from agent_core.types.runtime import RunStatus
 from agent_core.tasks.service import TaskService
 from agent_core.tasks.tools import register_task_tools
@@ -23,6 +19,7 @@ from agent_core.tools.registry import ToolRegistry
 from agent_core.types.permissions import PermissionDecision, PermissionDecisionKind
 from agent_core.types.tools import ToolCall
 from tests.conftest import write_config
+from tests.fixtures.scripted_ollama import ScriptedOllama, text_response, tool_call_response
 
 
 async def make_context(home, project):
@@ -50,6 +47,102 @@ async def make_context(home, project):
         services={"task_service": service},
     )
     return registry, context
+
+
+def _write_ollama_config(home, scripted_ollama: ScriptedOllama, **kwargs):
+    return write_config(home, base_url=scripted_ollama.base_url, **kwargs)
+
+
+def _runtime(project, scripted_ollama: ScriptedOllama, **kwargs) -> AgentRuntime:
+    return AgentRuntime(project_dir=project, provider_registry=scripted_ollama.provider_registry(), **kwargs)
+
+
+def _payload_text(payload: dict) -> str:
+    return "\n".join(str(message.get("content") or "") for message in payload.get("messages", []))
+
+
+def _is_worker_payload(payload: dict) -> bool:
+    text = _payload_text(payload)
+    return "Task id: task1" in text and "Worker pool:" in text
+
+
+def _payload_tool_names(payload: dict) -> set[str]:
+    return {tool["function"]["name"].replace("__", ".") for tool in payload.get("tools", [])}
+
+
+def _worker_payloads(scripted_ollama: ScriptedOllama) -> list[dict]:
+    return [payload for payload in scripted_ollama.requests if _is_worker_payload(payload)]
+
+
+def _enqueue_orchestrator_worker_scenario(
+    scripted_ollama: ScriptedOllama,
+    *,
+    worker_claim_step_id: str = "s1",
+    dispatch_allowed_tools: list[str] | None = None,
+    worker_complete_step: bool = True,
+) -> None:
+    main_turn = 0
+    worker_turn = 0
+
+    def responder(payload: dict, _index: int):
+        nonlocal main_turn, worker_turn
+        if _is_worker_payload(payload):
+            worker_turn += 1
+            if worker_turn == 1:
+                return tool_call_response(
+                    [
+                        ToolCall(
+                            tool_call_id="w_claim",
+                            name="agent.task_claim_step",
+                            arguments={"task_id": "task1", "step_id": worker_claim_step_id},
+                        )
+                    ]
+                )
+            if worker_turn == 2 and worker_complete_step:
+                return tool_call_response(
+                    [
+                        ToolCall(
+                            tool_call_id="w_done",
+                            name="agent.task_update_step",
+                            arguments={
+                                "task_id": "task1",
+                                "step_id": "s1",
+                                "status": "completed",
+                                "result_summary": "worker done",
+                            },
+                        )
+                    ]
+                )
+            if worker_turn == 2:
+                return text_response("worker final without terminal")
+            return text_response("worker final")
+
+        main_turn += 1
+        if main_turn == 1:
+            return tool_call_response(
+                [
+                    ToolCall(
+                        tool_call_id="create",
+                        name="agent.task_create",
+                        arguments={
+                            "task_id": "task1",
+                            "wal_name": "task1.wal.jsonl",
+                            "title": "Task",
+                            "summary": "",
+                            "steps": [{"step_id": "s1", "title": "Step 1"}, {"step_id": "s2", "title": "Step 2"}],
+                        },
+                    )
+                ]
+            )
+        if main_turn == 2:
+            arguments = {"task_id": "task1", "instruction": "do it", "allowed_step_ids": ["s1"]}
+            if dispatch_allowed_tools is not None:
+                arguments["allowed_tools"] = dispatch_allowed_tools
+            return tool_call_response([ToolCall(tool_call_id="dispatch", name="agent.dispatch_worker", arguments=arguments)])
+        return text_response("orchestrator final")
+
+    for _ in range(8):
+        scripted_ollama.enqueue(responder)
 
 
 @pytest.mark.asyncio
@@ -138,17 +231,14 @@ async def test_dispatch_no_step_claimed(isolated_dirs) -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_worker_preflight_skips_run_when_no_ready_step(isolated_dirs) -> None:
+async def test_runtime_worker_preflight_skips_run_when_no_ready_step(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, worker_pool=True)
-    provider = OrchestratorWorkerProvider()
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
+    _write_ollama_config(home, scripted_ollama, worker_pool=True)
 
     async def allow(_request):
         return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry, permission_callback=allow) as runtime:
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
         assert runtime.config and runtime.artifacts
         context = ToolExecutionContext(
             session_id="sess_preflight",
@@ -187,148 +277,20 @@ async def test_runtime_worker_preflight_skips_run_when_no_ready_step(isolated_di
 
     assert result["no_step_claimed"] is True
     assert result["child_run_id"] is None
-    assert provider.requests == []
+    assert scripted_ollama.requests == []
     assert all(event.event_type != "worker_run_started" for event in replay.events)
 
 
-class OrchestratorWorkerProvider(ProviderAdapter):
-    def __init__(self, *, worker_claim_step_id: str = "s1", dispatch_allowed_tools=None, worker_complete_step: bool = True) -> None:
-        self.requests: list[ModelRequest] = []
-        self.worker_claim_step_id = worker_claim_step_id
-        self.dispatch_allowed_tools = dispatch_allowed_tools
-        self.worker_complete_step = worker_complete_step
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
-        self.requests.append(request)
-        yield ModelEvent(event_type="model_started")
-        run_id = str(request.metadata.get("run_id") or "")
-        if run_id.startswith("run_worker"):
-            worker_turn = sum(1 for item in self.requests if str(item.metadata.get("run_id") or "") == run_id)
-            if worker_turn == 1:
-                yield ModelEvent(
-                    event_type="model_completed",
-                    tool_calls=[
-                        ToolCall(
-                            tool_call_id="w_claim",
-                            name="agent.task_claim_step",
-                            arguments={"task_id": "task1", "step_id": self.worker_claim_step_id},
-                        )
-                    ],
-                    stop_reason=StopReason.TOOL_USE,
-                )
-                return
-            if worker_turn == 2 and self.worker_complete_step:
-                yield ModelEvent(
-                    event_type="model_completed",
-                    tool_calls=[
-                        ToolCall(
-                            tool_call_id="w_done",
-                            name="agent.task_update_step",
-                            arguments={"task_id": "task1", "step_id": "s1", "status": "completed", "result_summary": "worker done"},
-                        )
-                    ],
-                    stop_reason=StopReason.TOOL_USE,
-                )
-                return
-            if worker_turn == 2:
-                yield ModelEvent(event_type="model_completed", content=[TextBlock(text="worker final without terminal")], stop_reason=StopReason.END_TURN)
-                return
-            yield ModelEvent(event_type="model_completed", content=[TextBlock(text="worker final")], stop_reason=StopReason.END_TURN)
-            return
-
-        main_turn = sum(1 for item in self.requests if not str(item.metadata.get("run_id") or "").startswith("run_worker"))
-        if main_turn == 1:
-            yield ModelEvent(
-                event_type="model_completed",
-                tool_calls=[
-                    ToolCall(
-                        tool_call_id="create",
-                        name="agent.task_create",
-                        arguments={
-                            "task_id": "task1",
-                            "wal_name": "task1.wal.jsonl",
-                            "title": "Task",
-                            "summary": "",
-                            "steps": [{"step_id": "s1", "title": "Step 1"}, {"step_id": "s2", "title": "Step 2"}],
-                        },
-                    )
-                ],
-                stop_reason=StopReason.TOOL_USE,
-            )
-            return
-        if main_turn == 2:
-            yield ModelEvent(
-                event_type="model_completed",
-                tool_calls=[
-                    ToolCall(
-                        tool_call_id="dispatch",
-                        name="agent.dispatch_worker",
-                        arguments={
-                            "task_id": "task1",
-                            "instruction": "do it",
-                            "allowed_step_ids": ["s1"],
-                            **({"allowed_tools": self.dispatch_allowed_tools} if self.dispatch_allowed_tools is not None else {}),
-                        },
-                    )
-                ],
-                stop_reason=StopReason.TOOL_USE,
-            )
-            return
-        yield ModelEvent(event_type="model_completed", content=[TextBlock(text="orchestrator final")], stop_reason=StopReason.END_TURN)
-
-    async def close(self) -> None:
-        return None
-
-
-class BlockingWorkerProvider(ProviderAdapter):
-    def __init__(self) -> None:
-        self.requests: list[ModelRequest] = []
-        self.worker_run_id: str | None = None
-        self.worker_blocked = asyncio.Event()
-        self.release_worker = asyncio.Event()
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
-        self.requests.append(request)
-        yield ModelEvent(event_type="model_started")
-        run_id = str(request.metadata.get("run_id") or "")
-        if run_id.startswith("run_worker"):
-            self.worker_run_id = run_id
-            worker_turn = sum(1 for item in self.requests if str(item.metadata.get("run_id") or "") == run_id)
-            if worker_turn == 1:
-                yield ModelEvent(
-                    event_type="model_completed",
-                    tool_calls=[
-                        ToolCall(
-                            tool_call_id="w_claim",
-                            name="agent.task_claim_step",
-                            arguments={"task_id": "task1", "step_id": "s1"},
-                        )
-                    ],
-                    stop_reason=StopReason.TOOL_USE,
-                )
-                return
-            self.worker_blocked.set()
-            await self.release_worker.wait()
-            yield ModelEvent(event_type="model_completed", content=[TextBlock(text="late worker final")], stop_reason=StopReason.END_TURN)
-            return
-        yield ModelEvent(event_type="model_completed", content=[TextBlock(text="unused")], stop_reason=StopReason.END_TURN)
-
-    async def close(self) -> None:
-        self.release_worker.set()
-
-
 @pytest.mark.asyncio
-async def test_runtime_dispatch_worker_runs_worker_agent_and_updates_step(isolated_dirs) -> None:
+async def test_runtime_dispatch_worker_runs_worker_agent_and_updates_step(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, worker_pool=True)
-    provider = OrchestratorWorkerProvider()
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
+    _write_ollama_config(home, scripted_ollama, worker_pool=True)
+    _enqueue_orchestrator_worker_scenario(scripted_ollama)
 
     async def allow(_request):
         return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry, permission_callback=allow) as runtime:
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
         handle = await runtime.start("orchestrate", session_id="sess_runtime_worker", mode="orchestrator")
         events = [event.event_type async for event in handle.events()]
         replay = await runtime.replay_session("sess_runtime_worker")
@@ -338,9 +300,9 @@ async def test_runtime_dispatch_worker_runs_worker_agent_and_updates_step(isolat
     assert "worker_run_started" in replay_events
     assert "worker_run_completed" in replay_events
     assert "tool_completed" in events
-    worker_requests = [request for request in provider.requests if str(request.metadata.get("run_id") or "").startswith("run_worker")]
+    worker_requests = _worker_payloads(scripted_ollama)
     assert worker_requests
-    assert {tool.name for tool in worker_requests[0].tools} == {
+    assert _payload_tool_names(worker_requests[0]) == {
         "agent.task_get",
         "agent.task_query_steps",
         "agent.task_claim_step",
@@ -367,17 +329,15 @@ async def test_runtime_dispatch_worker_runs_worker_agent_and_updates_step(isolat
 
 
 @pytest.mark.asyncio
-async def test_runtime_worker_cannot_claim_step_outside_dispatch_scope(isolated_dirs) -> None:
+async def test_runtime_worker_cannot_claim_step_outside_dispatch_scope(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, worker_pool=True)
-    provider = OrchestratorWorkerProvider(worker_claim_step_id="s2")
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
+    _write_ollama_config(home, scripted_ollama, worker_pool=True)
+    _enqueue_orchestrator_worker_scenario(scripted_ollama, worker_claim_step_id="s2")
 
     async def allow(_request):
         return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry, permission_callback=allow) as runtime:
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
         handle = await runtime.start("orchestrate", session_id="sess_worker_scope", mode="orchestrator")
         _events = [event.event_type async for event in handle.events()]
         task_get = runtime.task_service.get_task(
@@ -400,38 +360,34 @@ async def test_runtime_worker_cannot_claim_step_outside_dispatch_scope(isolated_
 
 
 @pytest.mark.asyncio
-async def test_dispatch_allowed_tools_cannot_expand_worker_effective_set(isolated_dirs) -> None:
+async def test_dispatch_allowed_tools_cannot_expand_worker_effective_set(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, worker_pool=True)
-    provider = OrchestratorWorkerProvider(dispatch_allowed_tools=["code.write_file"])
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
+    _write_ollama_config(home, scripted_ollama, worker_pool=True)
+    _enqueue_orchestrator_worker_scenario(scripted_ollama, dispatch_allowed_tools=["code.write_file"])
 
     async def allow(_request):
         return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry, permission_callback=allow) as runtime:
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
         handle = await runtime.start("orchestrate", session_id="sess_worker_bad_tools", mode="orchestrator")
         events = [event.event_type async for event in handle.events()]
 
     assert handle.status == RunStatus.COMPLETED
     assert "tool_failed" in events
-    worker_requests = [request for request in provider.requests if str(request.metadata.get("run_id") or "").startswith("run_worker")]
+    worker_requests = _worker_payloads(scripted_ollama)
     assert worker_requests == []
 
 
 @pytest.mark.asyncio
-async def test_worker_exit_with_unclosed_claim_marks_step_failed(isolated_dirs) -> None:
+async def test_worker_exit_with_unclosed_claim_marks_step_failed(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, worker_pool=True)
-    provider = OrchestratorWorkerProvider(worker_complete_step=False)
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
+    _write_ollama_config(home, scripted_ollama, worker_pool=True)
+    _enqueue_orchestrator_worker_scenario(scripted_ollama, worker_complete_step=False)
 
     async def allow(_request):
         return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry, permission_callback=allow) as runtime:
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
         handle = await runtime.start("orchestrate", session_id="sess_worker_unclosed", mode="orchestrator")
         _events = [event.event_type async for event in handle.events()]
         task_get = runtime.task_service.get_task(
@@ -456,17 +412,25 @@ async def test_worker_exit_with_unclosed_claim_marks_step_failed(isolated_dirs) 
 
 
 @pytest.mark.asyncio
-async def test_task_cancel_cancels_active_worker_run_and_preserves_task_terminal_step(isolated_dirs) -> None:
+async def test_task_cancel_cancels_active_worker_run_and_preserves_task_terminal_step(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, worker_pool=True)
-    provider = BlockingWorkerProvider()
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
+    _write_ollama_config(home, scripted_ollama, worker_pool=True)
+    worker_blocked = asyncio.Event()
+    release_worker = asyncio.Event()
+
+    async def wait_for_release() -> None:
+        worker_blocked.set()
+        await release_worker.wait()
+
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="w_claim", name="agent.task_claim_step", arguments={"task_id": "task1", "step_id": "s1"})]
+    )
+    scripted_ollama.enqueue_text("late worker final", block=wait_for_release)
 
     async def allow(_request):
         return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry, permission_callback=allow) as runtime:
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
         assert runtime.store and runtime.config and runtime.artifacts
         session_id = "sess_worker_task_cancel"
         parent_run_id = "run_parent"
@@ -516,8 +480,12 @@ async def test_task_cancel_cancels_active_worker_run_and_preserves_task_terminal
                 allowed_step_ids=["s1"],
             )
         )
-        await asyncio.wait_for(provider.worker_blocked.wait(), timeout=1)
-        assert provider.worker_run_id is not None
+        await asyncio.wait_for(worker_blocked.wait(), timeout=1)
+        worker_run_ids = [
+            run_id for run_id, meta in runtime._worker_run_meta.items() if meta.get("session_id") == session_id and meta.get("task_id") == "task1"
+        ]
+        assert len(worker_run_ids) == 1
+        worker_run_id = worker_run_ids[0]
 
         cancel = await runtime.tool_registry.execute(
             ToolCall(tool_call_id="cancel", name="agent.task_cancel", arguments={"task_id": "task1", "reason": "stop now"}),
@@ -525,9 +493,10 @@ async def test_task_cancel_cancels_active_worker_run_and_preserves_task_terminal
         )
         assert not cancel.is_error
         cancel_data = cancel.content[0].data  # type: ignore[union-attr]
-        assert cancel_data["terminated_worker_run_ids"] == [provider.worker_run_id]
+        assert cancel_data["terminated_worker_run_ids"] == [worker_run_id]
         with pytest.raises(asyncio.CancelledError):
             await worker_task
+        release_worker.set()
 
         task_get = runtime.task_service.get_task(context, {"task_id": "task1", "include_terminal_steps": True})
         step = task_get["task"]["steps"][0]

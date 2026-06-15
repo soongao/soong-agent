@@ -51,6 +51,24 @@ async def test_read_file_paging_and_line_cap(isolated_dirs) -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_file_binary_returns_metadata_without_artifact(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    path = project / "blob.bin"
+    path.write_bytes(b"abc\x00def")
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(tool_call_id="call1", name="code.read_file", arguments={"path": str(path)}),
+        await make_context(home, project),
+    )
+    data = result.content[0].data  # type: ignore[union-attr]
+    assert not result.is_error
+    assert data["binary"] is True
+    assert data["content"] == ""
+    assert not result.metadata.get("output_artifact_id")
+
+
+@pytest.mark.asyncio
 async def test_read_file_allows_non_sensitive_path_outside_project(isolated_dirs, tmp_path) -> None:
     home, project = isolated_dirs
     outside = tmp_path / "outside.txt"
@@ -63,6 +81,50 @@ async def test_read_file_allows_non_sensitive_path_outside_project(isolated_dirs
     )
     assert not result.is_error
     assert result.content[0].data["content"] == "outside"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_list_dir_nonrecursive_and_recursive_limit(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    (project / "root.txt").write_text("root", encoding="utf-8")
+    nested = project / "nested"
+    nested.mkdir()
+    (nested / "child.txt").write_text("child", encoding="utf-8")
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    context = await make_context(home, project)
+    context.config.tools.stdout_limit_bytes = 4096
+
+    shallow = await registry.execute(
+        ToolCall(tool_call_id="call1", name="code.list_dir", arguments={"path": str(project), "recursive": False}),
+        context,
+    )
+    shallow_names = {entry["name"] for entry in shallow.content[0].data["entries"]}  # type: ignore[union-attr]
+    assert shallow_names == {"nested", "root.txt"}
+
+    recursive = await registry.execute(
+        ToolCall(tool_call_id="call2", name="code.list_dir", arguments={"path": str(project), "recursive": True, "limit": 2}),
+        context,
+    )
+    data = recursive.content[0].data  # type: ignore[union-attr]
+    assert len(data["entries"]) == 2
+    assert data["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_defaults_to_project_path(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    (project / "needle.txt").write_text("needle\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    context = await make_context(home, project)
+    context.config.tools.stdout_limit_bytes = 4096
+    result = await registry.execute(
+        ToolCall(tool_call_id="call1", name="code.search", arguments={"query": "needle"}),
+        context,
+    )
+    matches = result.content[0].data["matches"]  # type: ignore[union-attr]
+    assert any(match["path"].endswith("needle.txt") for match in matches)
 
 
 @pytest.mark.asyncio
@@ -183,6 +245,67 @@ async def test_write_denied_without_callback(isolated_dirs) -> None:
 
 
 @pytest.mark.asyncio
+async def test_write_file_conflict_and_create_dirs(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    target = project / "exists.txt"
+    target.write_text("old", encoding="utf-8")
+
+    async def callback(_request):
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    context = await make_context(home, project, callback)
+
+    conflict = await registry.execute(
+        ToolCall(
+            tool_call_id="call1",
+            name="code.write_file",
+            arguments={"path": "exists.txt", "content": "new", "overwrite": False},
+        ),
+        context,
+    )
+    assert conflict.is_error
+    assert conflict.error and conflict.error.code.value == "path_conflict"
+    assert target.read_text(encoding="utf-8") == "old"
+
+    created = await registry.execute(
+        ToolCall(
+            tool_call_id="call2",
+            name="code.write_file",
+            arguments={"path": "new/dir/file.txt", "content": "new", "create_dirs": True},
+        ),
+        context,
+    )
+    assert not created.is_error
+    assert (project / "new" / "dir" / "file.txt").read_text(encoding="utf-8") == "new"
+    assert created.content[0].data["created"] is True  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_write_file_create_dirs_false_reports_missing_parent(isolated_dirs) -> None:
+    home, project = isolated_dirs
+
+    async def callback(_request):
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(
+            tool_call_id="call1",
+            name="code.write_file",
+            arguments={"path": "missing/dir/file.txt", "content": "new", "create_dirs": False},
+        ),
+        await make_context(home, project, callback),
+    )
+
+    assert result.is_error
+    assert result.error and result.error.code.value == "file_not_found"
+    assert not (project / "missing").exists()
+
+
+@pytest.mark.asyncio
 async def test_write_without_callback_allow_applies_to_plain_write_tools(isolated_dirs) -> None:
     home, project = isolated_dirs
     context = await make_context(home, project)
@@ -218,6 +341,42 @@ async def test_write_without_callback_allow_does_not_allow_dangerous_run_command
     )
     assert result.is_error
     assert result.error and result.error.code.value == "permission_denied"
+
+
+@pytest.mark.asyncio
+async def test_run_command_rejects_shell_string_before_handler(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(tool_call_id="call1", name="code.run_command", arguments={"argv": "echo hi"}),
+        await make_context(home, project),
+    )
+    assert result.is_error
+    assert result.error and result.error.code.value == "validation_error"
+
+
+@pytest.mark.asyncio
+async def test_run_command_cwd_outside_allowed_roots_denied(isolated_dirs, tmp_path) -> None:
+    home, project = isolated_dirs
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    async def callback(_request):
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(
+            tool_call_id="call1",
+            name="code.run_command",
+            arguments={"argv": [sys.executable, "-c", "print('x')"], "cwd": str(outside)},
+        ),
+        await make_context(home, project, callback),
+    )
+    assert result.is_error
+    assert result.error and result.error.code.value == "write_outside_allowed_roots"
 
 
 @pytest.mark.asyncio

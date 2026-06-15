@@ -53,15 +53,17 @@ def test_parse_memory_candidates_from_model_json() -> None:
 
 
 def test_memory_extraction_writes_and_advances_cursor(tmp_path) -> None:
-    job = MemoryExtractionJob(home_dir=tmp_path)
+    job = MemoryExtractionJob(home_dir=tmp_path, source_session_id="sess1")
     result = job.apply(
         [MemoryCandidate(category="user", filename="prefs.md", content="likes tests", source_node_ids=["n1"], summary="Testing preference")],
         source_node_seq=7,
     )
     path = tmp_path / "memory" / "user" / "prefs.md"
     text = path.read_text(encoding="utf-8")
+    created_at = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("created_at: "))
     assert "source_node_ids:" in text
     assert "  - n1" in text
+    assert "source_session_id: sess1" in text
     assert text.endswith("likes tests")
     assert result.created == [str(path)]
     catalog = tmp_path / "memory" / "MEMORY.md"
@@ -74,6 +76,14 @@ def test_memory_extraction_writes_and_advances_cursor(tmp_path) -> None:
     )
     assert duplicate.duplicate == [str(path)]
     assert duplicate.scan_cursor.node_seq == 8
+    updated = job.apply(
+        [MemoryCandidate(category="user", filename="prefs.md", content="likes tests more", source_node_ids=["n2"], summary="Testing preference")],
+        source_node_seq=9,
+    )
+    updated_text = path.read_text(encoding="utf-8")
+    assert updated.updated == [str(path)]
+    assert f"created_at: {created_at}" in updated_text
+    assert "  - n2" in updated_text
 
 
 def test_memory_extraction_invalid_filename_does_not_write_or_advance_cursor(tmp_path) -> None:

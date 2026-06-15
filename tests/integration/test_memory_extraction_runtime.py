@@ -1,58 +1,39 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 import json
 import re
 
 import pytest
 
 from agent_core import AgentRuntime
-from agent_core.providers import ModelEvent, ModelRequest, ProviderAdapter, ProviderRegistry
-from agent_core.providers.base import StopReason
-from agent_core.types.content import TextBlock
 from tests.conftest import write_config
+from tests.fixtures.scripted_ollama import ScriptedOllama, text_response
 
 
-class MemoryProvider(ProviderAdapter):
-    def __init__(self, *, memory_response: str) -> None:
-        self.memory_response = memory_response
-        self.requests: list[ModelRequest] = []
+def _write_ollama_config(home, scripted_ollama: ScriptedOllama, **kwargs):
+    return write_config(home, base_url=scripted_ollama.base_url, **kwargs)
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
-        self.requests.append(request)
-        yield ModelEvent(event_type="model_started")
-        if request.metadata.get("purpose") == "memory_extraction":
-            source_text = "\n".join(getattr(block, "text", "") for block in request.messages[-1].content)
-            match = re.search(r'<node id="([^"]+)"', source_text)
-            node_id = match.group(1) if match else "node_missing"
-            text = self.memory_response.replace("__NODE_ID__", node_id)
-            yield ModelEvent(
-                event_type="model_completed",
-                content=[TextBlock(text=text)],
-                stop_reason=StopReason.END_TURN,
-            )
-            return
-        if request.metadata.get("purpose") == "memory_recall_selector":
-            yield ModelEvent(
-                event_type="model_completed",
-                content=[TextBlock(text='{"selected_paths":["user/prefs.md"]}')],
-                stop_reason=StopReason.END_TURN,
-            )
-            return
-        yield ModelEvent(
-            event_type="model_completed",
-            content=[TextBlock(text="main done")],
-            stop_reason=StopReason.END_TURN,
-        )
 
-    async def close(self) -> None:
-        return None
+def _runtime(project, scripted_ollama: ScriptedOllama, **kwargs) -> AgentRuntime:
+    return AgentRuntime(project_dir=project, provider_registry=scripted_ollama.provider_registry(), **kwargs)
+
+
+def _memory_response_with_source(memory_response: str):
+    def responder(payload: dict, _index: int):
+        source_text = str(payload["messages"][-1].get("content") or "")
+        match = re.search(r'<node id="([^"]+)"', source_text)
+        node_id = match.group(1) if match else "node_missing"
+        return text_response(memory_response.replace("__NODE_ID__", node_id))
+
+    return responder
 
 
 @pytest.mark.asyncio
-async def test_runtime_memory_extraction_uses_model_profile_and_advances_cursor(isolated_dirs) -> None:
+async def test_runtime_memory_extraction_uses_model_profile_and_advances_cursor(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
     home, project = isolated_dirs
-    config_path = write_config(home)
+    config_path = _write_ollama_config(home, scripted_ollama)
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
         + """
@@ -73,41 +54,39 @@ max_output_tokens = 256
 """,
         encoding="utf-8",
     )
-    provider = MemoryProvider(
-        memory_response=json.dumps(
-            {
-                "memories": [
-                    {
-                        "decision": "new",
-                        "category": "user",
-                        "filename": "prefs.md",
-                        "summary": "Testing preference",
-                        "tags": ["test"],
-                        "source_node_ids": ["__NODE_ID__"],
-                        "content": "likes pytest",
-                    }
-                ]
-            }
-        )
+    memory_response = json.dumps(
+        {
+            "memories": [
+                {
+                    "decision": "new",
+                    "category": "user",
+                    "filename": "prefs.md",
+                    "summary": "Testing preference",
+                    "tags": ["test"],
+                    "source_node_ids": ["__NODE_ID__"],
+                    "content": "likes pytest",
+                }
+            ]
+        }
     )
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
+    scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue(_memory_response_with_source(memory_response))
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry) as runtime:
+    async with _runtime(project, scripted_ollama) as runtime:
         handle = await runtime.start("I like pytest", session_id="sess_memory")
         _events = [event async for event in handle.events()]
         replay = await runtime.replay_session("sess_memory")
         metadata = await runtime.store.session_metadata("sess_memory")  # type: ignore[union-attr]
 
-    memory_requests = [request for request in provider.requests if request.metadata.get("purpose") == "memory_extraction"]
+    memory_requests = [request for request in scripted_ollama.requests if request.get("model") == "memory-model"]
     assert memory_requests
-    assert memory_requests[-1].model == "memory-model"
-    assert memory_requests[-1].tools == []
+    assert memory_requests[-1].get("tools") is None
     memory_file = home / "memory" / "user" / "prefs.md"
     assert memory_file.exists()
     memory_text = memory_file.read_text(encoding="utf-8")
     assert "likes pytest" in memory_text
     assert "source_node_ids:" in memory_text
+    assert "source_session_id: sess_memory" in memory_text
     assert metadata["memory_scan_node_seq"] >= 1
     event_types = [event.event_type for event in replay.events]
     assert "memory_extraction_started" in event_types
@@ -119,9 +98,11 @@ max_output_tokens = 256
 
 
 @pytest.mark.asyncio
-async def test_runtime_memory_extraction_failure_does_not_advance_cursor(isolated_dirs) -> None:
+async def test_runtime_memory_extraction_failure_does_not_advance_cursor(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
     home, project = isolated_dirs
-    config_path = write_config(home)
+    config_path = _write_ollama_config(home, scripted_ollama)
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
         + """
@@ -137,13 +118,12 @@ memory_context_token_budget = 6000
 """,
         encoding="utf-8",
     )
-    provider = MemoryProvider(
-        memory_response='{"memories":[{"decision":"new","category":"user","filename":"bad.md","summary":"Bad","content":"missing source"}]}'
+    scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(
+        '{"memories":[{"decision":"new","category":"user","filename":"bad.md","summary":"Bad","content":"missing source"}]}'
     )
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry) as runtime:
+    async with _runtime(project, scripted_ollama) as runtime:
         handle = await runtime.start("remember this", session_id="sess_memory_fail")
         _events = [event async for event in handle.events()]
         replay = await runtime.replay_session("sess_memory_fail")
@@ -158,9 +138,11 @@ memory_context_token_budget = 6000
 
 
 @pytest.mark.asyncio
-async def test_recall_memory_uses_selector_model_and_deduplicates_context(isolated_dirs) -> None:
+async def test_recall_memory_uses_selector_model_and_deduplicates_context(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
     home, project = isolated_dirs
-    config_path = write_config(home)
+    config_path = _write_ollama_config(home, scripted_ollama)
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
         + """
@@ -187,13 +169,11 @@ max_output_tokens = 128
         "---\nid: mem_prefs\ncategory: user\nsummary: Likes pytest\n---\nlikes pytest\n",
         encoding="utf-8",
     )
-    provider = MemoryProvider(memory_response='{"memories":[]}')
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: provider)
+    scripted_ollama.enqueue_text('{"selected_paths":["user/prefs.md"]}')
 
     from agent_core.types.tools import ToolCall
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry) as runtime:
+    async with _runtime(project, scripted_ollama) as runtime:
         await runtime._ensure_started()
         context = runtime._worker_tool_context(
             session_id="sess_recall",
@@ -218,9 +198,8 @@ max_output_tokens = 128
             context,
         )
 
-    recall_requests = [request for request in provider.requests if request.metadata.get("purpose") == "memory_recall_selector"]
+    recall_requests = [request for request in scripted_ollama.requests if request.get("model") == "recall-model"]
     assert recall_requests
-    assert recall_requests[-1].model == "recall-model"
     assert first.content[0].data["selected_by_model"] is True  # type: ignore[union-attr]
     assert first.content[0].data["matches"][0]["id"] == "mem_prefs"  # type: ignore[union-attr]
     assert second.content[0].data["already_recalled"] is True  # type: ignore[union-attr]

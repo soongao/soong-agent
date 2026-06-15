@@ -21,9 +21,23 @@ class AgentDefinitionRegistry:
         if definition.agent_definition_id in self.INTERNAL_ONLY_IDS and source != "builtin":
             raise AgentCoreError(ErrorCode.INVALID_AGENT_OVERRIDE, f"cannot override internal agent definition: {definition.agent_definition_id}")
         existing = self._definitions.get(definition.agent_definition_id)
-        if existing and existing.source == "code" and source != "code":
+        if existing is None:
+            if definition.overrides:
+                raise AgentCoreError(ErrorCode.INVALID_AGENT_OVERRIDE, f"override target not found: {definition.overrides}")
+            self._definitions[definition.agent_definition_id] = _with_registry_metadata(definition, source=source)
+            return
+        if existing.source == source:
+            raise AgentCoreError(ErrorCode.DUPLICATE_AGENT_DEFINITION, f"duplicate agent definition: {definition.agent_definition_id}")
+        if existing.source == "code" and source != "code":
             raise AgentCoreError(ErrorCode.DUPLICATE_AGENT_DEFINITION, "cannot override code registered definition")
-        self._definitions[definition.agent_definition_id] = definition
+        _validate_override(definition, existing)
+        if source == "user" and existing.source != "builtin":
+            raise AgentCoreError(ErrorCode.INVALID_AGENT_OVERRIDE, "user definitions can only override builtin definitions")
+        self._definitions[definition.agent_definition_id] = _with_registry_metadata(
+            definition,
+            source=source,
+            overridden=existing,
+        )
 
     def get(self, agent_definition_id: str) -> AgentDefinition | None:
         return self._definitions.get(agent_definition_id)
@@ -53,3 +67,33 @@ class AgentDefinitionRegistry:
                 raise AgentCoreError(ErrorCode.DUPLICATE_AGENT_DEFINITION, definition.agent_definition_id)
             seen.add(definition.agent_definition_id)
             self.register(definition, source=definition.source)
+
+
+def _validate_override(definition: AgentDefinition, existing: AgentDefinition) -> None:
+    if not definition.overrides:
+        raise AgentCoreError(ErrorCode.DUPLICATE_AGENT_DEFINITION, f"duplicate agent definition: {definition.agent_definition_id}")
+    try:
+        target_source, target_id = definition.overrides.split(":", 1)
+    except ValueError as exc:
+        raise AgentCoreError(ErrorCode.INVALID_AGENT_OVERRIDE, "overrides must use '<source>:<agent_definition_id>'") from exc
+    if target_source != existing.source or target_id != existing.agent_definition_id:
+        raise AgentCoreError(
+            ErrorCode.INVALID_AGENT_OVERRIDE,
+            f"override target mismatch: expected {existing.source}:{existing.agent_definition_id}",
+        )
+
+
+def _with_registry_metadata(
+    definition: AgentDefinition,
+    *,
+    source: str,
+    overridden: AgentDefinition | None = None,
+) -> AgentDefinition:
+    metadata = dict(definition.metadata)
+    metadata["registry_source"] = source
+    if overridden is not None:
+        metadata["overrides"] = {
+            "agent_definition_id": overridden.agent_definition_id,
+            "source": overridden.source,
+        }
+    return definition.model_copy(update={"source": source, "metadata": metadata})

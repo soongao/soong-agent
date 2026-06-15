@@ -34,6 +34,7 @@ class ToolExecutionContext:
     effective_tool_definitions: dict[str, ToolDefinition] | None = None
     services: dict[str, Any] | None = None
     hooks: list[dict[str, Any]] | None = None
+    run_handle: Any | None = None
 
     @property
     def effective_cwd(self) -> Path:

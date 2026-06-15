@@ -7,12 +7,23 @@ from pathlib import Path
 import pytest
 
 from agent_core import AgentRuntime
-from agent_core.providers import ProviderRegistry
 from agent_core.types.permissions import PermissionDecision, PermissionDecisionKind
 from agent_core.types.runtime import RunStatus
 from agent_core.types.tools import ToolCall
 from tests.conftest import write_config
-from tests.fixtures.fake_provider import FakeProvider
+from tests.fixtures.scripted_ollama import ScriptedOllama
+
+
+def _write_ollama_config(home, scripted_ollama: ScriptedOllama, **kwargs):
+    return write_config(home, base_url=scripted_ollama.base_url, **kwargs)
+
+
+def _runtime(project, scripted_ollama: ScriptedOllama, **kwargs) -> AgentRuntime:
+    return AgentRuntime(project_dir=project, provider_registry=scripted_ollama.provider_registry(), **kwargs)
+
+
+def _payload_tool_names(payload: dict) -> set[str]:
+    return {tool["function"]["name"].replace("__", ".") for tool in payload.get("tools", [])}
 
 
 def write_mcp_server(path: Path) -> None:
@@ -88,7 +99,10 @@ while True:
         params = request.get("params") or {}
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        result = {"content": [{"type": "text", "text": f"{name}:{arguments.get('text', '')}"}]}
+        if name == "echo" and arguments.get("text") == "large":
+            result = {"content": [{"type": "text", "text": "x" * 200}]}
+        else:
+            result = {"content": [{"type": "text", "text": f"{name}:{arguments.get('text', '')}"}]}
     else:
         write_message({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32601, "message": "method not found"}})
         continue
@@ -122,24 +136,20 @@ def write_mcp_config(home: Path, server_script: Path, *, disabled_tools: list[st
 
 
 @pytest.mark.asyncio
-async def test_mcp_tools_are_discovered_and_callable(isolated_dirs, tmp_path: Path) -> None:
+async def test_mcp_tools_are_discovered_and_callable(isolated_dirs, tmp_path: Path, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home)
+    _write_ollama_config(home, scripted_ollama)
     server_script = tmp_path / "fake_mcp_server.py"
     write_mcp_server(server_script)
     write_mcp_config(home, server_script)
-    fake = FakeProvider(
-        final_text="done",
-        tool_call=ToolCall(tool_call_id="call1", name="mcp.local.echo", arguments={"text": "hello"}),
-    )
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: fake)
+    scripted_ollama.enqueue_tool_calls([ToolCall(tool_call_id="call1", name="mcp.local.echo", arguments={"text": "hello"})])
+    scripted_ollama.enqueue_text("done")
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry) as runtime:
+    async with _runtime(project, scripted_ollama) as runtime:
         handle = await runtime.start("use mcp")
         events = [event.event_type async for event in handle.events()]
 
-    tool_names = {tool.name for tool in fake.requests[0].tools}
+    tool_names = _payload_tool_names(scripted_ollama.requests[0])
     assert "mcp.local.echo" in tool_names
     assert "mcp.local.write_note" in tool_names
     assert not any(name.startswith("mcp.broken.") for name in tool_names)
@@ -149,29 +159,27 @@ async def test_mcp_tools_are_discovered_and_callable(isolated_dirs, tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_mcp_disabled_tool_is_hidden_from_provider(isolated_dirs, tmp_path: Path) -> None:
+async def test_mcp_disabled_tool_is_hidden_from_provider(isolated_dirs, tmp_path: Path, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home)
+    _write_ollama_config(home, scripted_ollama)
     server_script = tmp_path / "fake_mcp_server.py"
     write_mcp_server(server_script)
     write_mcp_config(home, server_script, disabled_tools=["mcp.local.write_note"])
-    fake = FakeProvider(final_text="done")
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: fake)
+    scripted_ollama.enqueue_text("done")
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry) as runtime:
+    async with _runtime(project, scripted_ollama) as runtime:
         handle = await runtime.start("hello")
         _events = [event.event_type async for event in handle.events()]
 
-    tool_names = {tool.name for tool in fake.requests[0].tools}
+    tool_names = _payload_tool_names(scripted_ollama.requests[0])
     assert "mcp.local.echo" in tool_names
     assert "mcp.local.write_note" not in tool_names
 
 
 @pytest.mark.asyncio
-async def test_mcp_write_tool_uses_permission_callback(isolated_dirs, tmp_path: Path) -> None:
+async def test_mcp_write_tool_uses_permission_callback(isolated_dirs, tmp_path: Path, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home)
+    _write_ollama_config(home, scripted_ollama)
     server_script = tmp_path / "fake_mcp_server.py"
     write_mcp_server(server_script)
     write_mcp_config(home, server_script)
@@ -181,14 +189,10 @@ async def test_mcp_write_tool_uses_permission_callback(isolated_dirs, tmp_path: 
         requests.append(request)
         return PermissionDecision(decision=PermissionDecisionKind.DENY)
 
-    fake = FakeProvider(
-        final_text="done",
-        tool_call=ToolCall(tool_call_id="call1", name="mcp.local.write_note", arguments={"text": "secret"}),
-    )
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: fake)
+    scripted_ollama.enqueue_tool_calls([ToolCall(tool_call_id="call1", name="mcp.local.write_note", arguments={"text": "secret"})])
+    scripted_ollama.enqueue_text("done")
 
-    async with AgentRuntime(project_dir=project, provider_registry=registry, permission_callback=deny) as runtime:
+    async with _runtime(project, scripted_ollama, permission_callback=deny) as runtime:
         handle = await runtime.start("write through mcp")
         events = [event.event_type async for event in handle.events()]
 
@@ -198,3 +202,24 @@ async def test_mcp_write_tool_uses_permission_callback(isolated_dirs, tmp_path: 
     assert "mcp" in requests[0].tags
     assert "tool_denied" in events
     assert handle.status == RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_mcp_large_output_is_registered_as_artifact(isolated_dirs, tmp_path: Path, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    server_script = tmp_path / "fake_mcp_server.py"
+    write_mcp_server(server_script)
+    write_mcp_config(home, server_script)
+    scripted_ollama.enqueue_tool_calls([ToolCall(tool_call_id="call1", name="mcp.local.echo", arguments={"text": "large"})])
+    scripted_ollama.enqueue_text("done")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("use large mcp", session_id="sess_mcp_large")
+        events = [event.event_type async for event in handle.events()]
+        replay = await runtime.replay_session("sess_mcp_large")
+
+    assert "tool_completed" in events
+    assert replay.artifacts
+    assert replay.artifacts[0]["summary"] == "stdout_artifact_id"
+    assert Path(replay.artifacts[0]["path"]).exists()

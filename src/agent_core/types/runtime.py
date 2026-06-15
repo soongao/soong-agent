@@ -68,6 +68,7 @@ class ReplayResult(StrictModel):
     nodes: list[Node] = Field(default_factory=list)
     events: list[RuntimeEvent] = Field(default_factory=list)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    model_requests: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CancelResult(StrictModel):
@@ -82,6 +83,7 @@ class InspectResult(StrictModel):
     nodes: list[Node] = Field(default_factory=list)
     events: list[RuntimeEvent] = Field(default_factory=list)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    model_requests: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class DeleteSessionResult(StrictModel):

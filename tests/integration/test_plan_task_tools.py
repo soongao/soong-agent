@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import json
+import time
 
 import pytest
 
@@ -212,6 +213,73 @@ async def test_task_reopen_step_emits_reopened_wal_event(isolated_dirs) -> None:
     assert reopened[-1]["payload"]["previous_status"] == "failed"
     assert reopened[-1]["payload"]["status"] == "pending"
     assert reopened[-1]["payload"]["reason"] == "retry"
+
+
+@pytest.mark.asyncio
+async def test_task_block_and_reopen_emits_task_reopened_and_replay_restores_running(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    registry = ToolRegistry()
+    service = TaskService()
+    register_task_tools(registry, service)
+    context = await make_context(home, project)
+    await registry.execute(
+        ToolCall(
+            tool_call_id="call_block_create",
+            name="agent.task_create",
+            arguments={
+                "task_id": "task_blocked",
+                "wal_name": "task_blocked.wal.jsonl",
+                "title": "Task",
+                "summary": "",
+                "steps": [{"step_id": "s1", "title": "Step 1"}],
+            },
+        ),
+        context,
+    )
+    blocked = await registry.execute(
+        ToolCall(
+            tool_call_id="call_block",
+            name="agent.task_update",
+            arguments={"task_id": "task_blocked", "operations": [{"op": "update_task", "status": "blocked", "reason": "waiting"}]},
+        ),
+        context,
+    )
+    assert blocked.content[0].data["task"]["status"] == "blocked"  # type: ignore[union-attr]
+    with pytest.raises(Exception) as exc_info:
+        service.dispatchable_steps(context, task_id="task_blocked", worker_pool_id="default")
+    assert getattr(exc_info.value, "code").value == "task_not_dispatchable"
+
+    reopened = await registry.execute(
+        ToolCall(
+            tool_call_id="call_reopen_task",
+            name="agent.task_update",
+            arguments={"task_id": "task_blocked", "operations": [{"op": "update_task", "status": "pending", "reason": "resume"}]},
+        ),
+        context,
+    )
+    assert reopened.content[0].data["task"]["status"] == "running"  # type: ignore[union-attr]
+    wal_events = [
+        json.loads(line)
+        for line in (project / ".soong-agent" / "tasks" / "sess_task" / "task_blocked.wal.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    task_reopened = [event for event in wal_events if event["event_type"] == "task_reopened"]
+    assert task_reopened
+    assert task_reopened[-1]["payload"] == {"previous_status": "blocked", "status": "pending", "reason": "resume"}
+
+    replayed = TaskService()
+    replayed.replay_project(project)
+    registry2 = ToolRegistry()
+    register_task_tools(registry2, replayed)
+    get = await registry2.execute(
+        ToolCall(
+            tool_call_id="call_get_reopened",
+            name="agent.task_get",
+            arguments={"task_id": "task_blocked", "include_terminal_steps": True},
+        ),
+        context,
+    )
+    assert get.content[0].data["task"]["status"] == "running"  # type: ignore[union-attr]
+    assert get.content[0].data["task"]["steps"][0]["status"] == "ready"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -481,3 +549,306 @@ async def test_task_wal_replay_and_terminal_list(isolated_dirs) -> None:
         context,
     )
     assert visible.content[0].data["tasks"][0]["status"] == "completed"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_task_terminal_list_orders_by_updated_at_and_pages(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    registry = ToolRegistry()
+    service = TaskService()
+    register_task_tools(registry, service)
+    context = await make_context(home, project)
+
+    async def create_and_complete(task_id: str) -> None:
+        await registry.execute(
+            ToolCall(
+                tool_call_id=f"create_{task_id}",
+                name="agent.task_create",
+                arguments={
+                    "task_id": task_id,
+                    "wal_name": f"{task_id}.wal.jsonl",
+                    "title": task_id,
+                    "summary": "",
+                    "steps": [{"step_id": "s1", "title": "Step 1"}],
+                },
+            ),
+            context,
+        )
+        await registry.execute(
+            ToolCall(tool_call_id=f"claim_{task_id}", name="agent.task_claim_step", arguments={"task_id": task_id, "step_id": "s1"}),
+            context,
+        )
+        await registry.execute(
+            ToolCall(
+                tool_call_id=f"step_{task_id}",
+                name="agent.task_update_step",
+                arguments={"task_id": task_id, "step_id": "s1", "status": "completed"},
+            ),
+            context,
+        )
+        await registry.execute(
+            ToolCall(tool_call_id=f"complete_{task_id}", name="agent.task_complete", arguments={"task_id": task_id}),
+            context,
+        )
+
+    await create_and_complete("task_old")
+    time.sleep(0.01)
+    await create_and_complete("task_new")
+
+    replayed = TaskService()
+    replayed.replay_project(project)
+    registry2 = ToolRegistry()
+    register_task_tools(registry2, replayed)
+
+    first_page = await registry2.execute(
+        ToolCall(tool_call_id="list_first", name="agent.task_list", arguments={"include_terminal": True, "limit": 1, "offset": 0}),
+        context,
+    )
+    second_page = await registry2.execute(
+        ToolCall(tool_call_id="list_second", name="agent.task_list", arguments={"include_terminal": True, "limit": 1, "offset": 1}),
+        context,
+    )
+    assert first_page.content[0].data["tasks"][0]["task_id"] == "task_new"  # type: ignore[union-attr]
+    assert first_page.content[0].data["truncated"] is True  # type: ignore[union-attr]
+    assert second_page.content[0].data["tasks"][0]["task_id"] == "task_old"  # type: ignore[union-attr]
+    assert second_page.content[0].data["truncated"] is False  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_task_complete_replay_cancels_optional_steps(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    registry = ToolRegistry()
+    service = TaskService()
+    register_task_tools(registry, service)
+    context = await make_context(home, project)
+    await registry.execute(
+        ToolCall(
+            tool_call_id="call_create",
+            name="agent.task_create",
+            arguments={
+                "task_id": "task_optional",
+                "wal_name": "task_optional.wal.jsonl",
+                "title": "Task",
+                "summary": "",
+                "steps": [
+                    {"step_id": "required", "title": "Required"},
+                    {"step_id": "optional", "title": "Optional", "required": False},
+                ],
+            },
+        ),
+        context,
+    )
+    await registry.execute(
+        ToolCall(
+            tool_call_id="call_complete_step",
+            name="agent.task_update_step",
+            arguments={"task_id": "task_optional", "step_id": "required", "status": "completed"},
+        ),
+        context,
+    )
+    complete = await registry.execute(
+        ToolCall(tool_call_id="call_complete_task", name="agent.task_complete", arguments={"task_id": "task_optional"}),
+        context,
+    )
+    assert not complete.is_error
+    live_steps = {step["step_id"]: step for step in complete.content[0].data["task"]["steps"]}  # type: ignore[union-attr]
+    assert live_steps["optional"]["status"] == "cancelled"
+    assert live_steps["optional"]["reason"] == "task_completed"
+
+    replayed = TaskService()
+    replayed.replay_project(project)
+    registry2 = ToolRegistry()
+    register_task_tools(registry2, replayed)
+    get = await registry2.execute(
+        ToolCall(
+            tool_call_id="call_get",
+            name="agent.task_get",
+            arguments={"task_id": "task_optional", "include_terminal_steps": True},
+        ),
+        context,
+    )
+    replay_steps = {step["step_id"]: step for step in get.content[0].data["task"]["steps"]}  # type: ignore[union-attr]
+    assert replay_steps["optional"]["status"] == "cancelled"
+    assert replay_steps["optional"]["reason"] == "task_completed"
+    wal_events = [
+        json.loads(line)
+        for line in (project / ".soong-agent" / "tasks" / "sess_task" / "task_optional.wal.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(event["event_type"] == "task_step_cancelled" and event["step_id"] == "optional" for event in wal_events)
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_and_fail_replay_terminate_unfinished_steps(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    registry = ToolRegistry()
+    service = TaskService()
+    register_task_tools(registry, service)
+    context = await make_context(home, project)
+    for task_id, wal_name, tool_name, expected_status in [
+        ("task_cancel", "task_cancel.wal.jsonl", "agent.task_cancel", "cancelled"),
+        ("task_fail", "task_fail.wal.jsonl", "agent.task_fail", "failed"),
+    ]:
+        await registry.execute(
+            ToolCall(
+                tool_call_id=f"create_{task_id}",
+                name="agent.task_create",
+                arguments={
+                    "task_id": task_id,
+                    "wal_name": wal_name,
+                    "title": "Task",
+                    "summary": "",
+                    "steps": [{"step_id": "s1", "title": "Step 1"}],
+                },
+            ),
+            context,
+        )
+        await registry.execute(
+            ToolCall(tool_call_id=f"terminate_{task_id}", name=tool_name, arguments={"task_id": task_id, "reason": "stop"}),
+            context,
+        )
+
+    replayed = TaskService()
+    replayed.replay_project(project)
+    registry2 = ToolRegistry()
+    register_task_tools(registry2, replayed)
+    for task_id, expected_status in [("task_cancel", "cancelled"), ("task_fail", "failed")]:
+        get = await registry2.execute(
+            ToolCall(
+                tool_call_id=f"get_{task_id}",
+                name="agent.task_get",
+                arguments={"task_id": task_id, "include_terminal_steps": True},
+            ),
+            context,
+        )
+        task = get.content[0].data["task"]  # type: ignore[union-attr]
+        assert task["status"] == expected_status
+        assert task["steps"][0]["status"] == expected_status
+        assert task["steps"][0]["reason"] == f"task_{expected_status}"
+        assert task["steps"][0]["result_summary"] == f"task_{expected_status}"
+        wal_text = (project / ".soong-agent" / "tasks" / "sess_task" / f"{task_id}.wal.jsonl").read_text(encoding="utf-8")
+        assert f"task_step_{expected_status}" in wal_text
+
+
+@pytest.mark.asyncio
+async def test_task_delete_step_status_and_dependent_constraints(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    registry = ToolRegistry()
+    service = TaskService()
+    register_task_tools(registry, service)
+    context = await make_context(home, project)
+    await registry.execute(
+        ToolCall(
+            tool_call_id="create_delete_task",
+            name="agent.task_create",
+            arguments={
+                "task_id": "task_delete",
+                "wal_name": "task_delete.wal.jsonl",
+                "title": "Task",
+                "summary": "",
+                "steps": [
+                    {"step_id": "ready", "title": "Ready"},
+                    {"step_id": "blocked", "title": "Blocked"},
+                    {"step_id": "dep", "title": "Dependent", "depends_on_step_ids": ["blocked"]},
+                ],
+            },
+        ),
+        context,
+    )
+    blocked = await registry.execute(
+        ToolCall(
+            tool_call_id="block_step",
+            name="agent.task_update_step",
+            arguments={"task_id": "task_delete", "step_id": "blocked", "status": "blocked"},
+        ),
+        context,
+    )
+    assert not blocked.is_error
+
+    blocked_delete = await registry.execute(
+        ToolCall(
+            tool_call_id="delete_blocked",
+            name="agent.task_update",
+            arguments={"task_id": "task_delete", "operations": [{"op": "delete_step", "step_id": "blocked"}]},
+        ),
+        context,
+    )
+    assert blocked_delete.is_error
+    assert blocked_delete.error and blocked_delete.error.code.value == "task_not_dispatchable"
+
+    reopen_and_delete = await registry.execute(
+        ToolCall(
+            tool_call_id="delete_ready_dependent",
+            name="agent.task_update",
+            arguments={
+                "task_id": "task_delete",
+                "operations": [
+                    {"op": "reopen_step", "step_id": "blocked"},
+                    {"op": "delete_step", "step_id": "blocked"},
+                ],
+            },
+        ),
+        context,
+    )
+    assert reopen_and_delete.is_error
+    assert reopen_and_delete.error and reopen_and_delete.error.code.value == "step_has_dependents"
+
+    delete_ready = await registry.execute(
+        ToolCall(
+            tool_call_id="delete_ready",
+            name="agent.task_update",
+            arguments={"task_id": "task_delete", "operations": [{"op": "delete_step", "step_id": "ready"}]},
+        ),
+        context,
+    )
+    assert not delete_ready.is_error
+    step_ids = {step["step_id"] for step in delete_ready.content[0].data["task"]["steps"]}  # type: ignore[union-attr]
+    assert "ready" not in step_ids
+
+
+@pytest.mark.asyncio
+async def test_task_terminal_step_update_does_not_write_wal(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    registry = ToolRegistry()
+    service = TaskService()
+    register_task_tools(registry, service)
+    context = await make_context(home, project)
+    await registry.execute(
+        ToolCall(
+            tool_call_id="create_terminal",
+            name="agent.task_create",
+            arguments={
+                "task_id": "task_terminal",
+                "wal_name": "task_terminal.wal.jsonl",
+                "title": "Task",
+                "summary": "",
+                "steps": [{"step_id": "s1", "title": "Step 1"}],
+            },
+        ),
+        context,
+    )
+    await registry.execute(
+        ToolCall(
+            tool_call_id="complete_step",
+            name="agent.task_update_step",
+            arguments={"task_id": "task_terminal", "step_id": "s1", "status": "completed"},
+        ),
+        context,
+    )
+    await registry.execute(
+        ToolCall(tool_call_id="complete_task", name="agent.task_complete", arguments={"task_id": "task_terminal"}),
+        context,
+    )
+    wal_path = project / ".soong-agent" / "tasks" / "sess_task" / "task_terminal.wal.jsonl"
+    before = wal_path.read_text(encoding="utf-8")
+    late = await registry.execute(
+        ToolCall(
+            tool_call_id="late_update",
+            name="agent.task_update_step",
+            arguments={"task_id": "task_terminal", "step_id": "s1", "status": "failed", "reason": "late"},
+        ),
+        context,
+    )
+    after = wal_path.read_text(encoding="utf-8")
+    assert late.is_error
+    assert late.error and late.error.code.value == "task_terminal"
+    assert after == before

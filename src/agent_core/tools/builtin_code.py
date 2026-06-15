@@ -275,6 +275,8 @@ async def write_file(context: ToolExecutionContext, args: dict[str, Any]) -> dic
     overwrite = bool(args.get("overwrite", False))
     if path.exists() and not overwrite:
         raise AgentCoreError(ErrorCode.PATH_CONFLICT, f"path exists and overwrite=false: {path}")
+    if not create_dirs and not path.parent.exists():
+        raise AgentCoreError(ErrorCode.FILE_NOT_FOUND, f"parent directory not found: {path.parent}")
     if create_dirs:
         path.parent.mkdir(parents=True, exist_ok=True)
     created = not path.exists()

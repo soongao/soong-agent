@@ -44,6 +44,24 @@ def test_instruction_catalog_frontmatter_only(isolated_dirs) -> None:
     assert "project body" not in text
 
 
+def test_instruction_catalog_prefers_claude_over_agents_in_same_directory(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    (home / "CLAUDE.md").write_text("---\ntitle: Home Claude\n---\nclaude body\n", encoding="utf-8")
+    (home / "AGENTS.md").write_text("---\ntitle: Home Agents\n---\nagents body\n", encoding="utf-8")
+    nested = project / "pkg"
+    nested.mkdir()
+    (nested / "CLAUDE.md").write_text("---\ntitle: Project Claude\n---\n", encoding="utf-8")
+    (nested / "AGENTS.md").write_text("---\ntitle: Project Agents\n---\n", encoding="utf-8")
+
+    entries, truncated = build_instruction_catalog(home_dir=home, project_dir=project)
+    text = instruction_catalog_text(entries, truncated=truncated)
+
+    assert str((home / "CLAUDE.md").resolve()) in text
+    assert str((home / "AGENTS.md").resolve()) not in text
+    assert str((nested / "CLAUDE.md").resolve()) in text
+    assert str((nested / "AGENTS.md").resolve()) not in text
+
+
 def test_static_system_blocks_load_package_assets(isolated_dirs) -> None:
     home, project = isolated_dirs
     blocks = build_static_system_blocks(home_dir=home, project_dir=project)

@@ -21,14 +21,21 @@ class TaskStep(StrictModel):
     result_summary: str | None = None
     artifact_ids: list[str] = Field(default_factory=list)
     reason: str | None = None
+    updated_at: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class Task(StrictModel):
     task_id: str
     wal_name: str | None = None
+    wal_path: str | None = None
     title: str
     summary: str = ""
     status: str = "pending"
+    root_step_ids: list[str] = Field(default_factory=list)
+    created_by_agent_id: str | None = None
+    created_by_run_id: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
     steps: list[TaskStep] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)

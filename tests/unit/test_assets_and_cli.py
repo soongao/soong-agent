@@ -6,7 +6,9 @@ import pytest
 
 from agent_core.cli import async_main, build_parser
 from agent_core.config import load_config
+from agent_core.permissions import stdin_permission_callback
 from tests.conftest import write_config
+from tests.fixtures.scripted_ollama import ScriptedOllama
 
 
 def test_required_assets_exist() -> None:
@@ -55,6 +57,14 @@ def test_cli_help_has_run_but_no_init(capsys) -> None:
     help_text = parser.format_help()
     assert "run" in help_text
     assert "init" not in help_text
+    assert "--json" not in help_text
+
+    run_parser = parser._subparsers._group_actions[0].choices["run"]  # type: ignore[attr-defined]
+    run_help = run_parser.format_help()
+    assert "--path" in run_help
+    assert "--orchestrator" in run_help
+    assert "--session-id" in run_help
+    assert "--json" not in run_help
 
 
 @pytest.mark.asyncio
@@ -67,30 +77,60 @@ async def test_cli_missing_config_exits_nonzero(isolated_dirs, capsys) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cli_path_file_uses_parent_dir(isolated_dirs, monkeypatch, capsys) -> None:
+async def test_cli_run_uses_ollama_provider(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home)
-    source = project / "src" / "a.py"
-    source.parent.mkdir()
-    source.write_text("print('x')\n", encoding="utf-8")
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_text("cli ok")
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
-    from agent_core import cli
-    from tests.fixtures.fake_provider import FakeProvider
-    from agent_core.providers import ProviderRegistry
-
-    fake = FakeProvider(final_text="ok")
-    registry = ProviderRegistry()
-    registry.register("fake", lambda config: fake)
-
-    original_runtime = cli.AgentRuntime
-
-    def runtime_factory(*args, **kwargs):
-        kwargs["provider_registry"] = registry
-        return original_runtime(*args, **kwargs)
-
-    monkeypatch.setattr(cli, "AgentRuntime", runtime_factory)
-    code = await async_main(["run", "--path", str(source), "hi"])
+    code = await async_main(["run", "--path", str(project), "hello from cli"])
     captured = capsys.readouterr()
+
     assert code == 0
-    assert "ok" in captured.out
-    assert fake.requests[0].metadata["session_id"]
+    assert "cli ok" in captured.out
+    assert captured.err == ""
+    assert len(scripted_ollama.requests) == 1
+    assert scripted_ollama.requests[0]["model"] == "gemma4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stdin_text", "expected"),
+    [
+        ("1\n", "allow_once"),
+        ("2\n", "allow_for_session"),
+        ("3\n", "deny"),
+        ("invalid\n", "deny"),
+        ("", "deny"),
+    ],
+)
+async def test_stdin_permission_choices(monkeypatch, stdin_text: str, expected: str) -> None:
+    from io import StringIO
+
+    from agent_core.types.permissions import PermissionRequest
+
+    monkeypatch.setattr("sys.stdin", StringIO(stdin_text))
+    request = PermissionRequest(
+        request_id="perm_test",
+        session_id="sess_test",
+        agent_id="agent_main",
+        run_id="run_test",
+        parent_agent_id=None,
+        parent_run_id=None,
+        agent_role="main",
+        tool_name="code.write_file",
+        permission="write",
+        tags=["code", "write"],
+        args_summary="{}",
+        target_scope="/tmp/a.txt",
+        cwd="/tmp",
+        env_summary={},
+        network_host=None,
+        dangerous=False,
+        hook_summary=None,
+        suggested_decision="deny",
+    )
+
+    decision = await stdin_permission_callback(request)
+
+    assert decision.decision.value == expected

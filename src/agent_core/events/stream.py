@@ -12,6 +12,10 @@ class EventStream:
         self._closed = False
         self._consumed = False
 
+    @property
+    def has_consumer(self) -> bool:
+        return self._consumed
+
     async def put(self, event: RuntimeEvent) -> None:
         if not self._closed:
             await self._queue.put(event)
@@ -30,4 +34,3 @@ class EventStream:
             if item is None:
                 return
             yield item
-

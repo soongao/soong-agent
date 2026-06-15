@@ -28,17 +28,54 @@ def test_pydantic_extra_forbid() -> None:
 
 def test_error_code_contract_subset() -> None:
     values = {item.value for item in ErrorCode}
-    for expected in [
+    expected_values = {
         "validation_error",
+        "schema_error",
         "config_error",
         "permission_denied",
         "tool_not_available",
+        "timeout",
+        "cancelled",
+        "internal_error",
+        "provider_error",
+        "unsupported_capability",
+        "provider_auth_failed",
+        "provider_rate_limited",
+        "provider_timeout",
+        "storage_error",
+        "migration_failed",
+        "session_active",
         "path_conflict",
+        "file_not_found",
+        "text_not_found",
+        "ambiguous_edit",
+        "patch_apply_failed",
+        "patch_path_mismatch",
         "write_outside_allowed_roots",
+        "invalid_agent_definition",
+        "duplicate_agent_definition",
+        "invalid_agent_override",
+        "child_agent_limit_exceeded",
+        "worker_busy",
+        "worker_not_available",
+        "worker_pool_busy",
+        "task_not_found",
         "task_terminal",
+        "task_not_dispatchable",
+        "dependency_cycle",
+        "step_not_found",
+        "step_not_ready",
+        "step_already_claimed",
+        "step_already_claimed_by_run",
+        "step_has_dependents",
+        "no_step_claimed",
+        "task_wal_unavailable",
+        "memory_recall_failed",
         "memory_write_failed",
-    ]:
-        assert expected in values
+        "skill_not_found",
+        "skill_load_failed",
+    }
+    assert values == expected_values
 
 
 def test_user_message_from_text() -> None:

@@ -34,12 +34,16 @@ class MemoryExtractionResult:
 
 
 class MemoryExtractionJob:
-    def __init__(self, *, home_dir: Path, cursor: MemoryScanCursor | None = None) -> None:
+    def __init__(self, *, home_dir: Path, cursor: MemoryScanCursor | None = None, source_session_id: str | None = None) -> None:
         self.home_dir = home_dir
         self.cursor = cursor or MemoryScanCursor()
+        self.source_session_id = source_session_id
 
     def apply(self, candidates: list[MemoryCandidate], *, source_node_seq: int) -> MemoryExtractionResult:
-        operations = [_prepare_candidate(self.home_dir, candidate) for candidate in candidates]
+        operations = [
+            _prepare_candidate(self.home_dir, candidate, source_session_id=self.source_session_id)
+            for candidate in candidates
+        ]
         memory_root = self.home_dir / "memory"
         catalog_path = memory_root / "MEMORY.md"
         old_catalog = catalog_path.read_text(encoding="utf-8") if catalog_path.exists() else None
@@ -124,7 +128,7 @@ def parse_memory_candidates(text: str) -> list[MemoryCandidate]:
     return candidates
 
 
-def _prepare_candidate(home_dir: Path, candidate: MemoryCandidate) -> dict[str, Any]:
+def _prepare_candidate(home_dir: Path, candidate: MemoryCandidate, *, source_session_id: str | None = None) -> dict[str, Any]:
     if not candidate.source_node_ids:
         raise AgentCoreError(ErrorCode.MEMORY_WRITE_FAILED, "memory candidate missing source_node_ids")
     if candidate.category not in {"user", "feedback", "reference"}:
@@ -136,19 +140,22 @@ def _prepare_candidate(home_dir: Path, candidate: MemoryCandidate) -> dict[str, 
     if not memory_id.startswith("mem_"):
         memory_id = "mem_" + memory_id
     body = _strip_frontmatter(candidate.content).lstrip()
+    path = home_dir / "memory" / candidate.category / filename
+    existing_metadata = _parse_frontmatter(path.read_text(encoding="utf-8", errors="replace")) if path.exists() else {}
     summary = candidate.summary or _first_content_line(body) or filename
+    now = utc_iso()
     content = _frontmatter(
         {
             "id": memory_id,
             "category": candidate.category,
             "summary": summary,
             "tags": candidate.tags or [],
-            "created_at": utc_iso(),
-            "updated_at": utc_iso(),
+            "created_at": existing_metadata.get("created_at") or now,
+            "updated_at": now,
+            "source_session_id": existing_metadata.get("source_session_id") or source_session_id,
             "source_node_ids": candidate.source_node_ids,
         }
     ) + body
-    path = home_dir / "memory" / candidate.category / filename
     ensure_memory_write_allowed(path, home_dir=home_dir)
     return {
         "path": path,

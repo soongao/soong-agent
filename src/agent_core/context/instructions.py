@@ -16,10 +16,12 @@ class InstructionEntry:
 
 def build_instruction_catalog(*, home_dir: Path, project_dir: Path, limit: int = 200) -> tuple[list[InstructionEntry], bool]:
     candidates: list[Path] = []
-    for name in ("CLAUDE.md", "AGENTS.md"):
-        path = home_dir / name
-        if path.exists():
-            candidates.append(path)
+    home_claude = home_dir / "CLAUDE.md"
+    home_agents = home_dir / "AGENTS.md"
+    if home_claude.exists():
+        candidates.append(home_claude)
+    elif home_agents.exists():
+        candidates.append(home_agents)
     rules_dir = home_dir / "rules"
     if rules_dir.exists():
         candidates.extend(sorted(rules_dir.rglob("*.md")))
@@ -71,4 +73,3 @@ def _frontmatter_metadata(path: Path) -> dict[str, Any]:
         key, value = raw.split(":", 1)
         metadata[key.strip()] = value.strip().strip('"').strip("'")
     return metadata or {"name": path.name}
-

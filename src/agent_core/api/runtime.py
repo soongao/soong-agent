@@ -41,11 +41,13 @@ from agent_core.tasks.service import TaskService
 from agent_core.tasks.tools import register_task_tools
 from agent_core.types import (
     AgentDefinition,
+    ArtifactRefBlock,
     CancelResult,
     CleanupResult,
     DeleteSessionResult,
     ErrorPayload,
     InspectResult,
+    JsonBlock,
     Node,
     PermissionDecision,
     PermissionRequest,
@@ -109,6 +111,7 @@ class AgentRuntime:
         self._worker_run_tasks: dict[str, asyncio.Task[Any]] = {}
         self._worker_run_meta: dict[str, dict[str, Any]] = {}
         self._child_managers: dict[str, ChildAgentManager] = {}
+        self._child_run_streams: dict[str, EventStream] = {}
         self._session_child_counts: dict[str, int] = defaultdict(int)
         from agent_core.permissions import PermissionSessionCache
 
@@ -164,6 +167,7 @@ class AgentRuntime:
         allowed_tools: list[str] | None = None,
         expected_output_schema: dict[str, Any] | None = None,
         timeout_ms: int | None = None,
+        parent_handle: RunHandle | None = None,
     ) -> dict[str, Any]:
         await self._ensure_started()
         assert self.store and self.paths and self.config and self._provider
@@ -197,16 +201,23 @@ class AgentRuntime:
         self._session_child_counts[session_id] += 1
         agent_id = new_id(f"agent_{mode}")
         run_id = new_id("run")
+        child_stream = self._open_child_run_stream(run_id)
         await self.store.ensure_agent(agent_id=agent_id, session_id=session_id, agent_type=mode, status="running")
         await self.store.create_run(run_id=run_id, session_id=session_id, agent_id=agent_id, status=RunStatus.RUNNING.value)
-        await self.store.add_event(
-            make_event(
-                session_id=session_id,
-                agent_id=agent_id,
-                run_id=run_id,
-                event_type="child_agent_created" if mode == "sub" else "fork_agent_created",
-                payload={"parent_agent_id": parent_agent_id, "parent_run_id": parent_run_id, "agent_definition_id": agent_definition_id},
-            )
+        await self._emit_child_run_event(
+            stream=child_stream,
+            mirror_handle=parent_handle,
+            session_id=session_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            event_type="child_agent_created" if mode == "sub" else "fork_agent_created",
+            payload={
+                "parent_agent_id": parent_agent_id,
+                "parent_run_id": parent_run_id,
+                "agent_definition_id": agent_definition_id,
+                "child_agent_id": agent_id,
+                "child_run_id": run_id,
+            },
         )
         parent_id = await self.store.active_node_id(session_id)
         task_node = await self.store.add_node(
@@ -239,31 +250,47 @@ class AgentRuntime:
         )
         model_config = resolve_model_config(self.config, definition.model_profile)
         provider = self._provider_for_model(model_config)
-        messages = [ModelMessage(role=ModelRole.USER, content=[TextBlock(text=child_prompt)], node_type="message")]
+        messages = [
+            ModelMessage(
+                role=ModelRole.USER,
+                content=[TextBlock(text=child_prompt)],
+                node_type="message",
+                metadata={"node_id": task_node.node_id},
+            )
+        ]
         end_node_id = task_node.node_id
         result_text = ""
         timeout_seconds = _child_timeout_seconds(self.config, timeout_ms)
         try:
             async with asyncio.timeout(timeout_seconds):
                 for _turn in range(8):
+                    system_blocks = build_system_blocks(
+                        home_dir=self.paths.home_dir,
+                        project_dir=self.paths.project_dir,
+                        context_state=self.context_state,
+                        memory_enabled=self.config.memory.enabled,
+                    ) + [
+                        SystemBlock(
+                            block_id=f"agent_definition.{agent_definition_id}",
+                            source="agent_definition",
+                            content=definition.body or "",
+                            priority=900,
+                            dynamic=True,
+                            metadata={"agent_definition_id": agent_definition_id},
+                        )
+                    ]
+                    await self._emit_child_run_event(
+                        stream=child_stream,
+                        mirror_handle=parent_handle,
+                        session_id=session_id,
+                        agent_id=agent_id,
+                        run_id=run_id,
+                        event_type="context_built",
+                        payload=_context_build_report(messages, system_blocks, tools) | {"model": model_config.name},
+                    )
                     request = ModelRequest(
                         model=model_config.name,
-                        system=build_system_blocks(
-                            home_dir=self.paths.home_dir,
-                            project_dir=self.paths.project_dir,
-                            context_state=self.context_state,
-                            memory_enabled=self.config.memory.enabled,
-                        )
-                        + [
-                            SystemBlock(
-                                block_id=f"agent_definition.{agent_definition_id}",
-                                source="agent_definition",
-                                content=definition.body or "",
-                                priority=900,
-                                dynamic=True,
-                                metadata={"agent_definition_id": agent_definition_id},
-                            )
-                        ],
+                        system=system_blocks,
                         messages=messages,
                         tools=tools,
                         temperature=model_config.temperature,
@@ -275,6 +302,13 @@ class AgentRuntime:
                         provider,
                         request,
                         provider_failure_message=f"{mode} provider failed",
+                        on_model_event=lambda event: self._emit_child_model_event(
+                            stream=child_stream,
+                            session_id=session_id,
+                            agent_id=agent_id,
+                            run_id=run_id,
+                            event=event,
+                        ),
                     )
                     assistant_content = list(completed.content)
                     turn_text = ""
@@ -301,7 +335,14 @@ class AgentRuntime:
                         make_active=False,
                     )
                     end_node_id = assistant_node.node_id
-                    messages.append(ModelMessage(role=ModelRole.ASSISTANT, content=assistant_content, node_type="child_message"))
+                    messages.append(
+                        ModelMessage(
+                            role=ModelRole.ASSISTANT,
+                            content=assistant_content,
+                            node_type="child_message",
+                            metadata={"node_id": assistant_node.node_id},
+                        )
+                    )
                     if not completed.tool_calls:
                         _validate_expected_output_schema(result_text, expected_output_schema)
                         break
@@ -314,6 +355,7 @@ class AgentRuntime:
                         parent_run_id=parent_run_id,
                         calls=completed.tool_calls,
                         allowed_tool_names=base_tool_names,
+                        stream=child_stream,
                     )
                     tool_content = [
                         ToolResultBlock(
@@ -337,7 +379,14 @@ class AgentRuntime:
                         make_active=False,
                     )
                     end_node_id = tool_node.node_id
-                    messages.append(ModelMessage(role=ModelRole.TOOL, content=tool_content, node_type="child_tool_result"))
+                    messages.append(
+                        ModelMessage(
+                            role=ModelRole.TOOL,
+                            content=tool_content,
+                            node_type="child_tool_result",
+                            metadata={"node_id": tool_node.node_id},
+                        )
+                    )
                 else:
                     raise AgentCoreError(ErrorCode.INTERNAL_ERROR, f"{mode} agent max turns exceeded")
         except TimeoutError as exc:
@@ -351,6 +400,18 @@ class AgentRuntime:
                 end_reason="timeout",
                 error={"code": ErrorCode.TIMEOUT.value, "message": f"{mode} agent timed out"},
             )
+            await self._emit_child_run_event(
+                stream=child_stream,
+                mirror_handle=parent_handle,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="child_agent_failed" if mode == "sub" else "fork_agent_failed",
+                level="error",
+                node_id=end_node_id,
+                payload={"code": ErrorCode.TIMEOUT.value, "message": f"{mode} agent timed out", "child_run_id": run_id},
+            )
+            await self._close_child_run_stream(run_id)
             raise AgentCoreError(ErrorCode.TIMEOUT, f"{mode} agent timed out") from exc
         except AgentCoreError as exc:
             child_manager.finished()
@@ -363,6 +424,18 @@ class AgentRuntime:
                 end_reason="failed",
                 error={"code": exc.code.value, "message": exc.message},
             )
+            await self._emit_child_run_event(
+                stream=child_stream,
+                mirror_handle=parent_handle,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="child_agent_failed" if mode == "sub" else "fork_agent_failed",
+                level="error",
+                node_id=end_node_id,
+                payload={"code": exc.code.value, "message": exc.message, "child_run_id": run_id},
+            )
+            await self._close_child_run_stream(run_id)
             raise
         except Exception as exc:
             child_manager.finished()
@@ -375,6 +448,18 @@ class AgentRuntime:
                 end_reason="failed",
                 error={"code": ErrorCode.INTERNAL_ERROR.value, "message": str(exc)},
             )
+            await self._emit_child_run_event(
+                stream=child_stream,
+                mirror_handle=parent_handle,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="child_agent_failed" if mode == "sub" else "fork_agent_failed",
+                level="error",
+                node_id=end_node_id,
+                payload={"code": ErrorCode.INTERNAL_ERROR.value, "message": str(exc), "child_run_id": run_id},
+            )
+            await self._close_child_run_stream(run_id)
             raise
         result_node = await self.store.add_node(
             session_id=session_id,
@@ -399,16 +484,17 @@ class AgentRuntime:
             end_node_id=result_node.node_id,
             end_reason="completed",
         )
-        await self.store.add_event(
-            make_event(
-                session_id=session_id,
-                agent_id=agent_id,
-                run_id=run_id,
-                event_type="child_agent_completed" if mode == "sub" else "fork_agent_completed",
-                node_id=result_node.node_id,
-                payload={"result_summary": result_text},
-            )
+        await self._emit_child_run_event(
+            stream=child_stream,
+            mirror_handle=parent_handle,
+            session_id=session_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            event_type="child_agent_completed" if mode == "sub" else "fork_agent_completed",
+            node_id=result_node.node_id,
+            payload={"result_summary": result_text, "child_agent_id": agent_id, "child_run_id": run_id},
         )
+        await self._close_child_run_stream(run_id)
         child_manager.finished()
         self._session_child_counts[session_id] = max(0, self._session_child_counts[session_id] - 1)
         return {
@@ -435,6 +521,7 @@ class AgentRuntime:
         allowed_tools: list[str] | None = None,
         expected_output_schema: dict[str, Any] | None = None,
         timeout_ms: int | None = None,
+        parent_handle: RunHandle | None = None,
     ) -> dict[str, Any]:
         await self._ensure_started()
         assert self.store and self.paths and self.config and self._provider and self.worker_runtime and self.artifacts
@@ -499,6 +586,7 @@ class AgentRuntime:
 
         agent_id = worker.worker_id
         run_id = new_id("run_worker")
+        worker_stream = self._open_child_run_stream(run_id)
         self.worker_runtime.mark_busy(worker, task_id=task_id)
         current_task = asyncio.current_task()
         if current_task is not None:
@@ -538,18 +626,32 @@ class AgentRuntime:
             make_active=False,
         )
         await self.store.update_run(run_id=run_id, status=RunStatus.RUNNING.value, start_node_id=start_node.node_id)
-        await self.store.add_event(
-            make_event(
-                session_id=session_id,
-                agent_id=agent_id,
-                run_id=run_id,
-                event_type="worker_run_started",
-                node_id=start_node.node_id,
-                payload={"parent_run_id": parent_run_id, "task_id": task_id, "worker_id": worker.worker_id},
-            )
+        await self._emit_child_run_event(
+            stream=worker_stream,
+            mirror_handle=parent_handle,
+            session_id=session_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            event_type="worker_run_started",
+            node_id=start_node.node_id,
+            payload={
+                "parent_agent_id": parent_agent_id,
+                "parent_run_id": parent_run_id,
+                "task_id": task_id,
+                "worker_id": worker.worker_id,
+                "child_run_id": run_id,
+                "stream_id": run_id,
+            },
         )
         worker_scope = {"task_id": task_id, "allowed_step_ids": step_scope, "worker_pool_id": worker.pool_id}
-        messages = [ModelMessage(role=ModelRole.USER, content=[TextBlock(text=worker_prompt)], node_type="worker_dispatch")]
+        messages = [
+            ModelMessage(
+                role=ModelRole.USER,
+                content=[TextBlock(text=worker_prompt)],
+                node_type="worker_dispatch",
+                metadata={"node_id": start_node.node_id},
+            )
+        ]
         end_node_id: str | None = start_node.node_id
         final_text = ""
         worker_result: dict[str, Any] | None = None
@@ -558,24 +660,33 @@ class AgentRuntime:
             model_config = resolve_model_config(self.config, definition.model_profile)
             async with asyncio.timeout(_child_timeout_seconds(self.config, timeout_ms)):
                 for _turn in range(8):
+                    system_blocks = build_system_blocks(
+                        home_dir=self.paths.home_dir,
+                        project_dir=self.paths.project_dir,
+                        context_state=self.context_state,
+                        memory_enabled=self.config.memory.enabled,
+                    ) + [
+                        SystemBlock(
+                            block_id=f"agent_definition.{worker.agent_definition_id}",
+                            source="agent_definition",
+                            content=definition.body or "",
+                            priority=900,
+                            dynamic=True,
+                            metadata={"agent_definition_id": worker.agent_definition_id},
+                        )
+                    ]
+                    await self._emit_child_run_event(
+                        stream=worker_stream,
+                        mirror_handle=parent_handle,
+                        session_id=session_id,
+                        agent_id=agent_id,
+                        run_id=run_id,
+                        event_type="context_built",
+                        payload=_context_build_report(messages, system_blocks, tools) | {"model": model_config.name},
+                    )
                     request = ModelRequest(
                         model=model_config.name,
-                        system=build_system_blocks(
-                            home_dir=self.paths.home_dir,
-                            project_dir=self.paths.project_dir,
-                            context_state=self.context_state,
-                            memory_enabled=self.config.memory.enabled,
-                        )
-                        + [
-                            SystemBlock(
-                                block_id=f"agent_definition.{worker.agent_definition_id}",
-                                source="agent_definition",
-                                content=definition.body or "",
-                                priority=900,
-                                dynamic=True,
-                                metadata={"agent_definition_id": worker.agent_definition_id},
-                            )
-                        ],
+                        system=system_blocks,
                         messages=messages,
                         tools=tools,
                         temperature=model_config.temperature,
@@ -588,6 +699,13 @@ class AgentRuntime:
                         provider,
                         request,
                         provider_failure_message="worker provider failed",
+                        on_model_event=lambda event: self._emit_child_model_event(
+                            stream=worker_stream,
+                            session_id=session_id,
+                            agent_id=agent_id,
+                            run_id=run_id,
+                            event=event,
+                        ),
                     )
                     final_text += "".join(text_parts)
                     assistant_content = list(completed.content)
@@ -608,7 +726,14 @@ class AgentRuntime:
                         make_active=False,
                     )
                     end_node_id = assistant_node.node_id
-                    messages.append(ModelMessage(role=ModelRole.ASSISTANT, content=assistant_content, node_type="worker_message"))
+                    messages.append(
+                        ModelMessage(
+                            role=ModelRole.ASSISTANT,
+                            content=assistant_content,
+                            node_type="worker_message",
+                            metadata={"node_id": assistant_node.node_id},
+                        )
+                    )
                     if not completed.tool_calls:
                         _validate_expected_output_schema(final_text, expected_output_schema)
                         worker_result = {"text": final_text}
@@ -622,6 +747,7 @@ class AgentRuntime:
                         calls=completed.tool_calls,
                         worker_scope=worker_scope,
                         allowed_tool_names=base_names,
+                        stream=worker_stream,
                     )
                     tool_content = [
                         ToolResultBlock(
@@ -645,7 +771,14 @@ class AgentRuntime:
                         make_active=False,
                     )
                     end_node_id = tool_node.node_id
-                    messages.append(ModelMessage(role=ModelRole.TOOL, content=tool_content, node_type="worker_tool_result"))
+                    messages.append(
+                        ModelMessage(
+                            role=ModelRole.TOOL,
+                            content=tool_content,
+                            node_type="worker_tool_result",
+                            metadata={"node_id": tool_node.node_id},
+                        )
+                    )
                 else:
                     raise AgentCoreError(ErrorCode.INTERNAL_ERROR, "worker max turns exceeded")
             if error_payload:
@@ -673,15 +806,15 @@ class AgentRuntime:
             summary = self._worker_step_summary(session_id=session_id, task_id=task_id, worker_run_id=run_id)
             if fallback is not None:
                 summary = _summary_from_step(fallback["step"])
-            await self.store.add_event(
-                make_event(
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    event_type="worker_run_completed",
-                    node_id=end_node_id,
-                    payload={"task_id": task_id, "summary": summary},
-                )
+            await self._emit_child_run_event(
+                stream=worker_stream,
+                mirror_handle=parent_handle,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="worker_run_completed",
+                node_id=end_node_id,
+                payload={"task_id": task_id, "summary": summary, "child_run_id": run_id, "stream_id": run_id},
             )
             return {
                 "worker_agent_id": worker.worker_id,
@@ -714,6 +847,17 @@ class AgentRuntime:
                 end_reason="timeout",
                 error={"code": ErrorCode.TIMEOUT.value, "message": "worker agent timed out"},
             )
+            await self._emit_child_run_event(
+                stream=worker_stream,
+                mirror_handle=parent_handle,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="worker_run_failed",
+                level="error",
+                node_id=end_node_id,
+                payload={"task_id": task_id, "code": ErrorCode.TIMEOUT.value, "message": "worker agent timed out", "child_run_id": run_id, "stream_id": run_id},
+            )
             raise AgentCoreError(ErrorCode.TIMEOUT, "worker agent timed out") from exc
         except asyncio.CancelledError:
             fallback_context = self._worker_tool_context(
@@ -736,15 +880,15 @@ class AgentRuntime:
                 end_node_id=end_node_id,
                 end_reason="cancelled",
             )
-            await self.store.add_event(
-                make_event(
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    event_type="worker_run_cancelled",
-                    node_id=end_node_id,
-                    payload={"task_id": task_id, "worker_id": worker.worker_id},
-                )
+            await self._emit_child_run_event(
+                stream=worker_stream,
+                mirror_handle=parent_handle,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="worker_run_cancelled",
+                node_id=end_node_id,
+                payload={"task_id": task_id, "worker_id": worker.worker_id, "child_run_id": run_id, "stream_id": run_id},
             )
             raise
         except Exception as exc:
@@ -771,11 +915,23 @@ class AgentRuntime:
                 end_reason="failed",
                 error={"code": str(code), "message": message_text},
             )
+            await self._emit_child_run_event(
+                stream=worker_stream,
+                mirror_handle=parent_handle,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="worker_run_failed",
+                level="error",
+                node_id=end_node_id,
+                payload={"task_id": task_id, "code": str(code), "message": message_text, "child_run_id": run_id, "stream_id": run_id},
+            )
             raise
         finally:
             self._worker_run_tasks.pop(run_id, None)
             self._worker_run_meta.pop(run_id, None)
             self.worker_runtime.mark_idle(worker)
+            await self._close_child_run_stream(run_id)
 
     async def run_compact_agent(
         self,
@@ -783,6 +939,7 @@ class AgentRuntime:
         session_id: str,
         source_node_ids: list[str] | None = None,
         reason: str = "manual",
+        first_kept_node_id: str | None = None,
     ) -> dict[str, Any]:
         await self._ensure_started()
         assert self.store and self.paths and self.config
@@ -868,6 +1025,7 @@ class AgentRuntime:
         stale = active_now != active_node_id
         compaction_node = None
         if not stale:
+            kept_node_id = first_kept_node_id if first_kept_node_id is not None else active_node_id
             compaction_node = await self.store.add_node(
                 session_id=session_id,
                 parent_id=active_node_id,
@@ -878,7 +1036,7 @@ class AgentRuntime:
                 content=[TextBlock(text=summary)],
                 metadata={
                     "purpose": "compact",
-                    "first_kept_node_id": active_node_id,
+                    "first_kept_node_id": kept_node_id,
                     "source_node_ids": source_node_ids or [node.node_id for node in selected],
                     "details": {"reason": reason, "stale": stale},
                 },
@@ -1170,7 +1328,8 @@ class AgentRuntime:
         artifacts = await self.store.list_artifacts(session_id=session_id)
         if not include_sensitive:
             nodes, events, artifacts = _redact_replay_payload(nodes, events, artifacts)
-        return ReplayResult(session_id=session_id, nodes=nodes, events=events, artifacts=artifacts)
+        model_requests = _model_request_views_from_events(events, run_id=None)
+        return ReplayResult(session_id=session_id, nodes=nodes, events=events, artifacts=artifacts, model_requests=model_requests)
 
     async def replay_run(self, run_id: str, include_sensitive: bool = False) -> ReplayResult:
         await self._ensure_started()
@@ -1182,7 +1341,8 @@ class AgentRuntime:
         artifacts = [artifact for artifact in await self.store.list_artifacts(session_id=session_id) if artifact.get("run_id") == run_id]
         if not include_sensitive:
             nodes, events, artifacts = _redact_replay_payload(nodes, events, artifacts)
-        return ReplayResult(session_id=session_id, run_id=run_id, nodes=nodes, events=events, artifacts=artifacts)
+        model_requests = _model_request_views_from_events(events, run_id=run_id)
+        return ReplayResult(session_id=session_id, run_id=run_id, nodes=nodes, events=events, artifacts=artifacts, model_requests=model_requests)
 
     async def get_node_path(self, node_id: str) -> list[Node]:
         await self._ensure_started()
@@ -1445,16 +1605,6 @@ class AgentRuntime:
                     context_config=self.config.context,
                     model_config=self.config.model,
                 )
-                request = ModelRequest(
-                    model=self.config.model.name,
-                    system=system_blocks,
-                    messages=context_bundle["messages"],
-                    tools=tools,
-                    temperature=self.config.model.temperature,
-                    max_output_tokens=self.config.model.max_output_tokens,
-                    metadata={"session_id": handle.session_id, "run_id": handle.run_id},
-                )
-                _ensure_provider_supports_request(self._provider, request)
                 await self._emit(
                     handle,
                     "context_built",
@@ -1470,18 +1620,60 @@ class AgentRuntime:
                         non_system_tokens_before_trim=context_bundle["non_system_tokens_before_trim"],
                         non_system_tokens_after_trim=context_bundle["non_system_tokens_after_trim"],
                         too_long=context_bundle["too_long"],
-                    ),
+                    )
+                    | {"model": self.config.model.name},
                 )
                 if context_bundle["too_long"]:
-                    raise AgentCoreError(
-                        ErrorCode.VALIDATION_ERROR,
-                        "prompt_too_long",
-                        details={
-                            "end_reason": "prompt_too_long",
-                            "estimated_input_tokens": context_bundle["tokens_after_trim"],
-                            "non_system_budget": context_bundle["budget"],
-                        },
+                    recovered = await self._try_recovery_compact(
+                        handle,
+                        user_node=user_node,
+                        messages=messages,
+                        system_blocks=system_blocks,
+                        context_config=self.config.context,
+                        tools=tools,
                     )
+                    if recovered is not None:
+                        messages = recovered["messages"]
+                        context_bundle = recovered["context_bundle"]
+                        end_node_id = recovered["end_node_id"]
+                        await self._emit(
+                            handle,
+                            "context_built",
+                            payload=_context_build_report(
+                                context_bundle["messages"],
+                                system_blocks,
+                                tools,
+                                trimmed_node_ids=context_bundle["trimmed_node_ids"],
+                                trimmed_system_blocks=system_budget["trimmed_system_blocks"],
+                                budget=context_bundle["budget"],
+                                tokens_before_trim=context_bundle["tokens_before_trim"],
+                                tokens_after_trim=context_bundle["tokens_after_trim"],
+                                non_system_tokens_before_trim=context_bundle["non_system_tokens_before_trim"],
+                                non_system_tokens_after_trim=context_bundle["non_system_tokens_after_trim"],
+                                too_long=context_bundle["too_long"],
+                            )
+                            | {"recovery_compact": True, "model": self.config.model.name},
+                        )
+                    if context_bundle["too_long"]:
+                        raise AgentCoreError(
+                            ErrorCode.VALIDATION_ERROR,
+                            "prompt_too_long",
+                            details={
+                                "end_reason": "prompt_too_long",
+                                "estimated_input_tokens": context_bundle["tokens_after_trim"],
+                                "non_system_budget": context_bundle["budget"],
+                            },
+                        )
+                request = ModelRequest(
+                    model=self.config.model.name,
+                    system=system_blocks,
+                    messages=context_bundle["messages"],
+                    tools=tools,
+                    temperature=self.config.model.temperature,
+                    max_output_tokens=self.config.model.max_output_tokens,
+                    metadata={"session_id": handle.session_id, "run_id": handle.run_id},
+                )
+                _ensure_provider_supports_request(self._provider, request)
                 completed = None
                 async for model_event in self._provider.stream(request):
                     if model_event.event_type == "model_started":
@@ -1528,7 +1720,14 @@ class AgentRuntime:
                 )
                 end_node_id = assistant_node.node_id
                 await self._emit(handle, "model_completed", node_id=assistant_node.node_id)
-                messages.append(ModelMessage(role=ModelRole.ASSISTANT, content=assistant_content, node_type="message"))
+                messages.append(
+                    ModelMessage(
+                        role=ModelRole.ASSISTANT,
+                        content=assistant_content,
+                        node_type="message",
+                        metadata={"node_id": assistant_node.node_id},
+                    )
+                )
                 if not completed.tool_calls:
                     handle.status = RunStatus.COMPLETED
                     stop_decision = await self._run_stop_hooks(handle, end_node_id=end_node_id)
@@ -1551,7 +1750,14 @@ class AgentRuntime:
                             metadata={"hook_event": "Stop", "reason": stop_decision.reason, "metadata": stop_decision.metadata},
                             make_active=False,
                         )
-                        messages.append(ModelMessage(role=ModelRole.USER, content=[TextBlock(text=note_text)], node_type="hook_context"))
+                        messages.append(
+                            ModelMessage(
+                                role=ModelRole.USER,
+                                content=[TextBlock(text=note_text)],
+                                node_type="hook_context",
+                                metadata={"node_id": note_node.node_id},
+                            )
+                        )
                         end_node_id = note_node.node_id
                         handle.status = RunStatus.RUNNING
                         continue
@@ -1589,7 +1795,14 @@ class AgentRuntime:
                     make_active=False,
                 )
                 end_node_id = tool_node.node_id
-                messages.append(ModelMessage(role=ModelRole.TOOL, content=tool_content, node_type="message"))
+                messages.append(
+                    ModelMessage(
+                        role=ModelRole.TOOL,
+                        content=tool_content,
+                        node_type="message",
+                        metadata={"node_id": tool_node.node_id},
+                    )
+                )
                 for synthetic in _synthetic_context_nodes_from_tool_results(tool_results):
                     synthetic_node = await self.store.add_node(
                         session_id=handle.session_id,
@@ -1658,6 +1871,7 @@ class AgentRuntime:
             allowed_tool_names={tool.name for tool in effective_tools},
             effective_tool_definitions={tool.name: tool for tool in effective_tools},
             debug=self.debug,
+            run_handle=handle,
             services={
                 "task_service": self.task_service,
                 "agent_definitions": self.agent_definitions,
@@ -1707,6 +1921,7 @@ class AgentRuntime:
         parent_run_id: str,
         calls: list[ToolCall],
         allowed_tool_names: set[str],
+        stream: EventStream | None = None,
     ) -> list[Any]:
         context = self._child_tool_context(
             session_id=session_id,
@@ -1719,16 +1934,14 @@ class AgentRuntime:
         )
 
         async def run_one(call: ToolCall):
-            assert self.store
-            await self.store.add_event(
-                make_event(
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    event_type="tool_started",
-                    tool_call_id=call.tool_call_id,
-                    payload={"name": call.name},
-                )
+            await self._emit_child_run_event(
+                stream=stream,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="tool_started",
+                tool_call_id=call.tool_call_id,
+                payload={"name": call.name},
             )
             result = await self.tool_registry.execute(call, context)
             child_handle = RunHandle(
@@ -1749,15 +1962,14 @@ class AgentRuntime:
                     event_type = "tool_denied"
                 else:
                     event_type = "tool_failed"
-            await self.store.add_event(
-                make_event(
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    event_type=event_type,
-                    tool_call_id=call.tool_call_id,
-                    payload=_tool_event_payload(call.name, result),
-                )
+            await self._emit_child_run_event(
+                stream=stream,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type=event_type,
+                tool_call_id=call.tool_call_id,
+                payload=_tool_event_payload(call.name, result),
             )
             return result
 
@@ -1778,6 +1990,7 @@ class AgentRuntime:
         calls: list[ToolCall],
         worker_scope: dict[str, Any],
         allowed_tool_names: set[str],
+        stream: EventStream | None = None,
     ) -> list[Any]:
         context = self._worker_tool_context(
             session_id=session_id,
@@ -1790,16 +2003,14 @@ class AgentRuntime:
         )
 
         async def run_one(call: ToolCall):
-            assert self.store
-            await self.store.add_event(
-                make_event(
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    event_type="tool_started",
-                    tool_call_id=call.tool_call_id,
-                    payload={"name": call.name},
-                )
+            await self._emit_child_run_event(
+                stream=stream,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="tool_started",
+                tool_call_id=call.tool_call_id,
+                payload={"name": call.name},
             )
             result = await self.tool_registry.execute(call, context)
             worker_handle = RunHandle(
@@ -1820,15 +2031,14 @@ class AgentRuntime:
                     event_type = "tool_denied"
                 else:
                     event_type = "tool_failed"
-            await self.store.add_event(
-                make_event(
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    event_type=event_type,
-                    tool_call_id=call.tool_call_id,
-                    payload=_tool_event_payload(call.name, result),
-                )
+            await self._emit_child_run_event(
+                stream=stream,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type=event_type,
+                tool_call_id=call.tool_call_id,
+                payload=_tool_event_payload(call.name, result),
             )
             return result
 
@@ -1940,6 +2150,11 @@ class AgentRuntime:
             artifact_refs.append((str(artifact_id), key))
         for artifact_id in metadata.get("artifact_ids") or []:
             artifact_refs.append((str(artifact_id), "tool_output"))
+        for block in getattr(result, "content", None) or []:
+            if isinstance(block, ArtifactRefBlock):
+                artifact_refs.append((block.artifact_id, block.summary or "tool_output"))
+            elif isinstance(block, JsonBlock) and block.artifact_id:
+                artifact_refs.append((block.artifact_id, block.summary or "tool_output"))
         seen: set[str] = set()
         for artifact_id, summary in artifact_refs:
             if artifact_id in seen:
@@ -2006,6 +2221,72 @@ class AgentRuntime:
         )
         asyncio.create_task(self.run_compact_agent(session_id=handle.session_id, reason="auto_background"))
 
+    async def _try_recovery_compact(
+        self,
+        handle: RunHandle,
+        *,
+        user_node: Node,
+        messages: list[ModelMessage],
+        system_blocks: list[SystemBlock],
+        context_config: ContextConfig,
+        tools: list[ToolDefinition],
+    ) -> dict[str, Any] | None:
+        assert self.config and self.store
+        if not self.config.compact.enabled or not self.config.compact.recovery_sync:
+            return None
+        budget = context_config.non_system_budget
+        if budget is None:
+            budget = max(self.config.model.context_window - self.config.model.max_output_tokens - _estimate_system_tokens(system_blocks), 0)
+        latest_tokens = _estimate_message_tokens(
+            ModelMessage(role=ModelRole.USER, content=user_node.content, node_type=user_node.node_type, metadata={"node_id": user_node.node_id})
+        )
+        if latest_tokens > max(budget, 0):
+            return None
+        replay = await self.replay_session(handle.session_id)
+        source_node_ids = [
+            node.node_id
+            for node in replay.nodes
+            if node.node_id != user_node.node_id
+            and node.node_type not in {"compaction", "compact_input"}
+            and node.role in {"user", "assistant", "tool"}
+        ]
+        if not source_node_ids:
+            return None
+        try:
+            await self._emit(
+                handle,
+                "compact_pending",
+                payload={"reason": "recovery_sync", "source_node_ids": source_node_ids},
+            )
+            result = await self.run_compact_agent(
+                session_id=handle.session_id,
+                source_node_ids=source_node_ids,
+                reason="recovery_sync",
+                first_kept_node_id=user_node.parent_id,
+            )
+        except AgentCoreError as exc:
+            await self._emit(
+                handle,
+                "compact_failed",
+                level="warning",
+                payload={"reason": "recovery_sync", "code": exc.code.value, "message": exc.message},
+            )
+            return None
+        if result.get("stale") or not result.get("compaction_node_id"):
+            return None
+        active_path = await self.store.get_node_path(str(result["compaction_node_id"]))
+        recovered_messages = build_context_messages(active_path)
+        task_board_message = _task_board_context_message(self.task_service, handle.session_id)
+        if task_board_message is not None:
+            recovered_messages.append(task_board_message)
+        context_bundle = _apply_context_budget(
+            messages=recovered_messages,
+            system_blocks=system_blocks,
+            context_config=context_config,
+            model_config=self.config.model,
+        )
+        return {"messages": recovered_messages, "context_bundle": context_bundle, "end_node_id": result["compaction_node_id"]}
+
     async def _maybe_run_memory_extraction(self, handle: RunHandle) -> None:
         assert self.config and self.paths and self.store
         if not self.config.memory.enabled:
@@ -2055,6 +2336,7 @@ class AgentRuntime:
             job = MemoryExtractionJob(
                 home_dir=self.paths.home_dir,
                 cursor=MemoryScanCursor(node_seq=cursor_seq),
+                source_session_id=handle.session_id,
             )
             result = job.apply(candidates, source_node_seq=max_seq)
             await self.store.update_session_metadata(
@@ -2220,6 +2502,103 @@ class AgentRuntime:
         await handle._stream.put(stored)
         return stored
 
+    def _open_child_run_stream(self, run_id: str) -> EventStream:
+        stream = EventStream()
+        self._child_run_streams[run_id] = stream
+        return stream
+
+    async def _close_child_run_stream(self, run_id: str) -> None:
+        stream = self._child_run_streams.pop(run_id, None)
+        if stream is not None:
+            await stream.close()
+
+    async def _emit_child_run_event(
+        self,
+        *,
+        stream: EventStream | None,
+        mirror_handle: RunHandle | None = None,
+        session_id: str,
+        agent_id: str,
+        run_id: str,
+        event_type: str,
+        level: str = "info",
+        node_id: str | None = None,
+        tool_call_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> RuntimeEvent:
+        assert self.store
+        stored = await self.store.add_event(
+            make_event(
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type=event_type,
+                level=level,
+                node_id=node_id,
+                tool_call_id=tool_call_id,
+                payload=payload,
+            )
+        )
+        if stream is not None and stream.has_consumer:
+            await stream.put(stored)
+        if mirror_handle is not None:
+            await mirror_handle._stream.put(stored)
+        return stored
+
+    async def _emit_child_model_event(
+        self,
+        *,
+        stream: EventStream,
+        session_id: str,
+        agent_id: str,
+        run_id: str,
+        event,
+    ) -> None:
+        if event.event_type == "model_started":
+            await self._emit_child_run_event(
+                stream=stream,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="model_started",
+                payload=event.metadata,
+            )
+        elif event.event_type == "model_text_delta":
+            if not stream.has_consumer:
+                return
+            transient = make_event(
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="model_text_delta",
+                payload={"text": event.text_delta or ""},
+            )
+            await stream.put(transient)
+        elif event.event_type == "model_completed":
+            await self._emit_child_run_event(
+                stream=stream,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="model_completed",
+                payload={
+                    "stop_reason": event.stop_reason.value if event.stop_reason else None,
+                    "tool_calls": [call.model_dump(mode="json") for call in event.tool_calls],
+                    "usage": event.usage.model_dump(mode="json") if event.usage else None,
+                },
+            )
+        elif event.event_type == "model_failed":
+            error = event.error or ErrorPayload(code=ErrorCode.PROVIDER_ERROR, message="provider failed")
+            await self._emit_child_run_event(
+                stream=stream,
+                session_id=session_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                event_type="model_failed",
+                level="error",
+                payload=error.model_dump(mode="json"),
+            )
+
     async def _cancel_run(self, handle: RunHandle) -> CancelResult:
         if handle._queued:
             try:
@@ -2257,9 +2636,21 @@ class AgentRuntime:
 
     async def _inspect_run(self, run_id: str, include_sensitive: bool = False) -> InspectResult:
         replay = await self.replay_run(run_id, include_sensitive=include_sensitive)
-        return InspectResult(run_id=run_id, nodes=replay.nodes, events=replay.events, artifacts=replay.artifacts)
+        return InspectResult(
+            run_id=run_id,
+            nodes=replay.nodes,
+            events=replay.events,
+            artifacts=replay.artifacts,
+            model_requests=replay.model_requests,
+        )
 
     async def _child_events(self, child_run_id: str, debug: bool = False):
+        stream = self._child_run_streams.get(child_run_id)
+        if stream is not None and not stream.has_consumer:
+            async for event in stream.iter():
+                if debug or event.level != "debug":
+                    yield event
+            return
         replay = await self.replay_run(child_run_id)
         for event in replay.events:
             if debug or event.level != "debug":
@@ -2351,10 +2742,13 @@ async def _collect_model_completion(
     request: ModelRequest,
     *,
     provider_failure_message: str,
+    on_model_event: Callable[[Any], Awaitable[None]] | None = None,
 ) -> tuple[Any, list[str]]:
     completed = None
     text_parts: list[str] = []
     async for model_event in provider.stream(request):
+        if on_model_event is not None:
+            await on_model_event(model_event)
         if model_event.event_type == "model_text_delta" and model_event.text_delta:
             text_parts.append(model_event.text_delta)
         elif model_event.event_type == "model_failed":
@@ -2469,6 +2863,37 @@ def _ensure_provider_supports_request(provider: ProviderAdapter, request: ModelR
                 "model": request.model,
             },
         )
+
+
+def _model_request_views_from_events(events: list[RuntimeEvent], *, run_id: str | None) -> list[dict[str, Any]]:
+    views: list[dict[str, Any]] = []
+    for event in events:
+        if event.event_type != "context_built":
+            continue
+        if run_id is not None and event.run_id != run_id:
+            continue
+        payload = dict(event.payload)
+        system_blocks = list(payload.get("system_blocks") or [])
+        views.append(
+            {
+                "run_id": event.run_id,
+                "agent_id": event.agent_id,
+                "event_id": event.event_id,
+                "seq": event.seq,
+                "run_seq": event.run_seq,
+                "model": payload.get("model"),
+                "message_count": payload.get("messages"),
+                "tool_count": payload.get("tools"),
+                "tool_names": list(payload.get("tool_names") or []),
+                "system_blocks": system_blocks,
+                "retained_node_ids": list(payload.get("retained_node_ids") or []),
+                "trimmed_node_ids": list(payload.get("trimmed_node_ids") or []),
+                "synthetic_messages": list(payload.get("synthetic_messages") or []),
+                "estimated_input_tokens": payload.get("estimated_input_tokens"),
+                "too_long": bool(payload.get("too_long", False)),
+            }
+        )
+    return views
 
 
 def _synthetic_context_nodes_from_tool_results(tool_results: list[Any]) -> list[dict[str, Any]]:
@@ -2746,7 +3171,7 @@ def _protected_message_suffix_start(messages: list[ModelMessage]) -> int:
 def _message_can_trim(message: ModelMessage) -> bool:
     if isinstance(message.metadata, dict) and message.metadata.get("synthetic") is True:
         return False
-    return message.node_type != "task_board"
+    return message.node_type not in {"task_board", "compaction"}
 
 
 def _message_node_id(message: ModelMessage) -> str | None:
@@ -2783,8 +3208,10 @@ def _context_build_report(
         if isinstance(message.metadata, dict) and message.metadata.get("synthetic") is True
     ]
     return {
+        "model": None,
         "messages": len(messages),
         "tools": len(tools),
+        "tool_names": [tool.name for tool in tools],
         "system_blocks": [
             {
                 "block_id": block.block_id,

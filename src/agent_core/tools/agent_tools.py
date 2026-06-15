@@ -146,6 +146,7 @@ async def create_sub_agent(context: ToolExecutionContext, args: dict) -> dict:
         allowed_tools=args.get("allowed_tools"),
         expected_output_schema=args.get("expected_output_schema"),
         timeout_ms=args.get("timeout_ms"),
+        parent_handle=context.run_handle,
     )
 
 
@@ -163,6 +164,7 @@ async def fork_agent(context: ToolExecutionContext, args: dict) -> dict:
         allowed_tools=args.get("allowed_tools"),
         expected_output_schema=args.get("expected_output_schema"),
         timeout_ms=args.get("timeout_ms"),
+        parent_handle=context.run_handle,
     )
 
 
@@ -185,6 +187,7 @@ async def dispatch_worker(context: ToolExecutionContext, args: dict, workers: Wo
             allowed_tools=args.get("allowed_tools"),
             expected_output_schema=args.get("expected_output_schema"),
             timeout_ms=args.get("timeout_ms"),
+            parent_handle=context.run_handle,
         )
     allowed_step_ids = args.get("allowed_step_ids")
     if allowed_step_ids == []:

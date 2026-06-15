@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.fixtures.scripted_ollama import scripted_ollama
+
 
 @pytest.fixture
 def isolated_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -19,7 +21,9 @@ def isolated_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def write_config(
     home: Path,
     *,
-    provider: str = "fake",
+    provider: str = "ollama",
+    base_url: str = "",
+    model_name: str = "gemma4",
     worker_pool: bool = False,
     disabled_tools: list[str] | None = None,
     tool_overrides: dict[str, dict] | None = None,
@@ -32,9 +36,9 @@ cancel_timeout_ms = 1000
 
 [model]
 provider = "{provider}"
-base_url = ""
+base_url = "{base_url}"
 api_key_env = ""
-name = "fake-model"
+name = "{model_name}"
 context_window = 8192
 max_output_tokens = 1024
 temperature = 0.0

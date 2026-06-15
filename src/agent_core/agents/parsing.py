@@ -45,6 +45,7 @@ def parse_agent_definition_text(text: str, *, source: str, metadata: dict[str, s
         model_profile=_parse_scalar_or_json(frontmatter.get("model_profile")),
         suggested_tools=_parse_list(frontmatter.get("suggested_tools")),
         tags=_parse_list(frontmatter.get("tags")),
+        overrides=frontmatter.get("overrides") or None,
         source=source,  # type: ignore[arg-type]
         metadata=output_metadata,
     )
