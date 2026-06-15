@@ -25,3 +25,4 @@ This document has been split into chapter files for easier editing.
 19. [Testing](19-testing.md)
 20. [Error Handling](20-error-handling.md)
 21. [Codegen Contract](21-codegen-contract.md)
+22. [Codegen Plan](22-codegen-plan.md)
