@@ -243,7 +243,7 @@ soong-agent/
 ### 4. Provider Adapter
 
 - 实现 provider registry。
-- 实现 `openai-compatible`, `anthropic`, `ollama` 三个 adapter。
+- 实现 `openai`, `anthropic`, `ollama` 三个 adapter。
 - 对外不暴露 provider SDK 原始 request/response 类型。
 - Provider 不支持 tool call/schema 时 run failed, 不静默退化为纯文本。
 - 先用 fake stream helper 完成 runtime 单元测试, 再接入 Ollama `gemma4` 做真实集成测试。
@@ -406,7 +406,7 @@ soong-agent/
 | --- | --- | --- |
 | C1 provider registry | 注册 key=`custom`, factory=fake provider, config 中 provider=`custom` | runtime 使用 fake provider; factory 收到解析后的 model config |
 | C2 unsupported tool call | fake provider 标记不支持 tools, 运行需要 tool schema 的 run | run failed; error code 为 `unsupported_capability`; 不降级为纯文本 |
-| C3 openai-compatible mapping | 给 adapter 输入包含 tool call delta 的 Chat Completions streaming chunk | 输出标准 `ModelEvent` tool_call start/delta/end; arguments 能重组成 dict |
+| C3 openai mapping | 给 adapter 输入包含 tool call delta 的 Chat Completions streaming chunk | 输出标准 `ModelEvent` tool_call start/delta/end; arguments 能重组成 dict |
 | C4 anthropic mapping | 给 adapter 输入 Anthropic Messages streaming tool_use 事件 | 输出标准 `ModelEvent`; tool name 和 input 保持一致 |
 | C5 ollama streaming | 本机 Ollama 运行时, 使用模型 `gemma4` 发送简单消息 | 收到 streaming text event; run 正常完成; event 中 provider 为 `ollama` |
 | C6 ollama tool call | 本机 Ollama `gemma4` 收到可调用 `code.list_dir` 的请求 | 模型能发起 tool call; core 映射并执行; 最终 assistant response 可见 |

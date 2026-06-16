@@ -3928,8 +3928,8 @@ def _structured_json_provider_options(model_config: Any, schema: dict[str, Any])
     provider = getattr(model_config, "provider", None)
     if provider == "ollama":
         return {"ollama": {"format": schema}}
-    if provider == "openai-compatible":
-        return {"openai-compatible": {"response_format": {"type": "json_schema", "json_schema": {"name": "structured_json", "schema": schema}}}}
+    if provider == "openai":
+        return {"openai": {"response_format": {"type": "json_schema", "json_schema": {"name": "structured_json", "schema": schema}}}}
     return {}
 
 

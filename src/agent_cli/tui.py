@@ -200,7 +200,7 @@ class SoongAgentTui(App[int]):
         self._history_index: int | None = None
         self._draft_message = ""
         self._auto_scroll = True
-        self._turn_count = 0
+        self._run_count = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -367,7 +367,7 @@ class SoongAgentTui(App[int]):
         self.session_id = requested_session_id.strip() or new_id("sess")
         self.current_handle = None
         self.event_task = None
-        self._turn_count = 0
+        self._run_count = 0
         self._set_status("idle")
         await self._write_message("system", f"new session: {self.session_id}\nprevious session: {previous}")
 
@@ -391,7 +391,7 @@ class SoongAgentTui(App[int]):
                 f"session_id: {self.session_id}",
                 f"mode: {self.mode}",
                 f"state: {state}",
-                f"turns: {self._turn_count}",
+                f"runs: {self._run_count}",
                 f"provider: {provider}",
                 f"model: {model_name}",
                 f"project: {project_path}",
@@ -471,7 +471,7 @@ class SoongAgentTui(App[int]):
             prompt.disabled = False
             prompt.focus()
             if handle.status == RunStatus.COMPLETED:
-                self._turn_count += 1
+                self._run_count += 1
             self._set_status(handle.status.value)
             self.current_handle = None
 
@@ -555,7 +555,7 @@ class SoongAgentTui(App[int]):
         model = getattr(getattr(self.runtime, "config", None), "model", None)
         model_name = getattr(model, "name", "not loaded")
         scroll = "on" if self._auto_scroll else "off"
-        return f"session: {self.session_id} | model: {model_name} | mode: {self.mode} | state: {state} | turns: {self._turn_count} | autoscroll: {scroll}"
+        return f"session: {self.session_id} | model: {model_name} | mode: {self.mode} | state: {state} | runs: {self._run_count} | autoscroll: {scroll}"
 
 
 def _format_message(role: str, text: str) -> str:

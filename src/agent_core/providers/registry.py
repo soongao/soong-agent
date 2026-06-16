@@ -31,8 +31,7 @@ def default_provider_registry() -> ProviderRegistry:
     from agent_core.providers.openai_compatible import OpenAICompatibleProvider
 
     registry = ProviderRegistry()
-    registry.register("openai-compatible", OpenAICompatibleProvider)
+    registry.register("openai", OpenAICompatibleProvider)
     registry.register("anthropic", AnthropicProvider)
     registry.register("ollama", OllamaProvider)
     return registry
-

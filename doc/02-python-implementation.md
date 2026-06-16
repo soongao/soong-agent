@@ -140,12 +140,12 @@
 - HTTP/provider:
 	- provider adapter 内部可以用 `httpx` async client.
 	- 第一版内置多个常用 provider adapter:
-		- OpenAI-compatible adapter.
+		- OpenAI adapter.
 		- Anthropic adapter.
 		- OllamaProviderAdapter.
 	- 内置 adapter 默认都不强制启用, 由配置选择 provider.
 	- provider adapter 通过 registry 创建:
-		- 内置 key 包括 `openai-compatible`, `anthropic`, `ollama`.
+		- 内置 key 包括 `openai`, `anthropic`, `ollama`.
 		- registry value 是 adapter class 或 factory.
 		- 调用方可以注册自定义 adapter class / factory.
 		- 配置中的 `model.provider` 用 registry key 选择 adapter.
@@ -159,15 +159,15 @@
 	- 官方 SDK 依赖只允许出现在 provider adapter 层.
 	- 官方 SDK 类型不能泄漏到 core protocol, runtime API, storage schema, event payload.
 	- adapter 边界负责把官方 SDK request/response/error 转成 core 标准类型.
-	- OpenAI-compatible / Ollama 这类 HTTP 接口简单的 provider 仍可直接用 `httpx`.
+	- OpenAI / Ollama 这类 HTTP 接口简单的 provider 仍可直接用 `httpx`.
 	- `OllamaProviderAdapter` 用于本地开发和集成测试.
 	- 所有 adapter 必须遵守统一 ProviderAdapter streaming 协议.
-	- OpenAI-compatible adapter 第一版只支持 Chat Completions 兼容流式接口:
+	- OpenAI adapter 第一版只支持 Chat Completions 兼容流式接口:
 		- 面向 `/v1/chat/completions` 风格协议.
 		- 输入映射到 messages/tools/tool_choice.
 		- 输出消费 streaming chat delta.
 		- OpenAI Responses API 后续再作为独立能力补充.
-		- 第一版不要求 OpenAI-compatible provider 支持 Responses API.
+		- 第一版不要求 OpenAI provider 支持 Responses API.
 	- Anthropic adapter 第一版使用 Anthropic Messages streaming API:
 		- 使用 Anthropic 原生 messages / system / tools 协议.
 		- 支持 tool use / tool result 的标准映射.
@@ -181,7 +181,7 @@
 	- 不设计统一 `ProviderCapabilities` 对象:
 		- provider 能力判断写在各 adapter 内部.
 		- 官方 provider adapter 按官方 API 能力实现.
-		- OpenAI-compatible / Ollama 这类能力不稳定的 provider, 由 adapter 根据配置、模型信息或请求特征自行判断.
+		- OpenAI / Ollama 这类能力不稳定的 provider, 由 adapter 根据配置、模型信息或请求特征自行判断.
 		- 如果 adapter 判断当前请求不支持, 返回/抛出结构化 provider capability error.
 		- core 不在发送模型请求前做统一能力矩阵校验.
 - Hook / command tool:

@@ -1,0 +1,106 @@
+[runtime]
+cancel_timeout_ms = 10000
+max_turns = 128
+
+[model]
+provider = "openai"
+base_url = "http://127.0.0.1:11434/v1"
+api_key_env = ""
+name = "gemma4"
+context_window = 8192
+max_output_tokens = 4096
+temperature = 0.2
+timeout_ms = 60000
+
+[model.retry]
+max_attempts = 3
+initial_backoff_ms = 500
+max_backoff_ms = 8000
+
+[model_overrides.compact]
+max_output_tokens = 2048
+temperature = 0.0
+
+[context]
+session_db_path = "${SOONG_AGENT_HOME}/sessions.sqlite"
+active_path_only = true
+reserve_output_tokens = 4096
+dynamic_system_budget = 12000
+task_board_token_budget = 1200
+task_recent_changes_limit = 20
+task_recent_changes_window_minutes = 30
+
+[compact]
+enabled = true
+reserve_tokens = 8000
+keep_recent_tokens = 16000
+auto_background = true
+recovery_sync = true
+model_profile = "compact"
+max_summary_tokens = 2048
+
+[memory]
+enabled = true
+memory_dir = "${SOONG_AGENT_HOME}/memory"
+categories = ["user", "feedback", "reference"]
+extract_every_messages = 32
+extract_every_tokens = 12000
+idle_seconds = 120
+catalog_max_tokens = 4000
+recall_top_k = 5
+memory_context_token_budget = 6000
+
+[agents]
+max_children_per_run = 4
+max_concurrent_children_per_session = 8
+default_sub_agent_definition = "default_sub_agent"
+default_fork_agent_definition = "default_fork_agent"
+default_child_timeout_ms = 600000
+child_cancel_timeout_ms = 30000
+
+[[agents.worker_pools]]
+pool_id = "default"
+
+[[agents.worker_pools.workers]]
+worker_id = "worker_general_1"
+agent_definition_id = "default_worker_agent"
+allowed_tools = ["agent.task_get", "agent.task_query_steps", "agent.task_claim_step", "agent.task_update_step", "code.read_file", "code.search"]
+
+[plan]
+default_dir = "<project>/.soong-agent/plans"
+template_name = "default"
+
+[task]
+wal_dir = "<project>/.soong-agent/tasks"
+step_lease_timeout_ms = 300000
+
+[permissions]
+readonly_default = "allow"
+write_without_callback = "deny"
+remember_scope = "session"
+allow_for_session_enabled = true
+
+[permissions.network_policy]
+default = "confirm"
+allowed_hosts = []
+allowed_domains = []
+
+[hooks]
+enabled = true
+default_timeout_ms = 30000
+
+[tools]
+declarative_enabled = true
+disabled = []
+allowed_write_roots = []
+allow_tmp_write = false
+default_timeout_ms = 120000
+max_timeout_ms = 600000
+env_allowlist = ["PATH", "HOME", "TMPDIR"]
+stdout_limit_bytes = 65536
+stderr_limit_bytes = 65536
+sensitive_paths = ["~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "*.pem", "*.key", ".env", ".env.*"]
+
+[tools.network]
+allowed_hosts = []
+allowed_domains = []

@@ -72,10 +72,10 @@
 	- timeout_ms
 	- retry
 - provider 第一版要求:
-	- `openai-compatible`: Chat Completions streaming.
+	- `openai`: Chat Completions streaming.
 	- `anthropic`: Anthropic Messages streaming.
 	- `ollama`: Ollama local API.
-	- 公司内部模型网关如果兼容 Chat Completions, 使用 `openai-compatible` + `base_url` 配置, 不单独定义内部 provider.
+	- 公司内部模型网关如果兼容 Chat Completions, 使用 `openai` + `base_url` 配置, 不单独定义内部 provider.
 	- 文档和默认示例只保留通用 `base_url / api_key_env / name`; 不写公司内部默认 endpoint 或模型名.
 - `model_overrides` 是可选 role override:
 	- small

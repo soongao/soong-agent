@@ -8,6 +8,7 @@ from agent_core.config import load_runtime_config
 from agent_core.config.paths import resolve_home_dir
 from agent_core.config.loader import resolve_model_config
 from agent_core.errors import ConfigError
+from agent_core.providers.registry import default_provider_registry
 from tests.conftest import write_config
 
 
@@ -159,6 +160,19 @@ def test_project_config_ignored(isolated_dirs) -> None:
     config, _paths = load_runtime_config(project_dir=project)
     assert config.model.provider == "ollama"
     assert config.model.name == "gemma4"
+
+
+def test_openai_provider_name_is_supported(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    path = write_config(home, provider="openai", base_url="http://127.0.0.1:11434/v1")
+
+    config, _paths = load_runtime_config(project_dir=project)
+    registry = default_provider_registry()
+
+    assert config.model.provider == "openai"
+    assert registry.has("openai")
+    assert registry.create(config.model.provider, config.model) is not None
+    assert "provider = \"openai\"" in path.read_text(encoding="utf-8")
 
 
 def test_explicit_home_overrides_environment(isolated_dirs, tmp_path, monkeypatch) -> None:

@@ -68,7 +68,7 @@ PYTHONPATH=/private/tmp/soong-agent-build-deps python3 -m build --wheel --no-iso
 Result: wheel built successfully as `soong_agent-0.1.0-py3-none-any.whl`.
 
 ```text
-rg -n "provider\s*=\s*['\"](fake|openai-compatible|anthropic)['\"]|FakeProvider|fake_provider|OpenAI|Anthropic|openai-compatible|anthropic" tests
+rg -n "provider\s*=\s*['\"](fake|openai|anthropic)['\"]|FakeProvider|fake_provider|OpenAI|Anthropic|openai|anthropic" tests
 ```
 
 Result: no matches.

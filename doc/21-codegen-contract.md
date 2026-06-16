@@ -634,7 +634,7 @@ CLI 第一版权限确认使用 stdin:
 
 第一版 CLI 不提供 `--json` event stream 输出; 只提供人读文本输出。
 
-`config_default.toml` 默认使用 `ollama` + `gemma4`; `openai-compatible` / `anthropic` 仅作为文档说明或注释示例出现, 且示例保持通用占位符, 不写公司内部 endpoint、模型名或 key 名.
+`config_default.toml` 默认使用 `ollama` + `gemma4`; `openai` / `anthropic` 仅作为文档说明或注释示例出现, 且示例保持通用占位符, 不写公司内部 endpoint、模型名或 key 名.
 
 Permission decision 第一版只允许:
 
@@ -681,7 +681,7 @@ src/agent_core/assets/
 - 包内提供 `template.config.default` / `config_default.toml` 作为人读默认配置模板.
 - `config_default.toml` 只作为模板资源提供, 不会被 CLI / runtime 自动写入 `${SOONG_AGENT_HOME}/config.toml`.
 - `config_default.toml` 默认 provider 使用 `ollama` + `gemma4`.
-- `config_default.toml` 如包含 `openai-compatible` / `anthropic` 注释示例, 只能使用通用占位符, 不写公司内部 endpoint、模型名或 key 名.
+- `config_default.toml` 如包含 `openai` / `anthropic` 注释示例, 只能使用通用占位符, 不写公司内部 endpoint、模型名或 key 名.
 - 模板文件可以在初始代码生成阶段放最小可用占位正文, 但必须满足:
 	- 文件存在。
 	- 非空。

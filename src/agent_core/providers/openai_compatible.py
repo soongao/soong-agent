@@ -33,7 +33,7 @@ class OpenAICompatibleProvider(ProviderAdapter):
             yield _failed(option_error)
             return
         if not self.base_url:
-            yield _failed("openai-compatible base_url is required")
+            yield _failed("openai base_url is required")
             return
         headers = {"Content-Type": "application/json"}
         if self.api_key_env:
@@ -51,7 +51,7 @@ class OpenAICompatibleProvider(ProviderAdapter):
         payload = build_openai_chat_payload(request)
         payload.update(provider_options)
         known_names = {tool.name for tool in request.tools}
-        yield ModelEvent(event_type="model_started", metadata={"provider": "openai-compatible"})
+        yield ModelEvent(event_type="model_started", metadata={"provider": "openai"})
         state = OpenAIToolAccumulator(known_names=known_names)
         text_parts: list[str] = []
         attempts = max(getattr(self.retry, "max_attempts", 1) or 1, 1)
@@ -82,7 +82,7 @@ class OpenAICompatibleProvider(ProviderAdapter):
                     yield ModelEvent(
                         event_type="model_failed",
                         error=info.payload(),
-                        metadata={"provider": "openai-compatible", "retry_count": retry_count},
+                        metadata={"provider": "openai", "retry_count": retry_count},
                     )
                     return
                 retry_count += 1
@@ -92,7 +92,7 @@ class OpenAICompatibleProvider(ProviderAdapter):
             content=[TextBlock(text="".join(text_parts))] if text_parts else [],
             tool_calls=state.tool_calls(),
             stop_reason=StopReason.TOOL_USE if state.tool_calls() else StopReason.END_TURN,
-            metadata={"provider": "openai-compatible", "retry_count": retry_count},
+            metadata={"provider": "openai", "retry_count": retry_count},
         )
 
     async def close(self) -> None:
@@ -168,16 +168,16 @@ def build_openai_chat_payload(request: ModelRequest) -> dict[str, Any]:
 def _openai_provider_options(request: ModelRequest) -> tuple[dict[str, Any], str | None]:
     if not request.provider_options:
         return {}, None
-    unknown_namespaces = sorted(key for key in request.provider_options if key != "openai-compatible")
+    unknown_namespaces = sorted(key for key in request.provider_options if key != "openai")
     if unknown_namespaces:
-        return {}, f"unknown provider_options namespace for openai-compatible: {', '.join(unknown_namespaces)}"
-    options = request.provider_options.get("openai-compatible") or {}
+        return {}, f"unknown provider_options namespace for openai: {', '.join(unknown_namespaces)}"
+    options = request.provider_options.get("openai") or {}
     if not isinstance(options, dict):
-        return {}, "provider_options.openai-compatible must be an object"
+        return {}, "provider_options.openai must be an object"
     allowed_keys = {"response_format", "seed", "parallel_tool_calls"}
     unknown_keys = sorted(key for key in options if key not in allowed_keys)
     if unknown_keys:
-        return {}, f"unsupported openai-compatible provider_options: {', '.join(unknown_keys)}"
+        return {}, f"unsupported openai provider_options: {', '.join(unknown_keys)}"
     return dict(options), None
 
 
