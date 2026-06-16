@@ -16,9 +16,12 @@ class StrictModel(BaseModel):
 
 
 class ErrorPayload(StrictModel):
+    type: str = "error"
     code: ErrorCode
     message: str
+    retryable: bool = False
     details: dict[str, Any] = Field(default_factory=dict)
+    redacted: bool = True
 
 
 def utc_now() -> datetime:

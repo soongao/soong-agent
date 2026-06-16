@@ -43,17 +43,92 @@ class SQLiteStore:
             self._conn.commit()
             return cursor.rowcount == 1
 
-    async def ensure_agent(self, *, agent_id: str, session_id: str, agent_type: str, status: str = "idle") -> None:
+    async def ensure_agent(
+        self,
+        *,
+        agent_id: str,
+        session_id: str,
+        agent_type: str,
+        status: str = "idle",
+        parent_agent_id: str | None = None,
+        created_by_run_id: str | None = None,
+        fork_from_node_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         async with self._lock:
             now = utc_iso()
+            existing = self._conn.execute(
+                "SELECT session_id FROM agents WHERE agent_id=?",
+                (agent_id,),
+            ).fetchone()
+            if existing is not None and existing["session_id"] != session_id:
+                raise ValueError(f"agent_id already belongs to another session: {agent_id}")
             self._conn.execute(
                 """
-                INSERT OR IGNORE INTO agents(
+                INSERT INTO agents(
                     agent_id, session_id, parent_agent_id, agent_type, created_by_run_id,
                     fork_from_node_id, status, result_json, metadata_json, created_at, updated_at
-                ) VALUES (?, ?, NULL, ?, NULL, NULL, ?, NULL, '{}', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    status=excluded.status,
+                    parent_agent_id=COALESCE(agents.parent_agent_id, excluded.parent_agent_id),
+                    created_by_run_id=COALESCE(agents.created_by_run_id, excluded.created_by_run_id),
+                    fork_from_node_id=COALESCE(agents.fork_from_node_id, excluded.fork_from_node_id),
+                    metadata_json=CASE
+                        WHEN excluded.metadata_json != '{}' THEN excluded.metadata_json
+                        ELSE agents.metadata_json
+                    END,
+                    updated_at=excluded.updated_at
                 """,
-                (agent_id, session_id, agent_type, status, now, now),
+                (
+                    agent_id,
+                    session_id,
+                    parent_agent_id,
+                    agent_type,
+                    created_by_run_id,
+                    fork_from_node_id,
+                    status,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+
+    async def update_agent(
+        self,
+        *,
+        agent_id: str,
+        status: str | None = None,
+        result: dict[str, Any] | None = None,
+        metadata_updates: dict[str, Any] | None = None,
+    ) -> None:
+        async with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata_json FROM agents WHERE agent_id=?",
+                (agent_id,),
+            ).fetchone()
+            if row is None:
+                return
+            metadata = json.loads(row["metadata_json"] or "{}")
+            if metadata_updates:
+                metadata.update(metadata_updates)
+            self._conn.execute(
+                """
+                UPDATE agents
+                SET status=COALESCE(?, status),
+                    result_json=COALESCE(?, result_json),
+                    metadata_json=?,
+                    updated_at=?
+                WHERE agent_id=?
+                """,
+                (
+                    status,
+                    json.dumps(result, ensure_ascii=False) if result is not None else None,
+                    json.dumps(metadata, ensure_ascii=False),
+                    utc_iso(),
+                    agent_id,
+                ),
             )
             self._conn.commit()
 
@@ -212,12 +287,25 @@ class SQLiteStore:
             row = self._conn.execute("SELECT active_node_id FROM sessions WHERE session_id=?", (session_id,)).fetchone()
             return row["active_node_id"] if row else None
 
+    async def get_session(self, session_id: str) -> dict[str, Any] | None:
+        session_id = sanitize_session_id(session_id)
+        async with self._lock:
+            row = self._conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+        return dict(row) if row else None
+
     async def node_exists(self, session_id: str, node_id: str) -> bool:
         session_id = sanitize_session_id(session_id)
         async with self._lock:
             ensure_session_tables(self._conn, session_id)
             row = self._conn.execute(f"SELECT 1 FROM nodes_{session_id} WHERE node_id=? LIMIT 1", (node_id,)).fetchone()
             return row is not None
+
+    async def get_node(self, session_id: str, node_id: str) -> Node | None:
+        session_id = sanitize_session_id(session_id)
+        async with self._lock:
+            ensure_session_tables(self._conn, session_id)
+            row = self._conn.execute(f"SELECT * FROM nodes_{session_id} WHERE node_id=?", (node_id,)).fetchone()
+        return _node_from_row(row) if row else None
 
     async def set_active_node(self, session_id: str, node_id: str) -> None:
         session_id = sanitize_session_id(session_id)

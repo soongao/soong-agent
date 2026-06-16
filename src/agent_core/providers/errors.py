@@ -25,7 +25,7 @@ class ProviderErrorInfo:
             details["status_code"] = self.status_code
         if self.retry_after_ms is not None:
             details["retry_after_ms"] = self.retry_after_ms
-        return ErrorPayload(code=self.code, message=self.message, details=details)
+        return ErrorPayload(code=self.code, message=self.message, retryable=self.retryable, details=details)
 
 
 def classify_provider_exception(exc: Exception) -> ProviderErrorInfo:

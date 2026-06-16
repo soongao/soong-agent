@@ -128,6 +128,25 @@ async def test_search_defaults_to_project_path(isolated_dirs) -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_query_starting_with_dash_is_treated_as_pattern(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    (project / "dash.txt").write_text("-needle\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    context = await make_context(home, project)
+    context.config.tools.stdout_limit_bytes = 4096
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="call1", name="code.search", arguments={"query": "-needle"}),
+        context,
+    )
+
+    assert not result.is_error
+    matches = result.content[0].data["matches"]  # type: ignore[union-attr]
+    assert any(match["path"].endswith("dash.txt") and match["text"] == "-needle" for match in matches)
+
+
+@pytest.mark.asyncio
 async def test_sensitive_read_denied_without_callback(isolated_dirs) -> None:
     home, project = isolated_dirs
     sensitive = project / ".env"
@@ -140,6 +159,49 @@ async def test_sensitive_read_denied_without_callback(isolated_dirs) -> None:
     )
     assert result.is_error
     assert result.error and result.error.code.value == "permission_denied"
+
+
+@pytest.mark.asyncio
+async def test_search_default_project_path_with_sensitive_file_requires_permission(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    (project / ".env").write_text("TOKEN=secret", encoding="utf-8")
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="call1", name="code.search", arguments={"query": "TOKEN"}),
+        await make_context(home, project),
+    )
+
+    assert result.is_error
+    assert result.error and result.error.code.value == "permission_denied"
+
+
+@pytest.mark.asyncio
+async def test_list_dir_recursive_sensitive_file_requires_permission(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    secrets = project / "nested"
+    secrets.mkdir()
+    (secrets / "secret.pem").write_text("secret", encoding="utf-8")
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    context = await make_context(home, project)
+    context.config.tools.stdout_limit_bytes = 4096
+
+    recursive = await registry.execute(
+        ToolCall(tool_call_id="call1", name="code.list_dir", arguments={"path": str(project), "recursive": True}),
+        context,
+    )
+    nonrecursive = await registry.execute(
+        ToolCall(tool_call_id="call2", name="code.list_dir", arguments={"path": str(project), "recursive": False}),
+        context,
+    )
+
+    assert recursive.is_error
+    assert recursive.error and recursive.error.code.value == "permission_denied"
+    assert not nonrecursive.is_error
+    entries = nonrecursive.content[0].data["entries"]  # type: ignore[union-attr]
+    assert [entry["name"] for entry in entries] == ["nested"]
 
 
 @pytest.mark.asyncio
@@ -161,6 +223,34 @@ async def test_permission_scope_uses_resolved_path(isolated_dirs) -> None:
     )
     assert result.is_error is False
     assert calls[0].target_scope == str(env_file.resolve())
+
+
+@pytest.mark.asyncio
+async def test_permission_request_args_summary_is_redacted(isolated_dirs, monkeypatch) -> None:
+    home, project = isolated_dirs
+    monkeypatch.setenv("SOONG_PERMISSION_TEST_SECRET", "permission-secret-value")
+    calls = []
+
+    async def callback(request):
+        calls.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.DENY)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(
+            tool_call_id="call1",
+            name="code.write_file",
+            arguments={"path": "secret.txt", "content": "api_key=permission-secret-value"},
+        ),
+        await make_context(home, project, callback),
+    )
+
+    assert result.is_error
+    assert calls
+    assert "permission-secret-value" not in calls[0].args_summary
+    assert "[REDACTED]" in calls[0].args_summary
+    assert not (project / "secret.txt").exists()
 
 
 @pytest.mark.asyncio
@@ -225,6 +315,43 @@ async def test_write_requires_permission(isolated_dirs) -> None:
     assert not result.is_error
     assert (project / "out.txt").read_text(encoding="utf-8") == "hello"
     assert calls and calls[0].tool_name == "code.write_file"
+
+
+@pytest.mark.asyncio
+async def test_allow_once_write_permission_asks_again_for_same_scope(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    calls = []
+
+    async def callback(request):
+        calls.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    context = await make_context(home, project, callback)
+
+    first = await registry.execute(
+        ToolCall(
+            tool_call_id="call1",
+            name="code.write_file",
+            arguments={"path": "out.txt", "content": "one"},
+        ),
+        context,
+    )
+    second = await registry.execute(
+        ToolCall(
+            tool_call_id="call2",
+            name="code.write_file",
+            arguments={"path": "out.txt", "content": "two", "overwrite": True},
+        ),
+        context,
+    )
+
+    assert not first.is_error
+    assert not second.is_error
+    assert len(calls) == 2
+    assert calls[0].target_scope == calls[1].target_scope == str((project / "out.txt").resolve())
+    assert (project / "out.txt").read_text(encoding="utf-8") == "two"
 
 
 @pytest.mark.asyncio
@@ -344,6 +471,52 @@ async def test_write_without_callback_allow_does_not_allow_dangerous_run_command
 
 
 @pytest.mark.asyncio
+async def test_run_command_allow_for_session_scope_includes_executable_when_cwd_is_present(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    calls = []
+
+    async def callback(request):
+        calls.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_FOR_SESSION)
+
+    context = await make_context(home, project, callback)
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+
+    first = await registry.execute(
+        ToolCall(
+            tool_call_id="call1",
+            name="code.run_command",
+            arguments={"argv": [sys.executable, "-c", "print('one')"], "cwd": str(project)},
+        ),
+        context,
+    )
+    second = await registry.execute(
+        ToolCall(
+            tool_call_id="call2",
+            name="code.run_command",
+            arguments={"argv": [sys.executable, "-c", "print('two')"], "cwd": str(project)},
+        ),
+        context,
+    )
+    third = await registry.execute(
+        ToolCall(
+            tool_call_id="call3",
+            name="code.run_command",
+            arguments={"argv": ["/bin/echo", "three"], "cwd": str(project)},
+        ),
+        context,
+    )
+
+    assert not first.is_error
+    assert not second.is_error
+    assert not third.is_error
+    assert len(calls) == 2
+    assert calls[0].target_scope == f"{sys.executable}:{project.resolve()}"
+    assert calls[1].target_scope == f"/bin/echo:{project.resolve()}"
+
+
+@pytest.mark.asyncio
 async def test_run_command_rejects_shell_string_before_handler(isolated_dirs) -> None:
     home, project = isolated_dirs
     registry = ToolRegistry()
@@ -405,6 +578,34 @@ async def test_edit_file_exact_replace_unique(isolated_dirs) -> None:
 
 
 @pytest.mark.asyncio
+async def test_edit_file_edits_schema_rejects_bad_items_before_permission(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    (project / "edit.txt").write_text("alpha\n", encoding="utf-8")
+    calls = []
+
+    async def callback(request):
+        calls.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(
+            tool_call_id="call1",
+            name="code.edit_file",
+            arguments={"path": "edit.txt", "edits": [{"old": "alpha"}]},
+        ),
+        await make_context(home, project, callback),
+    )
+
+    assert result.is_error
+    assert result.error and result.error.code.value == "validation_error"
+    assert "$.edits[0].new is required" in result.error.message
+    assert calls == []
+    assert (project / "edit.txt").read_text(encoding="utf-8") == "alpha\n"
+
+
+@pytest.mark.asyncio
 async def test_edit_file_exact_replace_ambiguous_without_replace_all(isolated_dirs) -> None:
     home, project = isolated_dirs
     target = project / "edit.txt"
@@ -452,6 +653,60 @@ async def test_edit_file_exact_replace_all(isolated_dirs) -> None:
     assert not result.is_error
     assert result.content[0].data["edits_applied"] == 2  # type: ignore[union-attr]
     assert target.read_text(encoding="utf-8") == "changed\nchanged\n"
+
+
+@pytest.mark.asyncio
+async def test_edit_file_create_if_missing_failure_does_not_leave_empty_file(isolated_dirs) -> None:
+    home, project = isolated_dirs
+
+    async def callback(_request):
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(
+            tool_call_id="call1",
+            name="code.edit_file",
+            arguments={
+                "path": "missing.txt",
+                "edits": [{"old": "not present", "new": "new"}],
+                "create_if_missing": True,
+            },
+        ),
+        await make_context(home, project, callback),
+    )
+
+    assert result.is_error
+    assert result.error and result.error.code.value == "text_not_found"
+    assert not (project / "missing.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_edit_file_create_if_missing_success_writes_file(isolated_dirs) -> None:
+    home, project = isolated_dirs
+
+    async def callback(_request):
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(
+            tool_call_id="call1",
+            name="code.edit_file",
+            arguments={
+                "path": "created.txt",
+                "edits": [{"old": "", "new": "created\n"}],
+                "create_if_missing": True,
+            },
+        ),
+        await make_context(home, project, callback),
+    )
+
+    assert not result.is_error
+    assert result.content[0].data["edits_applied"] == 1  # type: ignore[union-attr]
+    assert (project / "created.txt").read_text(encoding="utf-8") == "created\n"
 
 
 @pytest.mark.asyncio

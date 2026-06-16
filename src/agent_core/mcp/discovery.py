@@ -8,6 +8,7 @@ from typing import Any
 
 from agent_core.config.models import ToolsConfig
 from agent_core.errors import AgentCoreError
+from agent_core.errors.codes import ErrorCode
 from agent_core.mcp.client import McpClient
 from agent_core.types.tools import ToolDefinition
 
@@ -88,9 +89,10 @@ class McpToolManager:
     def _definition_from_raw_tool(self, server_id: str, client: McpClient, raw_tool: dict[str, Any]) -> McpToolBinding:
         tool_name = str(raw_tool.get("name") or "")
         if not tool_name:
-            raise AgentCoreError("validation_error", f"MCP server {server_id} returned a tool without name")
+            raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"MCP server {server_id} returned a tool without name")
         canonical = f"mcp.{server_id}.{tool_name}"
-        override = dict(self.tools_config.mcp.tool_overrides.get(canonical) or {})
+        override_config = self.tools_config.mcp.tool_overrides.get(canonical)
+        override = override_config.model_dump(exclude_none=True) if override_config is not None else {}
         permission = override.get("permission") or _infer_permission(raw_tool)
         tags = set(raw_tool.get("tags") or [])
         tags.add("mcp")
@@ -101,7 +103,7 @@ class McpToolManager:
         tags.update(override.get("tags") or [])
         definition = ToolDefinition(
             name=canonical,
-            description=str(raw_tool.get("description") or override.get("description") or f"MCP tool {tool_name}"),
+            description=str(override.get("description") or raw_tool.get("description") or f"MCP tool {tool_name}"),
             input_schema=dict(raw_tool.get("inputSchema") or raw_tool.get("input_schema") or {"type": "object", "properties": {}}),
             permission=permission,
             tags=tags,

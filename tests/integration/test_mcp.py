@@ -112,7 +112,14 @@ while True:
     )
 
 
-def write_mcp_config(home: Path, server_script: Path, *, disabled_tools: list[str] | None = None) -> None:
+def write_mcp_config(
+    home: Path,
+    server_script: Path,
+    *,
+    disabled_servers: list[str] | None = None,
+    disabled_tools: list[str] | None = None,
+    tool_overrides: dict[str, dict] | None = None,
+) -> None:
     (home / "mcp.json").write_text(
         json.dumps(
             {
@@ -129,10 +136,21 @@ def write_mcp_config(home: Path, server_script: Path, *, disabled_tools: list[st
         ),
         encoding="utf-8",
     )
+    mcp_config_lines: list[str] = []
+    if disabled_servers:
+        mcp_config_lines.append("disabled_servers = " + json.dumps(disabled_servers))
     if disabled_tools:
+        mcp_config_lines.append("disabled_tools = " + json.dumps(disabled_tools))
+    if mcp_config_lines:
         with (home / "config.toml").open("a", encoding="utf-8") as fh:
             fh.write("\n[tools.mcp]\n")
-            fh.write("disabled_tools = " + json.dumps(disabled_tools) + "\n")
+            fh.write("\n".join(mcp_config_lines) + "\n")
+    if tool_overrides:
+        with (home / "config.toml").open("a", encoding="utf-8") as fh:
+            for tool_name, values in tool_overrides.items():
+                fh.write(f'\n[tools.mcp.tool_overrides."{tool_name}"]\n')
+                for key, value in values.items():
+                    fh.write(f"{key} = {json.dumps(value)}\n")
 
 
 @pytest.mark.asyncio
@@ -177,6 +195,52 @@ async def test_mcp_disabled_tool_is_hidden_from_provider(isolated_dirs, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_mcp_disabled_tool_call_returns_tool_not_available(
+    isolated_dirs, tmp_path: Path, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    server_script = tmp_path / "fake_mcp_server.py"
+    write_mcp_server(server_script)
+    write_mcp_config(home, server_script, disabled_tools=["mcp.local.write_note"])
+    scripted_ollama.enqueue_tool_calls([ToolCall(tool_call_id="call1", name="mcp.local.write_note", arguments={"text": "secret"})])
+    scripted_ollama.enqueue_text("done")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("write through disabled mcp", session_id="sess_mcp_disabled_tool")
+        events = [event async for event in handle.events()]
+        replay = await runtime.replay_session("sess_mcp_disabled_tool")
+
+    failed = [event for event in events if event.event_type == "tool_failed"]
+    assert failed
+    assert failed[-1].payload["error"]["code"] == "tool_not_available"
+    tool_nodes = [node for node in replay.nodes if node.role == "tool"]
+    assert tool_nodes
+    assert tool_nodes[-1].content[0].error.code.value == "tool_not_available"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_mcp_disabled_server_is_not_connected_or_exposed(
+    isolated_dirs, tmp_path: Path, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    server_script = tmp_path / "fake_mcp_server.py"
+    write_mcp_server(server_script)
+    write_mcp_config(home, server_script, disabled_servers=["local", "broken"])
+    scripted_ollama.enqueue_text("done")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("hello")
+        events = [event.event_type async for event in handle.events()]
+
+    tool_names = _payload_tool_names(scripted_ollama.requests[0])
+    assert not any(name.startswith("mcp.local.") for name in tool_names)
+    assert not any(name.startswith("mcp.broken.") for name in tool_names)
+    assert "mcp_server_failed" not in events
+
+
+@pytest.mark.asyncio
 async def test_mcp_write_tool_uses_permission_callback(isolated_dirs, tmp_path: Path, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
     _write_ollama_config(home, scripted_ollama)
@@ -205,13 +269,97 @@ async def test_mcp_write_tool_uses_permission_callback(isolated_dirs, tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_mcp_large_output_is_registered_as_artifact(isolated_dirs, tmp_path: Path, scripted_ollama: ScriptedOllama) -> None:
+async def test_mcp_tool_override_changes_permission_tags_and_description(
+    isolated_dirs, tmp_path: Path, scripted_ollama: ScriptedOllama
+) -> None:
     home, project = isolated_dirs
     _write_ollama_config(home, scripted_ollama)
     server_script = tmp_path / "fake_mcp_server.py"
     write_mcp_server(server_script)
+    write_mcp_config(
+        home,
+        server_script,
+        tool_overrides={
+            "mcp.local.echo": {
+                "permission": "write",
+                "tags": ["dangerous", "network"],
+                "description": "Overridden MCP echo",
+            }
+        },
+    )
+    permission_requests = []
+
+    async def allow(request):
+        permission_requests.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    scripted_ollama.enqueue_tool_calls([ToolCall(tool_call_id="call1", name="mcp.local.echo", arguments={"text": "hello"})])
+    scripted_ollama.enqueue_text("done")
+
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
+        handle = await runtime.start("use overridden mcp", session_id="sess_mcp_override")
+        events = [event.event_type async for event in handle.events()]
+
+    tools = {tool["function"]["name"].replace("__", "."): tool for tool in scripted_ollama.requests[0]["tools"]}
+    assert tools["mcp.local.echo"]["function"]["description"] == "Overridden MCP echo"
+    assert permission_requests
+    assert permission_requests[0].tool_name == "mcp.local.echo"
+    assert permission_requests[0].permission == "write"
+    assert {"dangerous", "network", "mcp"} <= set(permission_requests[0].tags)
+    assert "tool_completed" in events
+    assert handle.status == RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_mcp_write_tool_honors_user_hook_before_permission(
+    isolated_dirs, tmp_path: Path, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    (home / "hooks.json").write_text(
+        json.dumps({"hooks": [{"tool_name": "mcp.local.write_note", "action": "deny", "reason": "mcp writes blocked"}]}),
+        encoding="utf-8",
+    )
+    server_script = tmp_path / "fake_mcp_server.py"
+    write_mcp_server(server_script)
     write_mcp_config(home, server_script)
-    scripted_ollama.enqueue_tool_calls([ToolCall(tool_call_id="call1", name="mcp.local.echo", arguments={"text": "large"})])
+    permission_requests = []
+
+    async def allow(request):
+        permission_requests.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    scripted_ollama.enqueue_tool_calls([ToolCall(tool_call_id="call1", name="mcp.local.write_note", arguments={"text": "secret"})])
+    scripted_ollama.enqueue_text("done")
+
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
+        handle = await runtime.start("write through mcp hook", session_id="sess_mcp_hook")
+        events = [event async for event in handle.events()]
+        replay = await runtime.replay_session("sess_mcp_hook")
+
+    assert permission_requests == []
+    denied = [event for event in events if event.event_type == "tool_denied"]
+    assert denied
+    assert denied[-1].payload["error"]["code"] == "permission_denied"
+    tool_nodes = [node for node in replay.nodes if node.role == "tool"]
+    assert tool_nodes
+    assert tool_nodes[-1].content[0].error.message == "mcp writes blocked"  # type: ignore[union-attr]
+    assert tool_nodes[-1].content[0].metadata["hook_summary"]["reason"] == "mcp writes blocked"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_mcp_large_output_is_registered_as_redacted_artifact(
+    isolated_dirs, tmp_path: Path, monkeypatch, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    monkeypatch.setenv("SOONG_MCP_SECRET_TOKEN", "mcp-secret-value")
+    _write_ollama_config(home, scripted_ollama)
+    server_script = tmp_path / "fake_mcp_server.py"
+    write_mcp_server(server_script)
+    write_mcp_config(home, server_script)
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="call1", name="mcp.local.echo", arguments={"text": "mcp-secret-value" * 12})]
+    )
     scripted_ollama.enqueue_text("done")
 
     async with _runtime(project, scripted_ollama) as runtime:
@@ -222,4 +370,8 @@ async def test_mcp_large_output_is_registered_as_artifact(isolated_dirs, tmp_pat
     assert "tool_completed" in events
     assert replay.artifacts
     assert replay.artifacts[0]["summary"] == "stdout_artifact_id"
-    assert Path(replay.artifacts[0]["path"]).exists()
+    artifact_path = Path(replay.artifacts[0]["path"])
+    assert artifact_path.exists()
+    artifact_text = artifact_path.read_text(encoding="utf-8")
+    assert "mcp-secret-value" not in artifact_text
+    assert "[REDACTED]" in artifact_text

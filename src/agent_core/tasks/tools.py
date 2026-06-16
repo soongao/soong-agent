@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from importlib import resources
 from typing import Any
 
+from agent_core.assets.loader import read_asset
 from agent_core.config.paths import expand_config_path
 from agent_core.tasks.service import TaskService
 from agent_core.tools.execution import ToolExecutionContext
@@ -13,6 +13,50 @@ from agent_core.types.tools import ToolDefinition
 PLAN_TEMPLATE_ID = "template.plan.default"
 TASK_TEMPLATE_ID = "template.task_dag.default"
 TEMPLATE_VERSION = "1"
+
+_STRING_LIST_SCHEMA = {"type": "array", "items": {"type": "string"}}
+_TASK_STEP_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "step_id": {"type": "string"},
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "status": {"type": "string"},
+        "depends_on_step_ids": _STRING_LIST_SCHEMA,
+        "required": {"type": "boolean"},
+        "worker_pool_id": {"type": ["string", "null"]},
+    },
+    "required": ["step_id", "title"],
+}
+_TASK_OPERATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "op": {
+            "type": "string",
+            "enum": [
+                "update_task",
+                "add_step",
+                "update_step",
+                "delete_step",
+                "add_dependency",
+                "remove_dependency",
+                "cancel_step",
+                "reopen_step",
+            ],
+        },
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "status": {"type": "string"},
+        "reason": {"type": ["string", "null"]},
+        "step": _TASK_STEP_INPUT_SCHEMA,
+        "step_id": {"type": "string"},
+        "depends_on_step_id": {"type": "string"},
+        "depends_on_step_ids": _STRING_LIST_SCHEMA,
+        "worker_pool_id": {"type": ["string", "null"]},
+        "required": {"type": "boolean"},
+    },
+    "required": ["op"],
+}
 
 
 def register_task_tools(registry: ToolRegistry, service: TaskService) -> None:
@@ -33,7 +77,7 @@ def register_task_tools(registry: ToolRegistry, service: TaskService) -> None:
                 "wal_name": {"type": "string"},
                 "title": {"type": "string"},
                 "summary": {"type": "string"},
-                "steps": {"type": "array"},
+                "steps": {"type": "array", "items": _TASK_STEP_INPUT_SCHEMA},
             },
             required=["task_id", "wal_name", "title", "summary", "steps"],
         ),
@@ -52,7 +96,12 @@ def register_task_tools(registry: ToolRegistry, service: TaskService) -> None:
         lambda context, args: _call(service.list_tasks, context, args),
     )
     registry.register_tool(
-        _definition("agent.task_update", "Apply structured Task DAG patch operations.", {"task_id": {"type": "string"}, "operations": {"type": "array"}}, required=["task_id", "operations"]),
+        _definition(
+            "agent.task_update",
+            "Apply structured Task DAG patch operations.",
+            {"task_id": {"type": "string"}, "operations": {"type": "array", "items": _TASK_OPERATION_SCHEMA}},
+            required=["task_id", "operations"],
+        ),
         lambda context, args: _call(service.update_task, context, args),
     )
     registry.register_tool(
@@ -61,7 +110,7 @@ def register_task_tools(registry: ToolRegistry, service: TaskService) -> None:
             "Query task steps.",
             {
                 "task_id": {"type": "string"},
-                "statuses": {"type": ["array", "null"]},
+                "statuses": {"type": ["array", "null"], "items": {"type": "string"}},
                 "worker_pool_id": {"type": ["string", "null"]},
                 "claimed_by_agent_id": {"type": ["string", "null"]},
                 "include_terminal_steps": {"type": "boolean"},
@@ -85,7 +134,7 @@ def register_task_tools(registry: ToolRegistry, service: TaskService) -> None:
                 "step_id": {"type": "string"},
                 "status": {"type": ["string", "null"]},
                 "result_summary": {"type": ["string", "null"]},
-                "artifact_ids": {"type": ["array", "null"]},
+                "artifact_ids": {"type": ["array", "null"], "items": {"type": "string"}},
                 "reason": {"type": ["string", "null"]},
             },
             required=["task_id", "step_id"],
@@ -107,7 +156,7 @@ def register_task_tools(registry: ToolRegistry, service: TaskService) -> None:
 
 
 async def plan_template(context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
-    content = resources.files("agent_core.assets.templates").joinpath("plan_template.md").read_text(encoding="utf-8")
+    content = read_asset(PLAN_TEMPLATE_ID)
     suggested_dir = args.get("suggested_dir")
     if suggested_dir is None:
         suggested_dir = str(
@@ -129,7 +178,7 @@ async def plan_template(context: ToolExecutionContext, args: dict[str, Any]) -> 
 
 
 async def task_template(context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
-    content = resources.files("agent_core.assets.templates").joinpath("task_template.md").read_text(encoding="utf-8")
+    content = read_asset(TASK_TEMPLATE_ID)
     return {
         "node_type": "task_instruction",
         "content": content,
@@ -162,9 +211,9 @@ def _definition(name: str, description: str, properties: dict[str, Any], *, requ
         name=name,
         description=description,
         input_schema={"type": "object", "properties": properties, "required": required or []},
-            permission="write" if name in _WRITE_TASK_TOOLS else "readonly",
-            tags={"agent", "task"} if name.startswith("agent.task") else {"agent"},
-        )
+        permission="write" if name in _WRITE_TASK_TOOLS else "readonly",
+        tags={"agent", "task"} if name.startswith("agent.task") else {"agent"},
+    )
 
 
 _WRITE_TASK_TOOLS = {

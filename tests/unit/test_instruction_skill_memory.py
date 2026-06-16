@@ -62,6 +62,29 @@ def test_instruction_catalog_prefers_claude_over_agents_in_same_directory(isolat
     assert str((nested / "AGENTS.md").resolve()) not in text
 
 
+def test_instruction_catalog_skips_project_rules_and_common_generated_dirs(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    (home / "rules").mkdir()
+    (home / "rules" / "home-rule.md").write_text("---\ntitle: Home Rule\n---\nbody\n", encoding="utf-8")
+    project_rules = project / ".soong-agent" / "rules"
+    project_rules.mkdir(parents=True)
+    (project_rules / "ignored.md").write_text("---\ntitle: Project Rule\n---\nbody\n", encoding="utf-8")
+    node_modules = project / "node_modules" / "pkg"
+    node_modules.mkdir(parents=True)
+    (node_modules / "CLAUDE.md").write_text("---\ntitle: Dependency\n---\nbody\n", encoding="utf-8")
+    git_dir = project / ".git"
+    git_dir.mkdir()
+    (git_dir / "AGENTS.md").write_text("---\ntitle: Git\n---\nbody\n", encoding="utf-8")
+
+    entries, truncated = build_instruction_catalog(home_dir=home, project_dir=project)
+    text = instruction_catalog_text(entries, truncated=truncated)
+
+    assert str((home / "rules" / "home-rule.md").resolve()) in text
+    assert "Project Rule" not in text
+    assert "Dependency" not in text
+    assert "Git" not in text
+
+
 def test_static_system_blocks_load_package_assets(isolated_dirs) -> None:
     home, project = isolated_dirs
     blocks = build_static_system_blocks(home_dir=home, project_dir=project)
@@ -127,6 +150,56 @@ async def test_read_instruction_marks_already_loaded(isolated_dirs) -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_file_only_marks_active_catalog_instructions(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    claude = project / "pkg" / "CLAUDE.md"
+    agents = project / "pkg" / "AGENTS.md"
+    project_rules = project / ".soong-agent" / "rules" / "ignored.md"
+    claude.parent.mkdir()
+    project_rules.parent.mkdir(parents=True)
+    claude.write_text("active rules\n", encoding="utf-8")
+    agents.write_text("shadowed agents\n", encoding="utf-8")
+    project_rules.write_text("project local rules\n", encoding="utf-8")
+    state = RuntimeContextState()
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    context = await make_context(home, project, state)
+
+    shadowed = await registry.execute(ToolCall(tool_call_id="c1", name="code.read_file", arguments={"path": str(agents)}), context)
+    ignored = await registry.execute(ToolCall(tool_call_id="c2", name="code.read_file", arguments={"path": str(project_rules)}), context)
+    active = await registry.execute(ToolCall(tool_call_id="c3", name="code.read_file", arguments={"path": str(claude)}), context)
+
+    assert shadowed.content[0].data["already_loaded"] is None  # type: ignore[union-attr]
+    assert ignored.content[0].data["already_loaded"] is None  # type: ignore[union-attr]
+    assert active.content[0].data["already_loaded"] is False  # type: ignore[union-attr]
+    blocks = build_system_blocks(home_dir=home, project_dir=project, context_state=state)
+    instruction_blocks = [block for block in blocks if block.source == "instruction_context"]
+    assert [block.content for block in instruction_blocks] == ["active rules\n"]
+
+
+@pytest.mark.asyncio
+async def test_read_instruction_reload_when_hash_changes(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    path = project / "CLAUDE.md"
+    path.write_text("rules v1\n", encoding="utf-8")
+    state = RuntimeContextState()
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    context = await make_context(home, project, state)
+
+    first = await registry.execute(ToolCall(tool_call_id="c1", name="code.read_file", arguments={"path": str(path)}), context)
+    path.write_text("rules v2\n", encoding="utf-8")
+    second = await registry.execute(ToolCall(tool_call_id="c2", name="code.read_file", arguments={"path": str(path)}), context)
+
+    assert first.content[0].data["already_loaded"] is False  # type: ignore[union-attr]
+    assert second.content[0].data["already_loaded"] is False  # type: ignore[union-attr]
+    blocks = build_system_blocks(home_dir=home, project_dir=project, context_state=state)
+    instruction_blocks = [block for block in blocks if block.source == "instruction_context"]
+    assert len(instruction_blocks) == 1
+    assert instruction_blocks[0].content == "rules v2\n"
+
+
+@pytest.mark.asyncio
 async def test_load_skill_marks_already_loaded(isolated_dirs) -> None:
     home, project = isolated_dirs
     skills = home / "skills"
@@ -177,3 +250,24 @@ async def test_recall_memory_user_level_only(isolated_dirs) -> None:
     assert matches[0]["path"].endswith("prefs.md")
     assert result.content[0].data["node_type"] == "memory_context"  # type: ignore[union-attr]
     assert "<memory" in result.content[0].data["content"]  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_role", ["sub", "fork", "worker", "compact"])
+async def test_recall_memory_denied_for_non_main_agent_roles(isolated_dirs, agent_role: str) -> None:
+    home, project = isolated_dirs
+    memory = home / "memory" / "user"
+    memory.mkdir(parents=True)
+    (memory / "prefs.md").write_text("likes pytest", encoding="utf-8")
+    registry = ToolRegistry()
+    register_internal_tools(registry)
+    context = await make_context(home, project)
+    context.agent_role = agent_role
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="m1", name="internal.recall_memory", arguments={"query": "pytest"}),
+        context,
+    )
+
+    assert result.is_error
+    assert result.error and result.error.code.value == "tool_not_available"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha1
 
 from agent_core.config.models import AgentsConfig
 from agent_core.errors import AgentCoreError
@@ -15,6 +16,8 @@ class WorkerRuntimeState:
     allowed_tools: list[str] | None = None
     status: str = "idle"
     current_task_id: str | None = None
+    current_run_id: str | None = None
+    current_step_id: str | None = None
 
 
 class WorkerPoolRuntime:
@@ -41,9 +44,15 @@ class WorkerPoolRuntime:
             return [self._workers[worker_id] for worker_id in self._by_pool.get(worker_pool_id, [])]
         return [self._workers[key] for key in sorted(self._workers)]
 
-    def select_worker(self, *, worker_pool_id: str | None = None, worker_agent_id: str | None = None) -> WorkerRuntimeState:
+    def select_worker(
+        self,
+        *,
+        worker_pool_id: str | None = None,
+        worker_agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> WorkerRuntimeState:
         if worker_agent_id:
-            worker = self._workers.get(worker_agent_id)
+            worker = self._workers.get(worker_agent_id) or self._worker_by_agent_id(worker_agent_id, session_id=session_id)
             if worker is None:
                 raise AgentCoreError(ErrorCode.WORKER_NOT_AVAILABLE, f"worker not available: {worker_agent_id}")
             if worker_pool_id is not None and worker.pool_id != worker_pool_id:
@@ -59,10 +68,27 @@ class WorkerPoolRuntime:
                     return worker
         raise AgentCoreError(ErrorCode.WORKER_POOL_BUSY, "no idle worker available")
 
-    def mark_busy(self, worker: WorkerRuntimeState, *, task_id: str) -> None:
+    def mark_busy(self, worker: WorkerRuntimeState, *, task_id: str, run_id: str | None = None, step_id: str | None = None) -> None:
         worker.status = "running"
         worker.current_task_id = task_id
+        worker.current_run_id = run_id
+        worker.current_step_id = step_id
 
     def mark_idle(self, worker: WorkerRuntimeState) -> None:
         worker.status = "idle"
         worker.current_task_id = None
+        worker.current_run_id = None
+        worker.current_step_id = None
+
+    def _worker_by_agent_id(self, worker_agent_id: str, *, session_id: str | None) -> WorkerRuntimeState | None:
+        if session_id is None:
+            return None
+        for worker in self._workers.values():
+            if worker_agent_id_for_session(session_id=session_id, worker_id=worker.worker_id) == worker_agent_id:
+                return worker
+        return None
+
+
+def worker_agent_id_for_session(*, session_id: str, worker_id: str) -> str:
+    digest = sha1(f"{session_id}:{worker_id}".encode("utf-8")).hexdigest()[:16]
+    return f"agent_worker_{digest}"

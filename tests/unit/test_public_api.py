@@ -4,9 +4,10 @@ import pytest
 from pydantic import ValidationError
 
 import agent_core
-from agent_core import AgentRuntime, PermissionDecision, RuntimeEvent, ToolDefinition
+from agent_core import AgentDefinition, AgentRuntime, PermissionDecision, PermissionRequest, RuntimeEvent, ToolDefinition, ToolResult
 from agent_core.errors import ErrorCode
 from agent_core.tools.registry import ToolRegistry
+from agent_core.types.content import TextBlock
 from agent_core.types.permissions import PermissionDecisionKind
 from agent_core.types.runtime import UserMessage
 from agent_core.api.handles import RunHandle
@@ -15,15 +16,92 @@ from agent_core.types.runtime import RunMode, RunStatus
 
 
 def test_public_api_exports() -> None:
-    assert AgentRuntime
-    assert "AgentRuntime" in agent_core.__all__
-    assert ToolDefinition
-    assert RuntimeEvent
+    assert set(agent_core.__all__) == {
+        "AgentDefinition",
+        "AgentRuntime",
+        "PermissionDecision",
+        "PermissionRequest",
+        "RunHandle",
+        "RuntimeEvent",
+        "ToolDefinition",
+        "ToolResult",
+        "UserMessage",
+    }
+    for name in agent_core.__all__:
+        assert getattr(agent_core, name)
 
 
 def test_pydantic_extra_forbid() -> None:
     with pytest.raises(ValidationError):
         PermissionDecision(decision=PermissionDecisionKind.DENY, unexpected=True)  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: UserMessage(content=[TextBlock(text="hello")], unexpected=True),
+        lambda: RuntimeEvent(
+            event_id="evt_test",
+            session_id="sess_test",
+            event_type="test",
+            created_at="2024-01-01T00:00:00Z",
+            unexpected=True,
+        ),
+        lambda: PermissionRequest(
+            request_id="perm_test",
+            session_id="sess_test",
+            agent_id="agent_test",
+            run_id="run_test",
+            agent_role="main",
+            tool_name="code.read_file",
+            permission="readonly",
+            args_summary="{}",
+            cwd="/tmp",
+            unexpected=True,
+        ),
+        lambda: PermissionDecision(decision=PermissionDecisionKind.DENY, unexpected=True),
+        lambda: ToolDefinition(
+            name="test.tool",
+            description="test",
+            input_schema={"type": "object", "properties": {}},
+            permission="readonly",
+            unexpected=True,
+        ),
+        lambda: ToolResult(tool_call_id="call_test", tool_name="test.tool", unexpected=True),
+        lambda: AgentDefinition(
+            agent_definition_id="agent_test",
+            name="Agent",
+            description="desc",
+            source="code",
+            unexpected=True,
+        ),
+    ],
+)
+def test_public_boundary_types_forbid_extra_fields(factory) -> None:
+    with pytest.raises(ValidationError):
+        factory()
+
+
+def test_error_payload_default_boundary_fields() -> None:
+    from agent_core.types.common import ErrorPayload
+
+    payload = ErrorPayload(code=ErrorCode.INTERNAL_ERROR, message="boom")
+    assert payload.type == "error"
+    assert payload.retryable is False
+    assert payload.details == {}
+    assert payload.redacted is True
+
+
+def test_agent_core_error_carries_retryable_details_and_cause() -> None:
+    from agent_core.errors import AgentCoreError
+
+    cause = RuntimeError("root")
+    error = AgentCoreError(ErrorCode.PROVIDER_TIMEOUT, "timeout", retryable=True, details={"attempt": 1}, cause=cause)
+
+    assert error.code == ErrorCode.PROVIDER_TIMEOUT
+    assert error.retryable is True
+    assert error.details == {"attempt": 1}
+    assert error.cause is cause
 
 
 def test_error_code_contract_subset() -> None:

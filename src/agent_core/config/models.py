@@ -112,7 +112,7 @@ class TaskConfig(StrictModel):
 
 
 class NetworkPolicyConfig(StrictModel):
-    default: str = "confirm"
+    default: Literal["allow", "confirm", "deny"] = "confirm"
     allowed_hosts: list[str] = Field(default_factory=list)
     allowed_domains: list[str] = Field(default_factory=list)
 
@@ -135,17 +135,23 @@ class ToolsNetworkConfig(StrictModel):
     allowed_domains: list[str] = Field(default_factory=list)
 
 
+class ToolOverrideConfig(StrictModel):
+    permission: Literal["readonly", "write"] | None = None
+    tags: list[str] | None = None
+    description: str | None = None
+
+
 class McpToolsConfig(StrictModel):
     disabled_servers: list[str] = Field(default_factory=list)
     disabled_tools: list[str] = Field(default_factory=list)
-    tool_overrides: dict[str, Any] = Field(default_factory=dict)
+    tool_overrides: dict[str, ToolOverrideConfig] = Field(default_factory=dict)
     discovery_cache_ttl_ms: int = 60000
 
 
 class ToolsConfig(StrictModel):
     declarative_enabled: bool = True
     disabled: list[str] = Field(default_factory=list)
-    overrides: dict[str, Any] = Field(default_factory=dict)
+    overrides: dict[str, ToolOverrideConfig] = Field(default_factory=dict)
     allowed_write_roots: list[str] = Field(default_factory=list)
     allow_tmp_write: bool = False
     default_timeout_ms: int = 120000
@@ -187,4 +193,3 @@ class AgentCoreConfig(StrictModel):
     @classmethod
     def normalize_model_overrides(cls, value: Any) -> Any:
         return value or {}
-

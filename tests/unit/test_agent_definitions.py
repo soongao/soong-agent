@@ -56,6 +56,15 @@ async def test_list_builtin_agent_definitions(isolated_dirs) -> None:
     ids = {item["agent_definition_id"] for item in result.content[0].data["agent_definitions"]}  # type: ignore[union-attr]
     assert {"default_sub_agent", "default_fork_agent", "default_worker_agent"} <= ids
     assert "default_compact_agent" not in ids
+    default_worker = next(
+        item
+        for item in result.content[0].data["agent_definitions"]  # type: ignore[union-attr]
+        if item["agent_definition_id"] == "default_worker_agent"
+    )
+    assert set(default_worker) == {"agent_definition_id", "name", "description", "source", "suggested_tools", "tags"}
+    assert "body" not in default_worker
+    assert default_worker["source"] == "builtin"
+    assert all({"name", "available"} <= set(tool) for tool in default_worker["suggested_tools"])
 
 
 def test_builtin_definitions_loaded_from_assets_and_compact_internal_hidden() -> None:

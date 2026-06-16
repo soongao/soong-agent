@@ -144,6 +144,65 @@ async def test_ollama_provider_mangles_and_unmangles_tool_name() -> None:
     assert completed.tool_calls[0].metadata["raw_name"] == "code__list_dir"
 
 
+@pytest.mark.asyncio
+async def test_ollama_provider_rejects_unknown_provider_options_without_request() -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, request=request, content=b'{"message":{},"done":true}\n')
+
+    provider = OllamaProvider(ModelConfig(provider="ollama", name="gemma4"))
+    await provider._client.aclose()
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    events = [
+        event
+        async for event in provider.stream(
+            ModelRequest(
+                model="gemma4",
+                messages=[ModelMessage(role=ModelRole.USER, content=[TextBlock(text="hi")])],
+                provider_options={"ollama": {"unsupported": True}},
+            )
+        )
+    ]
+    await provider.close()
+
+    assert called is False
+    assert events[-1].event_type == "model_failed"
+    assert events[-1].error and events[-1].error.code == ErrorCode.CONFIG_ERROR
+    assert "unsupported" in events[-1].error.message
+
+
+@pytest.mark.asyncio
+async def test_ollama_provider_applies_supported_provider_options() -> None:
+    captured_payload = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_payload
+        captured_payload = json_loads(request.content)
+        return httpx.Response(200, request=request, content=b'{"message":{},"done":true}\n')
+
+    provider = OllamaProvider(ModelConfig(provider="ollama", name="gemma4"))
+    await provider._client.aclose()
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    _events = [
+        event
+        async for event in provider.stream(
+            ModelRequest(
+                model="gemma4",
+                messages=[ModelMessage(role=ModelRole.USER, content=[TextBlock(text="hi")])],
+                provider_options={"ollama": {"options": {"top_k": 10}, "format": "json", "keep_alive": "5m"}},
+            )
+        )
+    ]
+    await provider.close()
+
+    assert captured_payload["options"]["top_k"] == 10
+    assert captured_payload["format"] == "json"
+    assert captured_payload["keep_alive"] == "5m"
+
+
 def test_provider_error_classification() -> None:
     request = httpx.Request("POST", "https://provider.test")
     unauthorized = httpx.HTTPStatusError(
@@ -239,4 +298,5 @@ async def test_ollama_provider_does_not_retry_auth_error() -> None:
     assert calls == 1
     assert events[-1].event_type == "model_failed"
     assert events[-1].error and events[-1].error.code == ErrorCode.PROVIDER_AUTH_FAILED
+    assert events[-1].error.retryable is False
     assert events[-1].error.details["retryable"] is False

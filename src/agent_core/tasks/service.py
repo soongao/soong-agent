@@ -30,8 +30,8 @@ class TaskRecord:
     def __post_init__(self) -> None:
         self.writer = TaskWalWriter(self.wal_path)
 
-    def append(self, *, session_id: str, event_type: str, actor_agent_id: str, actor_run_id: str, payload: dict[str, Any], step_id: str | None = None) -> None:
-        self.append_many(
+    def append(self, *, session_id: str, event_type: str, actor_agent_id: str, actor_run_id: str, payload: dict[str, Any], step_id: str | None = None) -> str | None:
+        event_ids = self.append_many(
             session_id=session_id,
             entries=[
                 {
@@ -43,20 +43,24 @@ class TaskRecord:
                 }
             ],
         )
+        return event_ids[-1] if event_ids else None
 
-    def append_many(self, *, session_id: str, entries: list[dict[str, Any]]) -> None:
+    def append_many(self, *, session_id: str, entries: list[dict[str, Any]]) -> list[str]:
         if not entries:
-            return
+            return []
         next_seq = self.wal_seq
         batch_created_at = utc_iso()
         payloads: list[dict[str, Any]] = []
+        event_ids: list[str] = []
         for entry in entries:
             next_seq += 1
+            event_id = f"task_evt_{next_seq}"
+            event_ids.append(event_id)
             payloads.append(
                 {
                     "wal_seq": next_seq,
                     "session_id": session_id,
-                    "event_id": f"task_evt_{next_seq}",
+                    "event_id": event_id,
                     "event_type": entry["event_type"],
                     "actor_agent_id": entry["actor_agent_id"],
                     "actor_run_id": entry["actor_run_id"],
@@ -66,20 +70,54 @@ class TaskRecord:
                     "created_at": entry.get("created_at") or batch_created_at,
                 }
             )
-        self.writer.append_many(payloads)
+        try:
+            self.writer.append_many(payloads)
+        except OSError as exc:
+            raise AgentCoreError(
+                ErrorCode.TASK_WAL_UNAVAILABLE,
+                f"failed to append Task WAL: {self.wal_path}",
+                details={"wal_path": str(self.wal_path)},
+                cause=exc,
+            ) from exc
         self.wal_seq = next_seq
+        return event_ids
+
+
+@dataclass(frozen=True)
+class UnavailableTaskRecord:
+    session_id: str
+    wal_path: Path
+    task_id: str
+    error: str
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "wal_path": str(self.wal_path),
+            "status": "unavailable",
+            "error": {
+                "code": ErrorCode.TASK_WAL_UNAVAILABLE.value,
+                "message": f"failed to replay Task WAL: {self.wal_path}",
+                "details": {"wal_path": str(self.wal_path), "error": self.error},
+            },
+        }
 
 
 class TaskService:
     def __init__(self) -> None:
         self._records: dict[tuple[str, str], TaskRecord] = {}
+        self._terminal_records: dict[tuple[str, str], TaskRecord] = {}
+        self._unavailable_records: dict[tuple[str, str], UnavailableTaskRecord] = {}
 
     def replay_project(self, project_dir: Path) -> None:
         task_root = project_dir / ".soong-agent" / "tasks"
         if not task_root.exists():
             return
         for wal in sorted(task_root.glob("*/*.wal.jsonl")):
-            self.replay_wal(wal)
+            try:
+                self.replay_wal(wal)
+            except Exception as exc:
+                self._mark_wal_unavailable(wal, exc)
 
     def replay_wal(self, wal_path: Path) -> Task | None:
         task: Task | None = None
@@ -117,10 +155,14 @@ class TaskService:
         task.updated_at = task.updated_at or last_created_at or task.created_at
         record = TaskRecord(task=task, wal_path=wal_path)
         record.wal_seq = wal_seq
-        self._records[(session_id, task.task_id)] = record
+        if task.status in TERMINAL_TASK_STATUSES:
+            self._terminal_records[(session_id, task.task_id)] = record
+        else:
+            self._records[(session_id, task.task_id)] = record
         return task
 
     def create_task(self, context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
+        _ensure_orchestrator(context, "create task DAG")
         task_id = validate_safe_id(str(args["task_id"]), field_name="task_id")
         key = (context.session_id, task_id)
         if key in self._records and self._records[key].task.status not in TERMINAL_TASK_STATUSES:
@@ -173,14 +215,19 @@ class TaskService:
                 }
             )
         _stamp_entries(entries, created_at)
-        record.append_many(session_id=context.session_id, entries=entries)
+        event_ids = record.append_many(session_id=context.session_id, entries=entries)
         self._records[key] = record
-        return {"task": task.model_dump(mode="json"), "wal_path": str(record.wal_path)}
+        return _with_wal_event_ids({"task": task.model_dump(mode="json"), "wal_path": str(record.wal_path)}, event_ids)
 
     def get_task(self, context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
-        record = self._record(context.session_id, str(args["task_id"]))
+        _ensure_task_reader(context, "read task DAG")
+        task_id = str(args["task_id"])
+        self._ensure_worker_task_scope(context, task_id)
+        self._raise_if_unavailable(context.session_id, task_id)
+        record = self._record(context.session_id, task_id, include_terminal=True)
         task = record.task
-        self._reconcile_leases(context, record)
+        if task.status not in TERMINAL_TASK_STATUSES:
+            self._reconcile_leases(context, record)
         include_terminal = bool(args.get("include_terminal_steps", False))
         data = task.model_dump(mode="json")
         if not include_terminal:
@@ -188,22 +235,38 @@ class TaskService:
         return {"task": data, "wal_path": str(record.wal_path)}
 
     def list_tasks(self, context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
+        _ensure_orchestrator(context, "list task DAGs")
         status = args.get("status")
         include_terminal = bool(args.get("include_terminal", False))
         limit = int(args.get("limit") or 50)
         offset = int(args.get("offset") or 0)
-        tasks: list[Task] = []
-        for (session_id, _task_id), record in self._records.items():
-            if session_id != context.session_id:
-                continue
-            if status and record.task.status != status:
-                continue
-            if not include_terminal and record.task.status in TERMINAL_TASK_STATUSES:
-                continue
-            tasks.append(record.task)
-        tasks.sort(key=lambda task: _task_updated_sort_key(task, self._record(context.session_id, task.task_id).wal_path), reverse=True)
-        sliced = tasks[offset : offset + limit]
-        return {"tasks": [task.model_dump(mode="json") for task in sliced], "truncated": offset + limit < len(tasks)}
+        selected_records: list[TaskRecord] = []
+        records = list(self._records.items())
+        if include_terminal:
+            records.extend(self._terminal_records.items())
+        for (session_id, _task_id), record in records:
+            if session_id == context.session_id and (not status or record.task.status == status):
+                selected_records.append(record)
+        selected_records.sort(key=lambda record: _task_updated_sort_key(record.task, record.wal_path), reverse=True)
+        sliced = selected_records[offset : offset + limit]
+        task_summaries: list[dict[str, Any]] = [record.task.model_dump(mode="json") for record in sliced]
+        total = len(selected_records)
+        if include_terminal and (not status or status == "unavailable"):
+            unavailable = [
+                record
+                for (session_id, _task_id), record in self._unavailable_records.items()
+                if session_id == context.session_id
+            ]
+            unavailable.sort(key=lambda record: _wal_path_sort_key(record.wal_path), reverse=True)
+            available_remaining = max(0, limit - len(task_summaries))
+            unavailable_offset = max(0, offset - total)
+            if available_remaining > 0:
+                task_summaries.extend(
+                    record.summary()
+                    for record in unavailable[unavailable_offset : unavailable_offset + available_remaining]
+                )
+            total += len(unavailable)
+        return {"tasks": task_summaries, "truncated": offset + limit < total}
 
     def active_task_summaries(self, session_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
         summaries: list[dict[str, Any]] = []
@@ -244,8 +307,18 @@ class TaskService:
             )
         return summaries[:limit]
 
+    def unavailable_task_summaries(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        records = [
+            record
+            for (record_session_id, _task_id), record in self._unavailable_records.items()
+            if session_id is None or record_session_id == session_id
+        ]
+        records.sort(key=lambda record: _wal_path_sort_key(record.wal_path), reverse=True)
+        return [record.summary() for record in records]
+
     def update_task(self, context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
-        record = self._record(context.session_id, str(args["task_id"]))
+        _ensure_orchestrator(context, "modify task DAG")
+        record = self._record(context.session_id, str(args["task_id"]), include_terminal=True)
         task = record.task
         self._ensure_not_terminal(task)
         operations = args.get("operations") or []
@@ -273,6 +346,8 @@ class TaskService:
         updated_at = utc_iso()
         _sync_task_roots(next_task)
         next_task.updated_at = updated_at
+        updated_after_dispatch_step_ids = _updated_after_dispatch_step_ids(task, operations)
+        _mark_updated_after_dispatch(next_task, updated_after_dispatch_step_ids)
         touched_step_ids = _operation_step_ids(operations)
         touched_step_ids.extend(step.step_id for step, _previous in ready_transitions)
         _touch_steps(next_task, touched_step_ids, updated_at)
@@ -283,7 +358,7 @@ class TaskService:
                 "actor_run_id": context.run_id,
                 "payload": {
                     "operations": operations,
-                    "updated_after_dispatch_step_ids": _updated_after_dispatch_step_ids(task, operations),
+                    "updated_after_dispatch_step_ids": updated_after_dispatch_step_ids,
                     "task_summary": next_task.model_dump(mode="json"),
                 },
             }
@@ -330,19 +405,24 @@ class TaskService:
                 }
             )
         _stamp_entries(entries, updated_at)
-        record.append_many(session_id=context.session_id, entries=entries)
+        event_ids = record.append_many(session_id=context.session_id, entries=entries)
         record.task = next_task
-        return {"task": next_task.model_dump(mode="json")}
+        return _with_wal_event_ids({"task": next_task.model_dump(mode="json")}, event_ids)
 
     def query_steps(self, context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
-        self._ensure_worker_task_scope(context, str(args["task_id"]))
-        record = self._record(context.session_id, str(args["task_id"]))
-        self._reconcile_leases(context, record)
+        _ensure_task_reader(context, "query task steps")
         statuses = set(args.get("statuses") or [])
         include_terminal = bool(args.get("include_terminal_steps", False))
+        task_id = str(args["task_id"])
+        self._ensure_worker_task_scope(context, task_id)
+        self._raise_if_unavailable(context.session_id, task_id)
+        record = self._record(context.session_id, task_id, include_terminal=include_terminal)
+        if record.task.status not in TERMINAL_TASK_STATUSES:
+            self._reconcile_leases(context, record)
         worker_pool_id = args.get("worker_pool_id")
         claimed_by_agent_id = args.get("claimed_by_agent_id")
-        limit = int(args.get("limit") or 50)
+        default_limit = 5 if context.agent_role == "worker" and statuses == {"ready"} else 50
+        limit = int(args["limit"]) if args.get("limit") is not None else default_limit
         offset = int(args.get("offset") or 0)
         steps = []
         for step in record.task.steps:
@@ -384,8 +464,9 @@ class TaskService:
         return steps
 
     def claim_step(self, context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
+        _ensure_role(context, {"orchestrator", "worker"}, "claim task step")
         self._ensure_worker_task_scope(context, str(args["task_id"]))
-        record = self._record(context.session_id, str(args["task_id"]))
+        record = self._record(context.session_id, str(args["task_id"]), include_terminal=True)
         task = record.task
         self._ensure_dispatchable(task)
         next_task = task.model_copy(deep=True)
@@ -424,16 +505,17 @@ class TaskService:
             ],
             updated_at,
         )
-        record.append_many(
+        event_ids = record.append_many(
             session_id=context.session_id,
             entries=entries,
         )
         record.task = next_task
-        return {"step": step.model_dump(mode="json")}
+        return _with_wal_event_ids({"step": step.model_dump(mode="json")}, event_ids)
 
     def update_step(self, context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
+        _ensure_role(context, {"orchestrator", "worker"}, "update task step")
         self._ensure_worker_task_scope(context, str(args["task_id"]))
-        record = self._record(context.session_id, str(args["task_id"]))
+        record = self._record(context.session_id, str(args["task_id"]), include_terminal=True)
         task = record.task
         self._ensure_not_terminal(task)
         next_task = task.model_copy(deep=True)
@@ -471,6 +553,11 @@ class TaskService:
                 step.lease_expires_at = None
                 event_type = "task_step_failed"
             elif status == "cancelled":
+                if previous in {"claimed", "running"}:
+                    raise AgentCoreError(
+                        ErrorCode.TASK_NOT_DISPATCHABLE,
+                        "cannot directly cancel claimed/running step",
+                    )
                 step.status = "cancelled"
                 step.lease_expires_at = None
                 event_type = "task_step_cancelled"
@@ -487,14 +574,7 @@ class TaskService:
                 "actor_agent_id": context.agent_id,
                 "actor_run_id": context.run_id,
                 "step_id": step.step_id,
-                "payload": {
-                    "previous_status": previous,
-                    "status": step.status,
-                    "result_summary": step.result_summary,
-                    "artifact_ids": step.artifact_ids,
-                    "reason": step.reason,
-                    "lease_expires_at": step.lease_expires_at,
-                },
+                "payload": _step_wal_payload(event_type, step, previous_status=previous),
             }
         ]
         entries.extend(self._ready_event_entries(context, ready_transitions))
@@ -512,12 +592,13 @@ class TaskService:
                 }
             )
         _stamp_entries(entries, updated_at)
-        record.append_many(session_id=context.session_id, entries=entries)
+        event_ids = record.append_many(session_id=context.session_id, entries=entries)
         record.task = next_task
-        return {"step": step.model_dump(mode="json")}
+        return _with_wal_event_ids({"step": step.model_dump(mode="json")}, event_ids)
 
     def complete_task(self, context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
-        record = self._record(context.session_id, str(args["task_id"]))
+        _ensure_orchestrator(context, "complete task DAG")
+        record = self._record(context.session_id, str(args["task_id"]), include_terminal=True)
         task = record.task
         self._ensure_not_terminal(task)
         next_task = task.model_copy(deep=True)
@@ -560,18 +641,20 @@ class TaskService:
             }
         )
         _stamp_entries(entries, updated_at)
-        record.append_many(session_id=context.session_id, entries=entries)
+        event_ids = record.append_many(session_id=context.session_id, entries=entries)
         record.task = next_task
-        return {"task": next_task.model_dump(mode="json")}
+        return _with_wal_event_ids({"task": next_task.model_dump(mode="json")}, event_ids)
 
     def fail_task(self, context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
+        _ensure_orchestrator(context, "fail task DAG")
         return self._terminate_task(context, args, status="failed", event_type="task_failed", step_status="failed", reason="task_failed")
 
     def cancel_task(self, context: ToolExecutionContext, args: dict[str, Any]) -> dict[str, Any]:
+        _ensure_orchestrator(context, "cancel task DAG")
         return self._terminate_task(context, args, status="cancelled", event_type="task_cancelled", step_status="cancelled", reason="task_cancelled")
 
     def _terminate_task(self, context: ToolExecutionContext, args: dict[str, Any], *, status: str, event_type: str, step_status: str, reason: str) -> dict[str, Any]:
-        record = self._record(context.session_id, str(args["task_id"]))
+        record = self._record(context.session_id, str(args["task_id"]), include_terminal=True)
         task = record.task
         self._ensure_not_terminal(task)
         next_task = task.model_copy(deep=True)
@@ -596,12 +679,7 @@ class TaskService:
                         "actor_agent_id": context.agent_id,
                         "actor_run_id": context.run_id,
                         "step_id": step.step_id,
-                        "payload": {
-                            "previous_status": previous,
-                            "reason": reason,
-                            "result_summary": step.result_summary,
-                            "artifact_ids": step.artifact_ids,
-                        },
+                        "payload": _step_wal_payload(f"task_step_{step_status}", step, previous_status=previous),
                     }
                 )
         next_task.status = status
@@ -617,14 +695,13 @@ class TaskService:
                 "payload": {
                     "reason": args.get("reason"),
                     f"{step_status}_step_ids": changed,
-                    "terminated_worker_run_ids": terminated,
                 },
             }
         )
         _stamp_entries(entries, updated_at)
-        record.append_many(session_id=context.session_id, entries=entries)
+        event_ids = record.append_many(session_id=context.session_id, entries=entries)
         record.task = next_task
-        return {"task": next_task.model_dump(mode="json"), "terminated_worker_run_ids": terminated}
+        return _with_wal_event_ids({"task": next_task.model_dump(mode="json"), "terminated_worker_run_ids": terminated}, event_ids)
 
     def _apply_operation(self, task: Task, op: dict[str, Any]) -> None:
         kind = op.get("op")
@@ -769,7 +846,7 @@ class TaskService:
         worker_run_id: str,
         reason: str,
     ) -> dict[str, Any] | None:
-        record = self._record(context.session_id, task_id)
+        record = self._record(context.session_id, task_id, include_terminal=True)
         task = record.task
         if task.status in TERMINAL_TASK_STATUSES:
             return None
@@ -791,12 +868,7 @@ class TaskService:
                             "actor_agent_id": context.agent_id,
                             "actor_run_id": context.run_id,
                             "step_id": step.step_id,
-                            "payload": {
-                                "previous_status": previous,
-                                "status": step.status,
-                                "result_summary": step.result_summary,
-                                "reason": step.reason,
-                            },
+                            "payload": _step_wal_payload("task_step_failed", step, previous_status=previous),
                         }
                     ],
                 )
@@ -871,11 +943,34 @@ class TaskService:
             )
         return entries
 
-    def _record(self, session_id: str, task_id: str) -> TaskRecord:
+    def _record(self, session_id: str, task_id: str, *, include_terminal: bool = False) -> TaskRecord:
         key = (session_id, task_id)
-        if key not in self._records:
+        record = self._records.get(key)
+        if record is None and include_terminal:
+            record = self._terminal_records.get(key)
+        if record is None:
             raise AgentCoreError(ErrorCode.TASK_NOT_FOUND, f"task not found: {task_id}")
-        return self._records[key]
+        return record
+
+    def _raise_if_unavailable(self, session_id: str, task_id: str) -> None:
+        record = self._unavailable_records.get((session_id, task_id))
+        if record is None:
+            return
+        raise AgentCoreError(
+            ErrorCode.TASK_WAL_UNAVAILABLE,
+            f"failed to replay Task WAL: {record.wal_path}",
+            details={"wal_path": str(record.wal_path), "error": record.error},
+        )
+
+    def _mark_wal_unavailable(self, wal_path: Path, exc: Exception) -> None:
+        session_id = wal_path.parent.name
+        task_id = _task_id_from_unavailable_wal(wal_path)
+        self._unavailable_records[(session_id, task_id)] = UnavailableTaskRecord(
+            session_id=session_id,
+            wal_path=wal_path,
+            task_id=task_id,
+            error=str(exc),
+        )
 
     def _replay_event(self, task: Task, event_type: str, step_id: str | None, payload: dict[str, Any], *, created_at: str | None = None) -> None:
         if event_type == "task_updated":
@@ -989,6 +1084,50 @@ def _step_from_input(raw: dict[str, Any]) -> TaskStep:
     )
 
 
+def _step_wal_payload(event_type: str, step: TaskStep, *, previous_status: str) -> dict[str, Any]:
+    if event_type == "task_step_started":
+        return {
+            "previous_status": previous_status,
+            "status": "running",
+            "lease_expires_at": step.lease_expires_at,
+        }
+    if event_type == "task_step_updated":
+        return {
+            "previous_status": previous_status,
+            "status": step.status,
+            "result_summary": step.result_summary,
+            "artifact_ids": step.artifact_ids,
+            "lease_expires_at": step.lease_expires_at,
+        }
+    if event_type == "task_step_blocked":
+        return {
+            "previous_status": previous_status,
+            "reason": step.reason,
+            "result_summary": step.result_summary,
+            "artifact_ids": step.artifact_ids,
+        }
+    if event_type == "task_step_completed":
+        return {
+            "previous_status": previous_status,
+            "result_summary": step.result_summary,
+            "artifact_ids": step.artifact_ids,
+        }
+    if event_type == "task_step_failed":
+        return {
+            "previous_status": previous_status,
+            "reason": step.reason,
+            "result_summary": step.result_summary,
+            "artifact_ids": step.artifact_ids,
+        }
+    if event_type == "task_step_cancelled":
+        return {
+            "previous_status": previous_status,
+            "reason": step.reason,
+            "result_summary": step.result_summary,
+        }
+    return {"previous_status": previous_status}
+
+
 def _stamp_entries(entries: list[dict[str, Any]], created_at: str) -> None:
     for entry in entries:
         entry["created_at"] = created_at
@@ -1032,10 +1171,25 @@ def _task_updated_sort_key(task: Task, wal_path: Path) -> float:
             return _parse_utc(task.updated_at).timestamp()
         except ValueError:
             pass
+    return _wal_path_sort_key(wal_path)
+
+
+def _wal_path_sort_key(wal_path: Path) -> float:
     try:
         return wal_path.stat().st_mtime
     except OSError:
         return 0.0
+
+
+def _task_id_from_unavailable_wal(wal_path: Path) -> str:
+    name = wal_path.name
+    suffix = ".wal.jsonl"
+    if name.endswith(suffix):
+        name = name[: -len(suffix)]
+    try:
+        return validate_safe_id(name, field_name="task_id")
+    except ValueError:
+        return f"unavailable_{abs(hash(str(wal_path))) & 0xFFFFFFFF:x}"
 
 
 def _validate_steps(steps: list[TaskStep]) -> None:
@@ -1070,6 +1224,22 @@ def _worker_scope(context: ToolExecutionContext) -> dict[str, Any]:
     return dict(context.services.get("worker_scope") or {})
 
 
+def _ensure_orchestrator(context: ToolExecutionContext, action: str) -> None:
+    _ensure_role(context, {"orchestrator"}, action)
+
+
+def _ensure_task_reader(context: ToolExecutionContext, action: str) -> None:
+    _ensure_role(context, {"orchestrator", "worker"}, action)
+    if context.agent_role == "worker" and not _worker_scope(context).get("task_id"):
+        raise AgentCoreError(ErrorCode.PERMISSION_DENIED, f"worker cannot {action} without dispatch scope")
+
+
+def _ensure_role(context: ToolExecutionContext, allowed_roles: set[str], action: str) -> None:
+    if context.agent_role not in allowed_roles:
+        roles = ", ".join(sorted(allowed_roles))
+        raise AgentCoreError(ErrorCode.PERMISSION_DENIED, f"{context.agent_role} agent cannot {action}; allowed roles: {roles}")
+
+
 def _lease_expires_at(context: ToolExecutionContext) -> str:
     return utc_iso(utc_now() + timedelta(milliseconds=context.config.task.step_lease_timeout_ms))
 
@@ -1098,6 +1268,25 @@ def _updated_after_dispatch_step_ids(task: Task, operations: list[dict[str, Any]
         if depends_on_step_id is not None and str(depends_on_step_id) in dispatched:
             touched.add(str(depends_on_step_id))
     return sorted(touched)
+
+
+def _mark_updated_after_dispatch(task: Task, step_ids: list[str]) -> None:
+    if not step_ids:
+        return
+    targets = set(step_ids)
+    for step in task.steps:
+        if step.step_id in targets:
+            step.metadata = {**step.metadata, "updated_after_dispatch": True}
+
+
+def _with_wal_event_ids(data: dict[str, Any], event_ids: list[str]) -> dict[str, Any]:
+    if not event_ids:
+        return data
+    return {
+        **data,
+        "wal_event_id": event_ids[-1],
+        "wal_event_ids": event_ids,
+    }
 
 
 def _safe_wal_name(value: str) -> str:

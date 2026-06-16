@@ -102,7 +102,18 @@ def register_builtin_code_tools(registry: ToolRegistry) -> None:
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "edits": {"type": ["array", "null"]},
+                    "edits": {
+                        "type": ["array", "null"],
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old": {"type": "string"},
+                                "new": {"type": "string"},
+                                "replace_all": {"type": "boolean", "default": False},
+                            },
+                            "required": ["old", "new"],
+                        },
+                    },
                     "unified_diff": {"type": ["string", "null"]},
                     "create_if_missing": {"type": "boolean", "default": False},
                 },
@@ -222,7 +233,7 @@ async def search(context: ToolExecutionContext, args: dict[str, Any]) -> dict[st
     glob = args.get("glob")
     limit = args.get("limit")
     limit = int(limit) if limit is not None else None
-    argv = ["rg", "--line-number", "--column", "--no-heading", query, str(path)]
+    argv = ["rg", "--line-number", "--column", "--no-heading", "--", query, str(path)]
     if glob:
         argv[1:1] = ["--glob", str(glob)]
     try:
@@ -236,6 +247,7 @@ async def search(context: ToolExecutionContext, args: dict[str, Any]) -> dict[st
             "grep",
             "-R",
             "-n",
+            "--",
             query,
             str(path),
             stdout=asyncio.subprocess.PIPE,
@@ -297,12 +309,13 @@ async def edit_file(context: ToolExecutionContext, args: dict[str, Any]) -> dict
     if (edits is None) == (unified_diff is None):
         raise AgentCoreError(ErrorCode.VALIDATION_ERROR, "exactly one of edits or unified_diff is required")
     create_if_missing = bool(args.get("create_if_missing", False))
-    if not path.exists():
+    existed = path.exists()
+    if not existed:
         if not create_if_missing:
             raise AgentCoreError(ErrorCode.FILE_NOT_FOUND, f"file not found: {path}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
-    original = path.read_text(encoding="utf-8")
+        original = ""
+    else:
+        original = path.read_text(encoding="utf-8")
     if edits is not None:
         updated = original
         applied = 0
@@ -319,6 +332,8 @@ async def edit_file(context: ToolExecutionContext, args: dict[str, Any]) -> dict
             applied += count if replace_all else 1
     else:
         updated, applied = _apply_simple_unified_diff(path=path, original=original, diff=str(unified_diff))
+    if not existed:
+        path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(updated, encoding="utf-8")
     return {"path": str(path), "edits_applied": applied, "bytes_written": len(updated.encode("utf-8"))}
 
@@ -430,9 +445,18 @@ def _looks_binary(path: Path) -> bool:
 
 
 def _mark_instruction_if_needed(context: ToolExecutionContext, path: Path) -> bool | None:
-    if path.name not in {"CLAUDE.md", "AGENTS.md"} and "rules" not in path.parts:
-        return None
     if not context.services or "context_state" not in context.services:
+        return None
+    from agent_core.context.instructions import build_instruction_catalog
+
+    try:
+        active_instruction_paths = {
+            entry.path.resolve()
+            for entry in build_instruction_catalog(home_dir=context.home_dir, project_dir=context.project_dir)[0]
+        }
+    except OSError:
+        return None
+    if path.resolve() not in active_instruction_paths:
         return None
     state = context.services["context_state"]
     return state.mark_instruction(path)

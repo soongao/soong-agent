@@ -17,6 +17,28 @@ def test_missing_config_fails(isolated_dirs) -> None:
         load_runtime_config(project_dir=project)
 
 
+def test_isolated_dirs_use_soong_agent_test_runs_layout(isolated_dirs, monkeypatch) -> None:
+    home, project = isolated_dirs
+    # The exact pytest temp prefix is not contractual, but the user-facing layout is.
+    assert home.name == "home"
+    assert project.name == "project"
+    assert home.parent == project.parent
+    assert home.parent.parent.name == "test-runs"
+    assert home.parent.parent.parent.name == ".soong-agent"
+    assert str(home).startswith(str(Path.home()))
+    assert str(project).startswith(str(Path.home()))
+
+
+def test_isolated_dirs_do_not_create_non_test_run_soong_agent_entries(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    soong_home = home.parent.parent.parent
+    entries = {entry.name for entry in soong_home.iterdir()}
+
+    assert entries == {"test-runs"}
+    assert home.is_relative_to(soong_home / "test-runs")
+    assert project.is_relative_to(soong_home / "test-runs")
+
+
 def test_invalid_toml_fails_with_config_path(isolated_dirs) -> None:
     home, project = isolated_dirs
     config_path = home / "config.toml"
@@ -33,6 +55,68 @@ def test_schema_invalid_fails_without_project_dirs(isolated_dirs) -> None:
         load_runtime_config(project_dir=project)
     assert exc_info.value.code.value == "config_error"
     assert not (project / ".soong-agent").exists()
+
+
+def test_invalid_network_policy_default_fails_schema_validation(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    path = write_config(home)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + """
+
+[permissions.network_policy]
+default = "maybe"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_runtime_config(project_dir=project)
+
+    assert exc_info.value.code.value == "config_error"
+    assert "network_policy" in str(exc_info.value.details["errors"])
+
+
+def test_invalid_tool_override_schema_fails_validation(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    path = write_config(home)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + """
+
+[tools.overrides."code.read_file"]
+permission = "execute"
+tags = ["dangerous"]
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_runtime_config(project_dir=project)
+
+    assert exc_info.value.code.value == "config_error"
+    assert "tools" in str(exc_info.value.details["errors"])
+
+
+def test_invalid_mcp_tool_override_schema_fails_validation(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    path = write_config(home)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + """
+
+[tools.mcp.tool_overrides."mcp.local.echo"]
+permission = "execute"
+description = "bad"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_runtime_config(project_dir=project)
+
+    assert exc_info.value.code.value == "config_error"
+    assert "tool_overrides" in str(exc_info.value.details["errors"])
 
 
 def test_missing_project_path_fails_without_project_dirs(isolated_dirs) -> None:

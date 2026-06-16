@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
+from agent_core.types.common import utc_iso
+
 
 SCHEMA_VERSION = 1
 
@@ -11,9 +13,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS schema_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
         )
         """
     )
@@ -88,8 +90,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
-        (str(SCHEMA_VERSION),),
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        (SCHEMA_VERSION, utc_iso()),
     )
     conn.commit()
 
@@ -132,4 +134,3 @@ def ensure_session_tables(conn: sqlite3.Connection, session_id: str) -> None:
         """
     )
     conn.commit()
-

@@ -28,6 +28,10 @@ class OpenAICompatibleProvider(ProviderAdapter):
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_ms / 1000))
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        provider_options, option_error = _openai_provider_options(request)
+        if option_error is not None:
+            yield _failed(option_error)
+            return
         if not self.base_url:
             yield _failed("openai-compatible base_url is required")
             return
@@ -45,6 +49,7 @@ class OpenAICompatibleProvider(ProviderAdapter):
                 return
             headers["Authorization"] = f"Bearer {api_key}"
         payload = build_openai_chat_payload(request)
+        payload.update(provider_options)
         known_names = {tool.name for tool in request.tools}
         yield ModelEvent(event_type="model_started", metadata={"provider": "openai-compatible"})
         state = OpenAIToolAccumulator(known_names=known_names)
@@ -156,6 +161,22 @@ def build_openai_chat_payload(request: ModelRequest) -> dict[str, Any]:
             for tool in request.tools
         ]
     return payload
+
+
+def _openai_provider_options(request: ModelRequest) -> tuple[dict[str, Any], str | None]:
+    if not request.provider_options:
+        return {}, None
+    unknown_namespaces = sorted(key for key in request.provider_options if key != "openai-compatible")
+    if unknown_namespaces:
+        return {}, f"unknown provider_options namespace for openai-compatible: {', '.join(unknown_namespaces)}"
+    options = request.provider_options.get("openai-compatible") or {}
+    if not isinstance(options, dict):
+        return {}, "provider_options.openai-compatible must be an object"
+    allowed_keys = {"response_format", "seed", "parallel_tool_calls", "tool_choice"}
+    unknown_keys = sorted(key for key in options if key not in allowed_keys)
+    if unknown_keys:
+        return {}, f"unsupported openai-compatible provider_options: {', '.join(unknown_keys)}"
+    return dict(options), None
 
 
 def openai_chunk_to_events(chunk: dict[str, Any], state: OpenAIToolAccumulator) -> list[ModelEvent]:

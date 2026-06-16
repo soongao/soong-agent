@@ -4,7 +4,14 @@ import pytest
 
 from agent_core.compact import RecoveryCompact, should_compact
 from agent_core.errors import AgentCoreError
-from agent_core.memory import MemoryCandidate, MemoryExtractionJob, MemoryRecallService, ensure_memory_write_allowed, parse_memory_candidates
+from agent_core.memory import (
+    MemoryCandidate,
+    MemoryExtractionJob,
+    MemoryRecallService,
+    ensure_memory_write_allowed,
+    parse_memory_candidates,
+    resolve_memory_dir,
+)
 
 
 def test_compact_policy_and_payload() -> None:
@@ -101,6 +108,31 @@ def test_memory_writer_boundary(tmp_path) -> None:
     ensure_memory_write_allowed(tmp_path / "memory" / "user" / "a.md", home_dir=tmp_path)
     with pytest.raises(AgentCoreError):
         ensure_memory_write_allowed(tmp_path / "project" / "memory.md", home_dir=tmp_path)
+
+
+def test_memory_writer_allows_configured_user_level_subdir(tmp_path) -> None:
+    memory_dir = resolve_memory_dir("${SOONG_AGENT_HOME}/memory-alt", home_dir=tmp_path)
+    ensure_memory_write_allowed(tmp_path / "memory-alt" / "MEMORY.md", home_dir=tmp_path, memory_dir=memory_dir)
+    ensure_memory_write_allowed(tmp_path / "memory-alt" / "reference" / "notes.md", home_dir=tmp_path, memory_dir=memory_dir)
+    with pytest.raises(AgentCoreError):
+        ensure_memory_write_allowed(tmp_path / "memory-alt" / "scratch.md", home_dir=tmp_path, memory_dir=memory_dir)
+
+
+def test_memory_dir_must_stay_inside_user_home(tmp_path) -> None:
+    with pytest.raises(AgentCoreError):
+        resolve_memory_dir("<project>/.soong-agent/memory", home_dir=tmp_path / "home", project_dir=tmp_path / "project")
+
+
+def test_memory_extraction_uses_configured_memory_root(tmp_path) -> None:
+    memory_dir = resolve_memory_dir("${SOONG_AGENT_HOME}/custom-memory", home_dir=tmp_path)
+    job = MemoryExtractionJob(home_dir=tmp_path, memory_dir=memory_dir)
+    result = job.apply(
+        [MemoryCandidate(category="reference", filename="docs.md", content="notes", source_node_ids=["n1"])],
+        source_node_seq=1,
+    )
+    assert (tmp_path / "custom-memory" / "reference" / "docs.md").exists()
+    assert not (tmp_path / "memory").exists()
+    assert str(tmp_path / "custom-memory" / "MEMORY.md") in result.files_changed
 
 
 def test_memory_recall_service(tmp_path) -> None:

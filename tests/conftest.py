@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -9,11 +10,15 @@ from tests.fixtures.scripted_ollama import scripted_ollama
 
 
 @pytest.fixture
-def isolated_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    home = tmp_path / "home"
-    project = tmp_path / "project"
-    home.mkdir()
+def isolated_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
+    fake_user_home = tmp_path / "user-home"
+    run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", request.node.nodeid).strip("_")[:120]
+    run_root = fake_user_home / ".soong-agent" / "test-runs" / run_id
+    home = run_root / "home"
+    project = run_root / "project"
+    home.mkdir(parents=True)
     project.mkdir()
+    monkeypatch.setenv("HOME", str(fake_user_home))
     monkeypatch.setenv("SOONG_AGENT_HOME", str(home))
     return home, project
 

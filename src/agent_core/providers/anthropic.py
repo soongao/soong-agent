@@ -28,6 +28,10 @@ class AnthropicProvider(ProviderAdapter):
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_ms / 1000))
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        provider_options, option_error = _anthropic_provider_options(request)
+        if option_error is not None:
+            yield _failed(option_error)
+            return
         if self.api_key_env:
             api_key = os.environ.get(self.api_key_env)
             if not api_key:
@@ -48,6 +52,8 @@ class AnthropicProvider(ProviderAdapter):
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
         }
+        headers.update(provider_options.pop("headers", {}))
+        payload.update(provider_options)
         yield ModelEvent(event_type="model_started", metadata={"provider": "anthropic"})
         state = AnthropicToolAccumulator(known_names=known_names)
         text_parts: list[str] = []
@@ -163,6 +169,24 @@ def build_anthropic_payload(request: ModelRequest) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
 
+def _anthropic_provider_options(request: ModelRequest) -> tuple[dict[str, Any], str | None]:
+    if not request.provider_options:
+        return {}, None
+    unknown_namespaces = sorted(key for key in request.provider_options if key != "anthropic")
+    if unknown_namespaces:
+        return {}, f"unknown provider_options namespace for anthropic: {', '.join(unknown_namespaces)}"
+    options = request.provider_options.get("anthropic") or {}
+    if not isinstance(options, dict):
+        return {}, "provider_options.anthropic must be an object"
+    allowed_keys = {"metadata", "stop_sequences", "thinking", "headers"}
+    unknown_keys = sorted(key for key in options if key not in allowed_keys)
+    if unknown_keys:
+        return {}, f"unsupported anthropic provider_options: {', '.join(unknown_keys)}"
+    if "headers" in options and not isinstance(options["headers"], dict):
+        return {}, "provider_options.anthropic.headers must be an object"
+    return dict(options), None
+
+
 def anthropic_sse_to_events(event_name: str, data: dict[str, Any], state: AnthropicToolAccumulator) -> list[ModelEvent]:
     events: list[ModelEvent] = []
     event_type = data.get("type") or event_name
@@ -233,3 +257,7 @@ def _tool_result_text(block: Any) -> str:
     if text:
         return text
     return json.dumps(getattr(block, "metadata", {}) or {}, ensure_ascii=False)
+
+
+def _failed(message: str) -> ModelEvent:
+    return ModelEvent(event_type="model_failed", error=ErrorPayload(code=ErrorCode.CONFIG_ERROR, message=message))

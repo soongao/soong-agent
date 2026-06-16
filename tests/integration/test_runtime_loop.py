@@ -10,14 +10,23 @@ from agent_core import AgentRuntime
 from agent_core.providers import ProviderRegistry
 from agent_core.providers.ollama import OllamaProvider
 from agent_core.types.content import TextBlock
+from agent_core.types.permissions import PermissionDecision, PermissionDecisionKind
 from agent_core.types.runtime import RunStatus
 from agent_core.types.tools import ToolCall, ToolDefinition
 from tests.conftest import write_config
-from tests.fixtures.scripted_ollama import ScriptedOllama
+from tests.fixtures.scripted_ollama import ScriptedOllama, ScriptedOllamaResponse
 
 
 class NoToolsOllamaProvider(OllamaProvider):
     supports_tools = False
+
+
+class RecordingProvider(OllamaProvider):
+    def __init__(self, config, scripted_ollama: ScriptedOllama, seen_configs: list) -> None:
+        seen_configs.append(config)
+        super().__init__(config)
+        self.base_url = scripted_ollama.base_url
+        self._client = scripted_ollama.provider_registry().create("ollama", config)._client
 
 
 def _write_ollama_config(home, scripted_ollama: ScriptedOllama, **kwargs):
@@ -52,6 +61,61 @@ async def test_runtime_simple_run(isolated_dirs, scripted_ollama: ScriptedOllama
     assert "run_completed" in events
     assert "loop_completed" in events
     assert handle.status == RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_run_events_is_single_consumer(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    scripted_ollama.enqueue_text("hello")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("hi")
+        first_events = [event.event_type async for event in handle.events()]
+        with pytest.raises(RuntimeError, match="single-consumer"):
+            _second_events = [event async for event in handle.events()]
+
+    assert "loop_completed" in first_events
+
+
+@pytest.mark.asyncio
+async def test_model_text_delta_is_realtime_only_not_persisted(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    scripted_ollama.enqueue_text("hello")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("hi", session_id="sess_realtime_delta")
+        events = [event async for event in handle.events(debug=True)]
+        replay = await runtime.replay_session("sess_realtime_delta")
+
+    assert any(event.event_type == "model_text_delta" and event.seq is None for event in events)
+    assert all(event.event_type != "model_text_delta" for event in replay.events)
+    assert any(event.event_type == "model_completed" for event in replay.events)
+
+
+@pytest.mark.asyncio
+async def test_runtime_register_provider_uses_custom_factory_config(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    write_config(home, provider="custom", base_url=scripted_ollama.base_url, model_name="custom-model")
+    scripted_ollama.enqueue_text("custom provider ok")
+    seen_configs = []
+
+    runtime = AgentRuntime(project_dir=project)
+    runtime.register_provider(
+        "custom",
+        lambda config: RecordingProvider(config, scripted_ollama, seen_configs),
+    )
+    async with runtime:
+        handle = await runtime.start("hi", session_id="sess_custom_provider")
+        events = [event.event_type async for event in handle.events()]
+
+    assert handle.status == RunStatus.COMPLETED
+    assert "loop_completed" in events
+    assert len(seen_configs) == 1
+    assert seen_configs[0].provider == "custom"
+    assert seen_configs[0].name == "custom-model"
+    assert scripted_ollama.requests[0]["model"] == "custom-model"
 
 
 @pytest.mark.asyncio
@@ -111,6 +175,59 @@ async def test_runtime_tool_call(isolated_dirs, scripted_ollama: ScriptedOllama)
     assert "tool_started" in events
     assert "tool_completed" in events
     assert handle.status == RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_empty_model_response_after_tool_result_is_retried_once(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    (project / "a.txt").write_text("hello", encoding="utf-8")
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="call1", name="code.read_file", arguments={"path": "a.txt"})]
+    )
+    scripted_ollama.enqueue(ScriptedOllamaResponse(lines=[{"message": {}, "done": True, "prompt_eval_count": 1, "eval_count": 0}]))
+    scripted_ollama.enqueue_text("read after retry")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("read file", session_id="sess_empty_tool_retry")
+        events = [event async for event in handle.events()]
+        replay = await runtime.replay_session("sess_empty_tool_retry")
+
+    assert handle.status == RunStatus.COMPLETED
+    assert "model_empty_response_recovered" in [event.event_type for event in events]
+    assert len(scripted_ollama.requests) == 3
+    assert any(
+        getattr(block, "text", "") == "read after retry"
+        for node in replay.nodes
+        if node.role == "assistant"
+        for block in node.content
+    )
+
+
+@pytest.mark.asyncio
+async def test_loaded_instruction_context_is_scoped_to_session(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    (project / "CLAUDE.md").write_text("session scoped instruction body\n", encoding="utf-8")
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="read_instruction", name="code.read_file", arguments={"path": "CLAUDE.md"})]
+    )
+    scripted_ollama.enqueue_text("loaded instruction")
+    scripted_ollama.enqueue_text("other session")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        first = await runtime.start("load instructions", session_id="sess_instruction_a")
+        _first_events = [event async for event in first.events()]
+        second = await runtime.start("separate session", session_id="sess_instruction_b")
+        _second_events = [event async for event in second.events()]
+
+    second_system = _payload_system_text(scripted_ollama.requests[2])
+    assert "session scoped instruction body" not in second_system
+    assert "session scoped instruction body" not in "\n".join(_payload_texts(scripted_ollama.requests[2]))
 
 
 @pytest.mark.asyncio
@@ -192,6 +309,47 @@ async def test_write_permission_failure_stops_later_write_tool_calls(isolated_di
 
 
 @pytest.mark.asyncio
+async def test_allow_for_session_permission_cache_is_not_persisted(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    requests = []
+
+    async def allow_for_session(request):
+        requests.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_FOR_SESSION)
+
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="write_first", name="code.write_file", arguments={"path": "cached.txt", "content": "one"})]
+    )
+    scripted_ollama.enqueue_text("first done")
+    async with _runtime(project, scripted_ollama, permission_callback=allow_for_session) as runtime:
+        first = await runtime.start("write once", session_id="sess_permission_cache")
+        _first_events = [event async for event in first.events()]
+
+    assert len(requests) == 1
+
+    scripted_ollama.enqueue_tool_calls(
+        [
+            ToolCall(
+                tool_call_id="write_second",
+                name="code.write_file",
+                arguments={"path": "cached.txt", "content": "two", "overwrite": True},
+            )
+        ]
+    )
+    scripted_ollama.enqueue_text("second done")
+    async with _runtime(project, scripted_ollama, permission_callback=allow_for_session) as runtime:
+        second = await runtime.start("write after restart", session_id="sess_permission_cache")
+        _second_events = [event async for event in second.events()]
+
+    assert len(requests) == 2
+    assert requests[0].target_scope == requests[1].target_scope == str((project / "cached.txt").resolve())
+    assert (project / "cached.txt").read_text(encoding="utf-8") == "two"
+
+
+@pytest.mark.asyncio
 async def test_plan_template_tool_persists_synthetic_instruction_node(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
     _write_ollama_config(home, scripted_ollama)
@@ -216,6 +374,44 @@ async def test_plan_template_tool_persists_synthetic_instruction_node(isolated_d
     texts = _payload_texts(scripted_ollama.requests[1])
     assert any("Default Plan Template" in text for text in texts)
     assert any("build a feature" in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_plan_template_then_write_plan_file_uses_write_permission(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    permission_requests = []
+
+    async def allow(request):
+        permission_requests.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="call_plan", name="agent.plan_template", arguments={"goal": "build a feature"})]
+    )
+    scripted_ollama.enqueue_tool_calls(
+        [
+            ToolCall(
+                tool_call_id="write_plan",
+                name="code.write_file",
+                arguments={"path": ".soong-agent/plans/plan.md", "content": "# Plan\n\n- build"},
+            )
+        ]
+    )
+    scripted_ollama.enqueue_text("plan written")
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
+        handle = await runtime.start("make and write a plan", session_id="sess_plan_write")
+        events = [event.event_type async for event in handle.events()]
+
+    plan_path = project / ".soong-agent" / "plans" / "plan.md"
+    assert handle.status == RunStatus.COMPLETED
+    assert "tool_completed" in events
+    assert plan_path.read_text(encoding="utf-8") == "# Plan\n\n- build"
+    assert len(permission_requests) == 1
+    assert permission_requests[0].tool_name == "code.write_file"
+    assert permission_requests[0].target_scope == str(plan_path.resolve())
 
 
 @pytest.mark.asyncio
@@ -247,9 +443,36 @@ async def test_load_skill_tool_persists_synthetic_context_node(isolated_dirs, sc
 
 
 @pytest.mark.asyncio
-async def test_task_tool_refreshes_task_board_context_and_context_report(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+async def test_repeated_load_skill_does_not_duplicate_synthetic_context_node(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
     home, project = isolated_dirs
     _write_ollama_config(home, scripted_ollama)
+    skills = home / "skills"
+    skills.mkdir()
+    (skills / "review.md").write_text("---\nname: review\ndescription: Review code\n---\nSkill body\n", encoding="utf-8")
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="call_skill_1", name="internal.load_skill", arguments={"name": "review"})]
+    )
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="call_skill_2", name="internal.load_skill", arguments={"name": "review"})]
+    )
+    scripted_ollama.enqueue_text("loaded once")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("load review twice", session_id="sess_skill_duplicate")
+        _events = [event async for event in handle.events()]
+        replay = await runtime.replay_session("sess_skill_duplicate")
+
+    assert handle.status == RunStatus.COMPLETED
+    context_nodes = [node for node in replay.nodes if node.node_type == "skill_context"]
+    assert len(context_nodes) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_tool_refreshes_task_board_context_and_context_report(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama, worker_pool=True)
     scripted_ollama.enqueue_tool_calls(
         [
             ToolCall(
@@ -276,7 +499,7 @@ async def test_task_tool_refreshes_task_board_context_and_context_report(isolate
         return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
 
     async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
-        handle = await runtime.start("create task", session_id="sess_task_board")
+        handle = await runtime.start("create task", session_id="sess_task_board", mode="orchestrator")
         _events = [event async for event in handle.events()]
         replay = await runtime.replay_session("sess_task_board")
 

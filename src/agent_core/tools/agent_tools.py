@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from agent_core.agents.registry import AgentDefinitionRegistry
-from agent_core.agents.workers import WorkerPoolRuntime
+from agent_core.agents.workers import WorkerPoolRuntime, WorkerRuntimeState, worker_agent_id_for_session
 from agent_core.errors import AgentCoreError
 from agent_core.errors.codes import ErrorCode
 from agent_core.tools.execution import ToolExecutionContext
@@ -49,7 +49,7 @@ def register_agent_tools(
                     "task": {"type": "string"},
                     "context": {"type": ["string", "null"]},
                     "constraints": {"type": ["object", "null"]},
-                    "allowed_tools": {"type": ["array", "null"]},
+                    "allowed_tools": {"type": ["array", "null"], "items": {"type": "string"}},
                     "expected_output_schema": {"type": ["object", "null"]},
                     "timeout_ms": {"type": ["integer", "null"]},
                 },
@@ -70,7 +70,7 @@ def register_agent_tools(
                     "agent_definition_id": {"type": ["string", "null"]},
                     "task": {"type": "string"},
                     "constraints": {"type": ["object", "null"]},
-                    "allowed_tools": {"type": ["array", "null"]},
+                    "allowed_tools": {"type": ["array", "null"], "items": {"type": "string"}},
                     "expected_output_schema": {"type": ["object", "null"]},
                     "timeout_ms": {"type": ["integer", "null"]},
                 },
@@ -91,11 +91,11 @@ def register_agent_tools(
                     "task_id": {"type": "string"},
                     "worker_pool_id": {"type": ["string", "null"]},
                     "worker_agent_id": {"type": ["string", "null"]},
-                    "allowed_step_ids": {"type": ["array", "null"]},
+                    "allowed_step_ids": {"type": ["array", "null"], "items": {"type": "string"}},
                     "instruction": {"type": "string"},
                     "context": {"type": ["string", "null"]},
                     "constraints": {"type": ["object", "null"]},
-                    "allowed_tools": {"type": ["array", "null"]},
+                    "allowed_tools": {"type": ["array", "null"], "items": {"type": "string"}},
                     "expected_output_schema": {"type": ["object", "null"]},
                     "timeout_ms": {"type": ["integer", "null"]},
                 },
@@ -109,27 +109,24 @@ def register_agent_tools(
 
 
 async def list_agent_definitions(context: ToolExecutionContext, args: dict, definitions: AgentDefinitionRegistry) -> dict:
-    return {"agent_definitions": [definition.model_dump(mode="json") for definition in definitions.list()]}
+    _ensure_agent_tool_role(context, "agent.list_agent_definitions", {"main", "orchestrator"})
+    return {"agent_definitions": [_definition_catalog_item(context, definition) for definition in definitions.list()]}
 
 
 async def list_workers(context: ToolExecutionContext, args: dict, workers: WorkerPoolRuntime | None) -> dict:
+    _ensure_agent_tool_role(context, "agent.list_workers", {"orchestrator"})
     if workers is None:
         return {"workers": []}
     return {
         "workers": [
-            {
-                "worker_id": worker.worker_id,
-                "worker_pool_id": worker.pool_id,
-                "agent_definition_id": worker.agent_definition_id,
-                "status": worker.status,
-                "allowed_tools": worker.allowed_tools,
-            }
+            _worker_catalog_item(context, worker)
             for worker in workers.list_workers(args.get("worker_pool_id"))
         ]
     }
 
 
 async def create_sub_agent(context: ToolExecutionContext, args: dict) -> dict:
+    _ensure_agent_tool_role(context, "agent.create_sub_agent", {"main", "orchestrator"})
     runtime = context.service("runtime")
     agent_definition_id = args.get("agent_definition_id") or context.config.agents.default_sub_agent_definition
     task = str(args["task"])
@@ -151,6 +148,7 @@ async def create_sub_agent(context: ToolExecutionContext, args: dict) -> dict:
 
 
 async def fork_agent(context: ToolExecutionContext, args: dict) -> dict:
+    _ensure_agent_tool_role(context, "agent.fork_agent", {"main"})
     runtime = context.service("runtime")
     agent_definition_id = args.get("agent_definition_id") or context.config.agents.default_fork_agent_definition
     return await runtime.run_child_agent(
@@ -169,6 +167,7 @@ async def fork_agent(context: ToolExecutionContext, args: dict) -> dict:
 
 
 async def dispatch_worker(context: ToolExecutionContext, args: dict, workers: WorkerPoolRuntime | None) -> dict:
+    _ensure_agent_tool_role(context, "agent.dispatch_worker", {"orchestrator"})
     if workers is None:
         raise AgentCoreError(ErrorCode.WORKER_NOT_AVAILABLE, "worker runtime not configured")
     if context.services and "runtime" in context.services:
@@ -193,7 +192,11 @@ async def dispatch_worker(context: ToolExecutionContext, args: dict, workers: Wo
     if allowed_step_ids == []:
         raise AgentCoreError(ErrorCode.VALIDATION_ERROR, "allowed_step_ids cannot be empty")
     allowed_set = set(str(item) for item in allowed_step_ids) if allowed_step_ids is not None else None
-    worker = workers.select_worker(worker_pool_id=args.get("worker_pool_id"), worker_agent_id=args.get("worker_agent_id"))
+    worker = workers.select_worker(
+        worker_pool_id=args.get("worker_pool_id"),
+        worker_agent_id=args.get("worker_agent_id"),
+        session_id=context.session_id,
+    )
     task_service = context.service("task_service")
     query = task_service.query_steps(
         context,
@@ -210,6 +213,7 @@ async def dispatch_worker(context: ToolExecutionContext, args: dict, workers: Wo
         candidates = [step for step in candidates if step["step_id"] in allowed_set]
     if not candidates:
         return {
+            "worker_agent_id": worker_agent_id_for_session(session_id=context.session_id, worker_id=worker.worker_id),
             "worker_id": worker.worker_id,
             "claimed_step_id": None,
             "step_status": None,
@@ -221,6 +225,7 @@ async def dispatch_worker(context: ToolExecutionContext, args: dict, workers: Wo
     try:
         claimed = task_service.claim_step(context, {"task_id": args["task_id"], "step_id": chosen["step_id"]})
         return {
+            "worker_agent_id": worker_agent_id_for_session(session_id=context.session_id, worker_id=worker.worker_id),
             "worker_id": worker.worker_id,
             "claimed_step_id": claimed["step"]["step_id"],
             "step_status": claimed["step"]["status"],
@@ -229,3 +234,60 @@ async def dispatch_worker(context: ToolExecutionContext, args: dict, workers: Wo
         }
     finally:
         workers.mark_idle(worker)
+
+
+def _definition_catalog_item(context: ToolExecutionContext, definition) -> dict:
+    return {
+        "agent_definition_id": definition.agent_definition_id,
+        "name": definition.name,
+        "description": definition.description,
+        "source": definition.source,
+        "suggested_tools": _suggested_tool_catalog(context, definition.suggested_tools),
+        "tags": list(definition.tags),
+    }
+
+
+def _worker_catalog_item(context: ToolExecutionContext, worker: WorkerRuntimeState) -> dict:
+    definitions = context.services.get("agent_definitions") if context.services else None
+    definition = definitions.get(worker.agent_definition_id) if definitions is not None else None
+    item = {
+        "worker_agent_id": worker_agent_id_for_session(session_id=context.session_id, worker_id=worker.worker_id),
+        "worker_id": worker.worker_id,
+        "agent_definition_id": worker.agent_definition_id,
+        "name": definition.name if definition is not None else worker.worker_id,
+        "description": definition.description if definition is not None else "",
+        "worker_pool_id": worker.pool_id,
+        "status": "busy" if worker.status == "running" else worker.status,
+        "suggested_tools": _suggested_tool_catalog(context, definition.suggested_tools if definition is not None else []),
+        "tags": list(definition.tags) if definition is not None else [],
+        "allowed_tools": worker.allowed_tools,
+    }
+    if worker.current_run_id:
+        item["current_run_id"] = worker.current_run_id
+    if worker.current_step_id:
+        item["current_step_id"] = worker.current_step_id
+    return item
+
+
+def _suggested_tool_catalog(context: ToolExecutionContext, names: list[str]) -> list[dict]:
+    result: list[dict] = []
+    disabled = set(context.config.tools.disabled or [])
+    effective = context.effective_tool_definitions or {}
+    for name in names:
+        item: dict[str, object] = {"name": name}
+        if name in disabled:
+            item["available"] = False
+            item["unavailable_reason"] = "disabled_by_config"
+        elif effective and name not in effective:
+            item["available"] = False
+            item["unavailable_reason"] = "mode_restricted"
+        else:
+            item["available"] = True
+        result.append(item)
+    return result
+
+
+def _ensure_agent_tool_role(context: ToolExecutionContext, tool_name: str, allowed_roles: set[str]) -> None:
+    if context.agent_role not in allowed_roles:
+        roles = ", ".join(sorted(allowed_roles))
+        raise AgentCoreError(ErrorCode.TOOL_NOT_AVAILABLE, f"{tool_name} is only available to {roles} agents")

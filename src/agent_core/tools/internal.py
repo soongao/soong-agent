@@ -6,6 +6,7 @@ from pathlib import Path
 from agent_core.context.skills import find_skill_by_name
 from agent_core.errors import AgentCoreError
 from agent_core.errors.codes import ErrorCode
+from agent_core.memory.writer import resolve_memory_dir
 from agent_core.tools.execution import ToolExecutionContext
 from agent_core.tools.registry import ToolRegistry
 from agent_core.types.tools import ToolDefinition
@@ -59,9 +60,11 @@ async def load_skill(context: ToolExecutionContext, args: dict) -> dict:
 
 
 async def recall_memory(context: ToolExecutionContext, args: dict) -> dict:
+    if context.agent_role not in {"main", "orchestrator"}:
+        raise AgentCoreError(ErrorCode.TOOL_NOT_AVAILABLE, "internal.recall_memory is only available to main/orchestrator agents")
     query = str(args["query"])
     top_k = int(args.get("top_k") or context.config.memory.recall_top_k)
-    memory_dir = Path(context.config.memory.memory_dir.replace("${SOONG_AGENT_HOME}", str(context.home_dir))).expanduser()
+    memory_dir = resolve_memory_dir(context.config.memory.memory_dir, home_dir=context.home_dir, project_dir=context.project_dir)
     selected_by_model = False
     selected_paths: list[str] = []
     runtime = context.services.get("runtime") if context.services else None

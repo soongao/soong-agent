@@ -20,10 +20,27 @@ class EventStream:
         if not self._closed:
             await self._queue.put(event)
 
+    def put_nowait(self, event: RuntimeEvent) -> bool:
+        if self._closed:
+            return False
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            return False
+        return True
+
     async def close(self) -> None:
         if not self._closed:
             self._closed = True
-            await self._queue.put(None)
+            if self._consumed:
+                await self._queue.put(None)
+                return
+            try:
+                self._queue.put_nowait(None)
+            except asyncio.QueueFull:
+                while not self._queue.empty():
+                    self._queue.get_nowait()
+                self._queue.put_nowait(None)
 
     async def iter(self) -> AsyncIterator[RuntimeEvent]:
         if self._consumed:

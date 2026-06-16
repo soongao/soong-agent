@@ -5,10 +5,12 @@ import sys
 
 import pytest
 
+from agent_core.api.runtime import AgentRuntime
 from agent_core.artifacts import ArtifactManager
 from agent_core.config import load_runtime_config
+from agent_core.errors import AgentCoreError
 from agent_core.hooks.loader import load_hooks, normalize_hooks
-from agent_core.mcp.discovery import McpDiscovery
+from agent_core.mcp.discovery import McpDiscovery, McpToolManager
 from agent_core.permissions import PermissionSessionCache
 from agent_core.tools.builtin_code import register_builtin_code_tools
 from agent_core.tools.declarative import load_declarative_tools
@@ -17,6 +19,7 @@ from agent_core.tools.registry import ToolRegistry
 from agent_core.types.permissions import PermissionDecision, PermissionDecisionKind
 from agent_core.types.tools import ToolCall, ToolDefinition
 from tests.conftest import write_config
+from tests.fixtures.scripted_ollama import ScriptedOllama
 
 
 async def network_echo_handler(_context, args):
@@ -466,6 +469,214 @@ async def test_declarative_tool_user_level_exec(isolated_dirs) -> None:
 
 
 @pytest.mark.asyncio
+async def test_declarative_tool_stdout_json_can_return_tool_result_schema(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    tools_dir = home / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "structured.json").write_text(
+        json.dumps(
+            {
+                "name": "user.structured",
+                "description": "structured",
+                "permission": "readonly",
+                "tags": ["declarative"],
+                "input_schema": {"type": "object", "properties": {}},
+                "command_type": "exec",
+                "command": [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json; "
+                        "print(json.dumps({'content':[{'type':'text','text':'structured ok'}],"
+                        "'metadata': {'from_stdout_json': True}}))"
+                    ),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    load_declarative_tools(registry, home)
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="structured_call", name="user.structured", arguments={}),
+        await make_context(home, project),
+    )
+
+    assert not result.is_error
+    assert result.tool_call_id == "structured_call"
+    assert result.tool_name == "user.structured"
+    assert result.content[0].text == "structured ok"  # type: ignore[union-attr]
+    assert result.metadata["from_stdout_json"] is True
+    assert result.metadata["exit_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_declarative_tool_receives_stdin_json_payload(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    tools_dir = home / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "stdin.json").write_text(
+        json.dumps(
+            {
+                "name": "user.stdin",
+                "description": "stdin",
+                "permission": "readonly",
+                "tags": ["declarative"],
+                "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+                "command_type": "exec",
+                "command": [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json, sys; "
+                        "payload=json.load(sys.stdin); "
+                        "print(json.dumps({'content':[{'type':'json','data': payload}]}))"
+                    ),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    load_declarative_tools(registry, home)
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="stdin_call", name="user.stdin", arguments={"text": "hello"}),
+        await make_context(home, project),
+    )
+
+    assert not result.is_error
+    data = result.content[0].data  # type: ignore[union-attr]
+    assert data["tool_name"] == "user.stdin"
+    assert data["arguments"] == {"text": "hello"}
+    assert data["session_id"] == "sess"
+
+
+@pytest.mark.asyncio
+async def test_declarative_shell_command_requires_write_and_quotes_template_values(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    tools_dir = home / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "shell.json").write_text(
+        json.dumps(
+            {
+                "name": "user.shell",
+                "description": "shell",
+                "permission": "write",
+                "tags": ["declarative", "dangerous"],
+                "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+                "command_type": "shell",
+                "command": f"{sys.executable} -c \"import sys; print(sys.argv[1])\" {{{{args.text}}}}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    load_declarative_tools(registry, home)
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="shell_call", name="user.shell", arguments={"text": "hello; exit 7"}),
+        await make_context(home, project),
+    )
+
+    assert not result.is_error
+    assert result.content[0].data["stdout"].strip() == "hello; exit 7"  # type: ignore[union-attr]
+
+
+def test_declarative_tool_unknown_fields_are_rejected(isolated_dirs) -> None:
+    home, _project = isolated_dirs
+    tools_dir = home / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "bad.json").write_text(
+        json.dumps(
+            {
+                "name": "user.bad",
+                "description": "bad",
+                "permission": "readonly",
+                "tags": ["declarative"],
+                "input_schema": {"type": "object", "properties": {}},
+                "command_type": "exec",
+                "command": [sys.executable, "-c", "print('bad')"],
+                "surprise": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+
+    with pytest.raises(AgentCoreError) as exc:
+        load_declarative_tools(registry, home)
+
+    assert exc.value.code.value == "validation_error"
+    assert "unknown field: surprise" in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_project_level_declarative_tools_are_ignored(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    project_tools = project / ".soong-agent" / "tools"
+    project_tools.mkdir(parents=True)
+    (project_tools / "project.json").write_text(
+        json.dumps(
+            {
+                "name": "user.project_tool",
+                "description": "project tool should be ignored",
+                "permission": "readonly",
+                "tags": ["declarative"],
+                "input_schema": {"type": "object", "properties": {}},
+                "command_type": "exec",
+                "command": ["python3", "-c", "print('project')"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    load_declarative_tools(registry, home)
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="c1", name="user.project_tool", arguments={}),
+        await make_context(home, project),
+    )
+
+    assert result.is_error
+    assert result.error and result.error.code.value == "tool_not_available"
+
+
+@pytest.mark.asyncio
+async def test_runtime_declarative_enabled_false_skips_user_tools(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    tools_dir = home / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "echo.json").write_text(
+        json.dumps(
+            {
+                "name": "user.echo",
+                "description": "echo",
+                "permission": "readonly",
+                "tags": ["declarative"],
+                "input_schema": {"type": "object", "properties": {}},
+                "command_type": "exec",
+                "command": ["python3", "-c", "print('hello')"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = write_config(home, base_url=scripted_ollama.base_url)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("declarative_enabled = true", "declarative_enabled = false"),
+        encoding="utf-8",
+    )
+
+    async with AgentRuntime(project_dir=project, provider_registry=scripted_ollama.provider_registry()) as runtime:
+        names = {tool.name for tool in runtime._effective_tools(agent_role="main")}
+
+    assert "user.echo" not in names
+
+
+@pytest.mark.asyncio
 async def test_declarative_tool_large_stdout_uses_artifact(isolated_dirs) -> None:
     home, project = isolated_dirs
     tools_dir = home / "tools"
@@ -496,6 +707,90 @@ async def test_declarative_tool_large_stdout_uses_artifact(isolated_dirs) -> Non
     assert result.metadata["stdout_artifact_id"]
     artifact = home / "sessions" / "sess" / "artifacts" / result.metadata["stdout_artifact_id"]
     assert list(artifact.iterdir())[0].read_text(encoding="utf-8").strip() == "x" * 200
+
+
+@pytest.mark.asyncio
+async def test_declarative_tool_env_allowlist_filters_os_and_config_env(isolated_dirs, monkeypatch) -> None:
+    home, project = isolated_dirs
+    monkeypatch.setenv("DECL_SECRET", "should-not-leak")
+    tools_dir = home / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "env.json").write_text(
+        json.dumps(
+            {
+                "name": "user.env",
+                "description": "env",
+                "permission": "readonly",
+                "tags": ["declarative"],
+                "input_schema": {"type": "object", "properties": {}},
+                "command_type": "exec",
+                "command": [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json, os; "
+                        "print(json.dumps({"
+                        "'allowed': os.environ.get('DECL_ALLOWED'), "
+                        "'blocked': os.environ.get('DECL_BLOCKED'), "
+                        "'secret': os.environ.get('DECL_SECRET'), "
+                        "'path': bool(os.environ.get('PATH'))"
+                        "}))"
+                    ),
+                ],
+                "stdout_limit_bytes": 512,
+                "env_allowlist": ["DECL_ALLOWED"],
+                "env": {"DECL_ALLOWED": "configured", "DECL_BLOCKED": "blocked"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    load_declarative_tools(registry, home)
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="c1", name="user.env", arguments={}),
+        await make_context(home, project),
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content[0].data["stdout"]) == {  # type: ignore[union-attr]
+        "allowed": "configured",
+        "blocked": None,
+        "secret": None,
+        "path": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_declarative_tool_timeout_returns_timeout_error(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    tools_dir = home / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "slow.json").write_text(
+        json.dumps(
+            {
+                "name": "user.slow",
+                "description": "slow",
+                "permission": "readonly",
+                "tags": ["declarative"],
+                "input_schema": {"type": "object", "properties": {}},
+                "command_type": "exec",
+                "command": [sys.executable, "-c", "import time; time.sleep(1)"],
+                "timeout_ms": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ToolRegistry()
+    load_declarative_tools(registry, home)
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="c1", name="user.slow", arguments={}),
+        await make_context(home, project),
+    )
+
+    assert result.is_error
+    assert result.error and result.error.code.value == "timeout"
 
 
 @pytest.mark.asyncio
@@ -540,3 +835,41 @@ def test_mcp_discovery_disabled_rules(isolated_dirs) -> None:
     assert discovery.available_servers() == ["s1"]
     assert discovery.tool_enabled("mcp.s1.ok")
     assert not discovery.tool_enabled("mcp.s1.bad")
+
+
+@pytest.mark.asyncio
+async def test_mcp_discovery_cache_refreshes_when_tool_config_changes(isolated_dirs, monkeypatch) -> None:
+    home, project = isolated_dirs
+    write_config(home)
+    config, _paths = load_runtime_config(project_dir=project)
+    config.tools.mcp.discovery_cache_ttl_ms = 60000
+    list_calls = 0
+
+    class StubMcpClient:
+        def __init__(self, *, server_id, config):
+            self.server_id = server_id
+            self.config = config
+
+        async def list_tools(self):
+            nonlocal list_calls
+            list_calls += 1
+            return [
+                {"name": "ok", "description": "ok", "inputSchema": {"type": "object", "properties": {}}, "permission": "readonly"},
+                {"name": "bad", "description": "bad", "inputSchema": {"type": "object", "properties": {}}, "permission": "readonly"},
+            ]
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("agent_core.mcp.discovery.McpClient", StubMcpClient)
+    manager = McpToolManager({"servers": {"s1": {"command": "stub"}}}, config.tools)
+
+    first = await manager.discover()
+    second = await manager.discover()
+    config.tools.mcp.disabled_tools.append("mcp.s1.bad")
+    refreshed = await manager.discover()
+
+    assert list_calls == 2
+    assert sorted(first.tools) == ["mcp.s1.bad", "mcp.s1.ok"]
+    assert second is first
+    assert sorted(refreshed.tools) == ["mcp.s1.ok"]

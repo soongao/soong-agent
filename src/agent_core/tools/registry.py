@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from agent_core.artifacts.redaction import redact_value
 from agent_core.errors.codes import ErrorCode
 from agent_core.hooks.matcher import hook_matches
 from agent_core.hooks.runner import HookRunner
 from agent_core.types.common import ErrorPayload
 from agent_core.types.permissions import PermissionDecisionKind, PermissionRequest
 from agent_core.types.tools import ToolCall, ToolDefinition, ToolResult, error_tool_result, normalize_tool_result
-from agent_core.permissions import needs_permission
+from agent_core.permissions import is_sensitive_path, needs_permission
 from agent_core.tools.execution import ToolExecutionContext, ToolHandler
 
 
@@ -59,9 +61,10 @@ class ToolRegistry:
                 error=ErrorPayload(code=ErrorCode.VALIDATION_ERROR, message=str(exc)),
             )
 
-        target_path = _target_path(call.arguments, context)
+        target_path = _target_path(call.name, call.arguments, context)
         network_host = _network_host(call.arguments) if "network" in definition.tags else None
         target_scope = _target_scope(
+            call.name,
             call.arguments,
             context,
             target_path=target_path,
@@ -104,6 +107,8 @@ class ToolRegistry:
                 target=target_path,
                 config=context.config,
             )
+            if permitted and _sensitive_read_target_hit(call.name, call.arguments, target_path, context):
+                permitted = False
             network_denied_by_policy = False
             if "network" in definition.tags:
                 network_policy = context.config.permissions.network_policy
@@ -143,7 +148,7 @@ class ToolRegistry:
                     tool_name=definition.name,
                     permission=definition.permission,
                     tags=sorted(definition.tags),
-                    args_summary=str(call.arguments)[:1000],
+                    args_summary=str(redact_value(call.arguments))[:1000],
                     target_scope=target_scope,
                     cwd=str(context.effective_cwd),
                     env_summary={},
@@ -205,7 +210,12 @@ class ToolRegistry:
             result = error_tool_result(
                 tool_call_id=call.tool_call_id,
                 tool_name=definition.name,
-                error=ErrorPayload(code=code, message=message),
+                error=ErrorPayload(
+                    code=code,
+                    message=message,
+                    retryable=bool(getattr(exc, "retryable", False)),
+                    details=dict(getattr(exc, "details", {}) or {}),
+                ),
             )
             return await _run_post_tool_hooks(context=context, call=call, definition=definition, target_path=target_path, result=result)
 
@@ -249,6 +259,7 @@ async def _run_post_tool_hooks(
 
 
 def _target_scope(
+    tool_name: str,
     arguments: dict[str, Any],
     context: ToolExecutionContext,
     *,
@@ -260,22 +271,56 @@ def _target_scope(
         return f"network:{network_host}"
     if is_network:
         return "network:unknown"
-    if "path" in arguments:
+    if "path" in arguments or tool_name == "code.search":
         return str(target_path) if target_path is not None else None
-    if "cwd" in arguments:
-        return str(_resolve_scope_path(arguments["cwd"], context))
     if "argv" in arguments:
         argv = arguments.get("argv") or []
         executable = argv[0] if isinstance(argv, list) and argv else ""
         cwd = _resolve_scope_path(arguments.get("cwd") or str(context.project_dir), context)
         return f"{executable}:{cwd}"
+    if "cwd" in arguments:
+        return str(_resolve_scope_path(arguments["cwd"], context))
     return None
 
 
-def _target_path(arguments: dict[str, Any], context: ToolExecutionContext):
+def _target_path(tool_name: str, arguments: dict[str, Any], context: ToolExecutionContext):
     if "path" in arguments and arguments["path"] is not None:
         return _resolve_scope_path(arguments["path"], context)
+    if tool_name == "code.search":
+        return context.project_dir.resolve()
     return None
+
+
+def _sensitive_read_target_hit(
+    tool_name: str,
+    arguments: dict[str, Any],
+    target_path: Any,
+    context: ToolExecutionContext,
+) -> bool:
+    if tool_name not in {"code.read_file", "code.list_dir", "code.search"} or target_path is None:
+        return False
+    path = Path(str(target_path))
+    patterns = context.config.tools.sensitive_paths
+    if is_sensitive_path(path, patterns=patterns):
+        return True
+    if not path.is_dir():
+        return False
+    if tool_name == "code.search":
+        return _directory_contains_sensitive_path(path, patterns=patterns, recursive=True)
+    if tool_name == "code.list_dir":
+        return _directory_contains_sensitive_path(path, patterns=patterns, recursive=bool(arguments.get("recursive", False)))
+    return False
+
+
+def _directory_contains_sensitive_path(path: Path, *, patterns: list[str], recursive: bool) -> bool:
+    try:
+        iterator = path.rglob("*") if recursive else path.iterdir()
+        for child in iterator:
+            if is_sensitive_path(child, patterns=patterns):
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def _resolve_scope_path(value: Any, context: ToolExecutionContext):

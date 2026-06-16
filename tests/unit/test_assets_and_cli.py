@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from importlib import resources
+from pathlib import Path
+import tomllib
 
 import pytest
 
+from agent_core.assets.loader import get_asset, list_required_assets, read_asset
 from agent_core.cli import async_main, build_parser
 from agent_core.config import load_config
 from agent_core.permissions import stdin_permission_callback
@@ -14,7 +17,13 @@ from tests.fixtures.scripted_ollama import ScriptedOllama
 
 def test_required_assets_exist() -> None:
     for package, names in {
-        "agent_core.assets.templates": ["config_default.toml", "plan_template.md", "task_template.md"],
+        "agent_core.assets.templates": [
+            "config_default.toml",
+            "plan_default.md",
+            "task_dag_default.md",
+            "plan_template.md",
+            "task_template.md",
+        ],
         "agent_core.assets.prompts.system": [
             "core.md",
             "tool_protocol.md",
@@ -37,8 +46,36 @@ def test_required_assets_exist() -> None:
             assert text.strip()
 
 
+def test_asset_loader_reads_contract_asset_ids() -> None:
+    asset_ids = {asset.asset_id for asset in list_required_assets()}
+
+    assert {
+        "system.core",
+        "template.config.default",
+        "template.plan.default",
+        "template.task_dag.default",
+        "agent.default_worker_agent",
+        "agent.default_compact_agent",
+    } <= asset_ids
+
+    for asset_id in asset_ids:
+        text = read_asset(asset_id)
+        assert text.strip()
+        assert get_asset(asset_id).resource_path
+
+
+def test_wheel_build_config_includes_typed_marker_and_assets() -> None:
+    data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    wheel = data["tool"]["hatch"]["build"]["targets"]["wheel"]
+
+    assert wheel["packages"] == ["src/agent_core"]
+    assert "src/agent_core/py.typed" in wheel["include"]
+    assert "src/agent_core/assets/**/*.md" in wheel["include"]
+    assert "src/agent_core/assets/**/*.toml" in wheel["include"]
+
+
 def test_default_config_template_matches_contract(tmp_path) -> None:
-    text = resources.files("agent_core.assets.templates").joinpath("config_default.toml").read_text(encoding="utf-8")
+    text = read_asset("template.config.default")
     path = tmp_path / "config.toml"
     path.write_text(text, encoding="utf-8")
 
@@ -144,6 +181,40 @@ async def test_cli_permission_allow_once_writes_file(isolated_dirs, monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_cli_permission_allow_for_session_reuses_scope(
+    isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_tool_calls(
+        [ToolCall(tool_call_id="write_first", name="code.write_file", arguments={"path": "session.txt", "content": "one"})]
+    )
+    scripted_ollama.enqueue_tool_calls(
+        [
+            ToolCall(
+                tool_call_id="write_second",
+                name="code.write_file",
+                arguments={"path": "session.txt", "content": "two", "overwrite": True},
+            )
+        ]
+    )
+    scripted_ollama.enqueue_text("session write done")
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+
+    from io import StringIO
+
+    monkeypatch.setattr("sys.stdin", StringIO("2\n"))
+    code = await async_main(["run", "--path", str(project), "write the same file twice"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert captured.out.count("Permission required for code.write_file") == 1
+    assert "session write done" in captured.out
+    assert captured.err == ""
+    assert (project / "session.txt").read_text(encoding="utf-8") == "two"
+
+
+@pytest.mark.asyncio
 async def test_cli_permission_deny_blocks_write(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
     write_config(home, base_url=scripted_ollama.base_url)
@@ -164,6 +235,36 @@ async def test_cli_permission_deny_blocks_write(isolated_dirs, monkeypatch, caps
     assert "write denied" in captured.out
     assert captured.err == ""
     assert not (project / "denied.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_cli_permission_deny_stops_following_write_tool_calls(
+    isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_tool_calls(
+        [
+            ToolCall(tool_call_id="denied", name="code.write_file", arguments={"path": "denied.txt", "content": "no"}),
+            ToolCall(tool_call_id="skipped", name="code.write_file", arguments={"path": "skipped.txt", "content": "skip"}),
+        ]
+    )
+    scripted_ollama.enqueue_text("writes stopped")
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+
+    from io import StringIO
+
+    monkeypatch.setattr("sys.stdin", StringIO("3\n"))
+    code = await async_main(["run", "--path", str(project), "try writing two files"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert captured.out.count("Permission required for code.write_file") == 1
+    assert "deny" in captured.out
+    assert "writes stopped" in captured.out
+    assert captured.err == ""
+    assert not (project / "denied.txt").exists()
+    assert not (project / "skipped.txt").exists()
 
 
 @pytest.mark.asyncio
@@ -231,8 +332,13 @@ async def test_cli_orchestrator_dispatches_worker_with_ollama(isolated_dirs, mon
     ("stdin_text", "expected"),
     [
         ("1\n", "allow_once"),
+        ("allow once\n", "allow_once"),
+        ("allow_once\n", "allow_once"),
         ("2\n", "allow_for_session"),
+        ("allow for session\n", "allow_for_session"),
+        ("allow_for_session\n", "allow_for_session"),
         ("3\n", "deny"),
+        ("deny\n", "deny"),
         ("invalid\n", "deny"),
         ("", "deny"),
     ],

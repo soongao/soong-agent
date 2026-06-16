@@ -26,6 +26,10 @@ class OllamaProvider(ProviderAdapter):
         self._client = httpx.AsyncClient(timeout=self.timeout)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        provider_options, option_error = _ollama_provider_options(request)
+        if option_error is not None:
+            yield _failed(option_error)
+            return
         messages: list[dict[str, Any]] = []
         if request.system:
             messages.append({"role": "system", "content": "\n\n".join(block.content for block in request.system)})
@@ -53,6 +57,8 @@ class OllamaProvider(ProviderAdapter):
                 "num_predict": request.max_output_tokens,
             },
         }
+        payload["options"].update(provider_options.pop("options", {}))
+        payload.update(provider_options)
         if tools:
             payload["tools"] = tools
         yield ModelEvent(event_type="model_started", metadata={"provider": "ollama"})
@@ -64,10 +70,12 @@ class OllamaProvider(ProviderAdapter):
             try:
                 async with self._client.stream("POST", f"{self.base_url}/api/chat", json=payload) as response:
                     response.raise_for_status()
+                    raw_lines: list[dict[str, Any]] = []
                     async for line in response.aiter_lines():
                         if not line:
                             continue
                         data = json.loads(line)
+                        raw_lines.append(data)
                         message = data.get("message") or {}
                         content = message.get("content")
                         if content:
@@ -83,7 +91,7 @@ class OllamaProvider(ProviderAdapter):
                                         tool_call_id=f"ollama_tool_{len(tool_calls) + index}",
                                         name=from_provider_tool_name(name, known_names),
                                         arguments=args if isinstance(args, dict) else {},
-                                        metadata={"raw": raw_call, "raw_name": name},
+                                        metadata={"raw_name": name},
                                     )
                                 )
                         if data.get("done"):
@@ -100,7 +108,14 @@ class OllamaProvider(ProviderAdapter):
                                 tool_calls=tool_calls,
                                 stop_reason=stop_reason,
                                 usage=usage,
-                                metadata={"provider": "ollama", "raw_done": data, "retry_count": retry_count},
+                                metadata={
+                                    "provider": "ollama",
+                                    "retry_count": retry_count,
+                                    "raw_debug": {
+                                        "request": payload,
+                                        "response": raw_lines,
+                                    },
+                                },
                             )
                             return
                     return
@@ -118,6 +133,34 @@ class OllamaProvider(ProviderAdapter):
 
     async def close(self) -> None:
         await self._client.aclose()
+
+
+def _ollama_provider_options(request: ModelRequest) -> tuple[dict[str, Any], str | None]:
+    if not request.provider_options:
+        return {}, None
+    unknown_namespaces = sorted(key for key in request.provider_options if key != "ollama")
+    if unknown_namespaces:
+        return {}, f"unknown provider_options namespace for ollama: {', '.join(unknown_namespaces)}"
+    options = request.provider_options.get("ollama") or {}
+    if not isinstance(options, dict):
+        return {}, "provider_options.ollama must be an object"
+    allowed_keys = {"options", "format", "keep_alive"}
+    unknown_keys = sorted(key for key in options if key not in allowed_keys)
+    if unknown_keys:
+        return {}, f"unsupported ollama provider_options: {', '.join(unknown_keys)}"
+    payload: dict[str, Any] = {}
+    if "options" in options:
+        if not isinstance(options["options"], dict):
+            return {}, "provider_options.ollama.options must be an object"
+        payload["options"] = dict(options["options"])
+    for key in ("format", "keep_alive"):
+        if key in options:
+            payload[key] = options[key]
+    return payload, None
+
+
+def _failed(message: str) -> ModelEvent:
+    return ModelEvent(event_type="model_failed", error=ErrorPayload(code=ErrorCode.CONFIG_ERROR, message=message))
 
 
 def _ollama_messages(message: Any) -> list[dict[str, Any]]:

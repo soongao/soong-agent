@@ -11,11 +11,15 @@ class AgentCoreError(Exception):
         code: ErrorCode | str,
         message: str,
         *,
+        retryable: bool = False,
         details: dict[str, Any] | None = None,
+        cause: BaseException | None = None,
     ) -> None:
         self.code = ErrorCode(code)
         self.message = message
+        self.retryable = retryable
         self.details = details or {}
+        self.cause = cause
         super().__init__(f"{self.code.value}: {message}")
 
 
@@ -30,4 +34,3 @@ class ToolExecutionError(AgentCoreError):
 
 class ProviderError(AgentCoreError):
     pass
-

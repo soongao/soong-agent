@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from importlib import resources
 from pathlib import Path
 from typing import Any
 
+from agent_core.assets.loader import get_asset, read_asset
 from agent_core.context.instructions import build_instruction_catalog, instruction_catalog_text
 from agent_core.context.skills import build_skill_catalog, skill_catalog_text
+from agent_core.memory.writer import resolve_memory_dir
 from agent_core.providers.base import SystemBlock
 
 
@@ -27,10 +28,10 @@ def build_static_system_blocks(*, home_dir: Path, project_dir: Path) -> list[Sys
         SystemBlock(
             block_id=block_id,
             source="package_asset",
-            content=_read_system_asset(filename),
+            content=read_asset(block_id),
             priority=priority,
             dynamic=False,
-            metadata={"asset_path": f"prompts/system/{filename}"},
+            metadata={"asset_id": block_id, "asset_path": get_asset(block_id).resource_path},
         )
         for block_id, filename, priority in SYSTEM_PROMPT_ASSETS
     ]
@@ -57,10 +58,16 @@ def build_static_system_blocks(*, home_dir: Path, project_dir: Path) -> list[Sys
     return blocks
 
 
-def build_dynamic_system_blocks(context_state: Any | None, *, home_dir: Path | None = None, memory_enabled: bool = True) -> list[SystemBlock]:
+def build_dynamic_system_blocks(
+    context_state: Any | None,
+    *,
+    home_dir: Path | None = None,
+    memory_enabled: bool = True,
+    memory_dir: Path | None = None,
+) -> list[SystemBlock]:
     blocks: list[SystemBlock] = []
     if home_dir is not None and memory_enabled:
-        catalog_path = home_dir / "memory" / "MEMORY.md"
+        catalog_path = (memory_dir or (home_dir / "memory")) / "MEMORY.md"
         if catalog_path.exists():
             blocks.append(
                 SystemBlock(
@@ -97,16 +104,15 @@ def build_system_blocks(
     project_dir: Path,
     context_state: Any | None = None,
     memory_enabled: bool = True,
+    memory_dir_template: str = "${SOONG_AGENT_HOME}/memory",
 ) -> list[SystemBlock]:
+    memory_dir = resolve_memory_dir(memory_dir_template, home_dir=home_dir, project_dir=project_dir) if memory_enabled else None
     return build_static_system_blocks(home_dir=home_dir, project_dir=project_dir) + build_dynamic_system_blocks(
         context_state,
         home_dir=home_dir,
         memory_enabled=memory_enabled,
+        memory_dir=memory_dir,
     )
-
-
-def _read_system_asset(filename: str) -> str:
-    return resources.files("agent_core.assets.prompts.system").joinpath(filename).read_text(encoding="utf-8")
 
 
 def _memory_context_text(items: list[dict[str, Any]]) -> str:
