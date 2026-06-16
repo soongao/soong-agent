@@ -16,6 +16,7 @@ from tests.fixtures.scripted_ollama import ScriptedOllama, text_response
 
 
 def _write_ollama_config(home, scripted_ollama: ScriptedOllama, **kwargs):
+    kwargs.setdefault("memory_enabled", None)
     return write_config(home, base_url=scripted_ollama.base_url, **kwargs)
 
 
@@ -31,6 +32,10 @@ def _memory_response_with_source(memory_response: str):
         return text_response(memory_response.replace("__NODE_ID__", node_id))
 
     return responder
+
+
+def _memory_intent_response(explicit: bool) -> str:
+    return json.dumps({"explicit": explicit, "reason": "test"})
 
 
 def test_repeated_memory_recall_result_does_not_create_synthetic_context_node() -> None:
@@ -93,6 +98,7 @@ max_output_tokens = 256
         }
     )
     scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(_memory_intent_response(False))
     scripted_ollama.enqueue(_memory_response_with_source(memory_response))
 
     async with _runtime(project, scripted_ollama) as runtime:
@@ -164,6 +170,7 @@ memory_context_token_budget = 6000
         }
     )
     scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(_memory_intent_response(True))
     scripted_ollama.enqueue(_memory_response_with_source(memory_response))
 
     async with _runtime(project, scripted_ollama) as runtime:
@@ -198,6 +205,7 @@ memory_context_token_budget = 6000
         encoding="utf-8",
     )
     scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(_memory_intent_response(False))
 
     async with _runtime(project, scripted_ollama) as runtime:
         handle = await runtime.start("ordinary status update", session_id="sess_memory_wait")
@@ -205,6 +213,41 @@ memory_context_token_budget = 6000
         replay = await runtime.replay_session("sess_memory_wait")
 
     assert [request for request in scripted_ollama.requests if request.get("metadata", {}).get("purpose") == "memory_extraction"] == []
+    assert not [event for event in replay.events if event.event_type.startswith("memory_extraction_")]
+
+
+@pytest.mark.asyncio
+async def test_memory_extraction_intent_uses_model_decision_not_local_keywords(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    config_path = _write_ollama_config(home, scripted_ollama)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + """
+
+[memory]
+enabled = true
+extract_every_messages = 99
+extract_every_tokens = 12000
+idle_seconds = 120
+catalog_max_tokens = 4000
+recall_top_k = 5
+memory_context_token_budget = 6000
+""",
+        encoding="utf-8",
+    )
+    scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(_memory_intent_response(False))
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("remember how this algorithm works for this task only", session_id="sess_memory_model_intent")
+        _events = [event async for event in handle.events()]
+        replay = await runtime.replay_session("sess_memory_model_intent")
+
+    intent_requests = [request for request in scripted_ollama.requests if request.get("format", {}).get("required") == ["explicit", "reason"]]
+    assert intent_requests
+    assert [request for request in scripted_ollama.requests if request.get("format", {}).get("required") == ["memories"]] == []
     assert not [event for event in replay.events if event.event_type.startswith("memory_extraction_")]
 
 
@@ -244,6 +287,7 @@ memory_context_token_budget = 6000
         }
     )
     scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(_memory_intent_response(False))
     scripted_ollama.enqueue(_memory_response_with_source(memory_response))
 
     async with _runtime(project, scripted_ollama) as runtime:
@@ -296,6 +340,7 @@ memory_context_token_budget = 6000
         }
     )
     scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(_memory_intent_response(False))
     scripted_ollama.enqueue(_memory_response_with_source(memory_response))
 
     async with _runtime(project, scripted_ollama) as runtime:
@@ -345,6 +390,7 @@ memory_context_token_budget = 6000
         }
     )
     scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(_memory_intent_response(True))
     scripted_ollama.enqueue(_memory_response_with_source(memory_response))
 
     async with _runtime(project, scripted_ollama) as runtime:
@@ -418,6 +464,7 @@ memory_context_token_budget = 6000
         }
     )
     scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(_memory_intent_response(True))
     scripted_ollama.enqueue(_memory_response_with_source(memory_response))
 
     async with _runtime(project, scripted_ollama) as runtime:
@@ -455,6 +502,7 @@ memory_context_token_budget = 6000
         encoding="utf-8",
     )
     scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(_memory_intent_response(True))
     scripted_ollama.enqueue_text(
         '{"memories":[{"decision":"new","category":"user","filename":"bad.md","summary":"Bad","content":"missing source"}]}'
     )
@@ -496,6 +544,7 @@ memory_context_token_budget = 6000
         encoding="utf-8",
     )
     scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue_text(_memory_intent_response(True))
     scripted_ollama.enqueue_text(
         json.dumps(
             {
@@ -553,9 +602,10 @@ max_output_tokens = 128
     memory_dir = home / "memory" / "user"
     memory_dir.mkdir(parents=True)
     (memory_dir / "prefs.md").write_text(
-        "---\nid: mem_prefs\ncategory: user\nsummary: Likes pytest\n---\nlikes pytest\n",
+        "---\nid: mem_prefs\ncategory: user\nsummary: Likes pytest\ntags:\n  - testing\n---\nlikes pytest\n",
         encoding="utf-8",
     )
+    scripted_ollama.enqueue_text('{"selected_paths":["user/prefs.md"]}')
     scripted_ollama.enqueue_text('{"selected_paths":["user/prefs.md"]}')
 
     from agent_core.types.tools import ToolCall
@@ -587,9 +637,70 @@ max_output_tokens = 128
 
     recall_requests = [request for request in scripted_ollama.requests if request.get("model") == "recall-model"]
     assert recall_requests
+    recall_request = recall_requests[-1]
+    assert recall_request["format"]["required"] == ["selected_paths"]
+    assert "Match semantically" in recall_request["messages"][0]["content"]
+    assert "tags=" in recall_request["messages"][-1]["content"]
+    assert "excerpt=likes pytest" in recall_request["messages"][-1]["content"]
     assert first.content[0].data["selected_by_model"] is True  # type: ignore[union-attr]
     assert first.content[0].data["matches"][0]["id"] == "mem_prefs"  # type: ignore[union-attr]
     assert second.content[0].data["already_recalled"] is True  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_recall_memory_model_empty_selection_does_not_use_literal_fallback(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    config_path = _write_ollama_config(home, scripted_ollama)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + """
+
+[memory]
+enabled = true
+recall_model_profile = "memory_recall"
+
+[model_overrides.memory_recall]
+name = "recall-model"
+max_output_tokens = 128
+""",
+        encoding="utf-8",
+    )
+    memory_dir = home / "memory" / "user"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "profile.md").write_text(
+        "---\nid: mem_profile\ncategory: user\nsummary: User identity profile\ntags:\n  - profile\n  - backend\n---\n"
+        "user identity profile\n",
+        encoding="utf-8",
+    )
+    scripted_ollama.enqueue_text('{"selected_paths":[]}')
+
+    from agent_core.types.tools import ToolCall
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        await runtime._ensure_started()
+        context = runtime._worker_tool_context(
+            session_id="sess_recall_empty",
+            run_id="run_recall_empty",
+            agent_id="agent_main",
+            parent_agent_id="agent_main",
+            parent_run_id="run_parent",
+            worker_scope={},
+            allowed_tool_names={"internal.recall_memory"},
+        )
+        context.agent_role = "main"
+        context.allowed_tool_names = {"internal.recall_memory"}
+        context.effective_tool_definitions = {
+            tool.name: tool for tool in runtime._effective_tools(agent_role="main") if tool.name == "internal.recall_memory"
+        }
+        result = await runtime.tool_registry.execute(
+            ToolCall(tool_call_id="m1", name="internal.recall_memory", arguments={"query": "user identity profile"}),
+            context,
+        )
+
+    assert result.content[0].data["selected_by_model"] is True  # type: ignore[union-attr]
+    assert result.content[0].data["matches"] == []  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio

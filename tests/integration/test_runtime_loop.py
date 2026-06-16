@@ -643,7 +643,7 @@ async def test_recovery_compact_runs_when_history_exceeds_budget(isolated_dirs, 
 @pytest.mark.asyncio
 async def test_dynamic_system_budget_trims_large_dynamic_blocks(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    config_path = _write_ollama_config(home, scripted_ollama)
+    config_path = _write_ollama_config(home, scripted_ollama, memory_enabled=True)
     config_path.write_text(
         config_path.read_text(encoding="utf-8").replace(
             'session_db_path = "${SOONG_AGENT_HOME}/sessions.sqlite"',

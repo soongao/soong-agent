@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-import re
 from typing import Any, Literal
 
 from agent_core.agents.registry import AgentDefinitionRegistry
@@ -69,7 +68,7 @@ from agent_core.types.tools import error_tool_result
 
 PermissionCallback = Callable[[PermissionRequest], Awaitable[PermissionDecision]]
 RAW_DEBUG_METADATA_KEY = "raw_debug"
-_MEMORY_EXTRACTION_OLLAMA_FORMAT: dict[str, Any] = {
+_MEMORY_EXTRACTION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "memories": {
@@ -91,6 +90,26 @@ _MEMORY_EXTRACTION_OLLAMA_FORMAT: dict[str, Any] = {
         }
     },
     "required": ["memories"],
+    "additionalProperties": False,
+}
+_MEMORY_RECALL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "selected_paths": {
+            "type": "array",
+            "items": {"type": "string"},
+        }
+    },
+    "required": ["selected_paths"],
+    "additionalProperties": False,
+}
+_MEMORY_INTENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "explicit": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["explicit", "reason"],
     "additionalProperties": False,
 }
 
@@ -1300,60 +1319,28 @@ class AgentRuntime:
         if not candidates:
             return {"selected_paths": [], "selected_by_model": False, "candidates": []}
         model_config = resolve_model_config(self.config, self.config.memory.recall_model_profile)
-        request = ModelRequest(
-            model=model_config.name,
-            system=[
-                SystemBlock(
-                    block_id="memory.recall_selector",
-                    source="memory_recall_selector",
-                    content=(
-                        "Select which user-level memory files are relevant to the query. "
-                        "Return only JSON: {\"selected_paths\":[\"user/file.md\"]}. "
-                        "Select at most the requested top_k. Do not invent paths."
-                    ),
-                    priority=900,
-                    dynamic=True,
-                )
-            ],
-            messages=[
-                ModelMessage(
-                    role=ModelRole.USER,
-                    content=[
-                        TextBlock(
-                            text=(
-                                f"Query: {query}\n"
-                                f"top_k: {top_k or self.config.memory.recall_top_k}\n"
-                                "Memory candidates:\n"
-                                + "\n".join(
-                                    f"- {item['relative_path']} [{item.get('category')}] {item.get('summary')}"
-                                    for item in candidates
-                                )
-                            )
-                        )
-                    ],
-                    node_type="memory_recall_request",
-                )
-            ],
-            tools=[],
-            temperature=model_config.temperature,
+        result = await self._run_structured_json_model(
+            model_config=model_config,
+            schema=_MEMORY_RECALL_SCHEMA,
+            purpose="memory_recall_selector",
+            session_id=session_id,
+            system_text=(
+                "You are the Soong Agent memory recall selector. "
+                "Select user-level memory files that may help answer the query. "
+                "Match semantically using summaries, categories, tags, and filenames; do not require exact word overlap. "
+                "For identity, profile, role, language, preference, or background questions, include memories describing the user. "
+                "Return selected_paths with at most the requested top_k. Return [] only when no candidate is plausibly relevant. "
+                "Do not invent paths."
+            ),
+            user_text=(
+                f"Query: {query}\n"
+                f"top_k: {top_k or self.config.memory.recall_top_k}\n"
+                "Memory candidates:\n"
+                + "\n".join(_memory_candidate_selector_line(item) for item in candidates)
+            ),
             max_output_tokens=min(model_config.max_output_tokens, 1024),
-            metadata={"session_id": session_id, "purpose": "memory_recall_selector"},
         )
-        provider = self._provider_for_model(model_config)
-        _ensure_provider_supports_request(provider, request)
-        output_parts: list[str] = []
-        async for model_event in provider.stream(request):
-            if model_event.event_type == "model_text_delta" and model_event.text_delta:
-                output_parts.append(model_event.text_delta)
-            elif model_event.event_type == "model_failed":
-                error = model_event.error or ErrorPayload(code=ErrorCode.MEMORY_RECALL_FAILED, message="memory recall selector failed")
-                raise AgentCoreError(error.code, error.message, details=error.details)
-            elif model_event.event_type == "model_completed":
-                for block in model_event.content:
-                    if getattr(block, "type", None) == "text":
-                        output_parts.append(getattr(block, "text", ""))
-                break
-        selected = _parse_selected_memory_paths("".join(output_parts))
+        selected = [str(path) for path in result.get("selected_paths") or []]
         allowed = {item["relative_path"]: item for item in candidates}
         max_items = top_k or self.config.memory.recall_top_k
         selected = [path for path in selected if path in allowed][:max_items]
@@ -2750,7 +2737,8 @@ class AgentRuntime:
         sources = await self.store.memory_source_nodes_since(handle.session_id, cursor_seq)
         if not sources:
             return
-        reason = _memory_extraction_trigger_reason(
+        reason = await self._memory_extraction_trigger_reason(
+            session_id=handle.session_id,
             sources=sources,
             latest_user_text=prompt_text,
             max_pending_messages=max(1, self.config.memory.extract_every_messages),
@@ -2760,6 +2748,96 @@ class AgentRuntime:
             self._schedule_memory_idle_extraction(session_id=handle.session_id)
             return
         await self._run_memory_extraction_for_sources(session_id=handle.session_id, cursor_seq=cursor_seq, sources=sources, reason=reason)
+
+    async def _memory_extraction_trigger_reason(
+        self,
+        *,
+        session_id: str,
+        sources: list[tuple[int, Node]],
+        latest_user_text: str,
+        max_pending_messages: int,
+        token_threshold: int,
+    ) -> str | None:
+        if await self._has_explicit_memory_intent(session_id=session_id, latest_user_text=latest_user_text):
+            return "explicit"
+        if len(sources) >= max_pending_messages:
+            return "message_backlog"
+        if _estimate_memory_source_tokens([node for _seq, node in sources]) >= token_threshold:
+            return "token_backlog"
+        return None
+
+    async def _has_explicit_memory_intent(self, *, session_id: str, latest_user_text: str) -> bool:
+        text = latest_user_text.strip()
+        if not text:
+            return False
+        assert self.config
+        model_config = resolve_model_config(self.config, self.config.memory.extract_model_profile)
+        try:
+            decision = await self._run_structured_json_model(
+                model_config=model_config,
+                schema=_MEMORY_INTENT_SCHEMA,
+                purpose="memory_intent_classifier",
+                session_id=session_id,
+                system_text=(
+                    "Decide whether the user's latest message explicitly asks the assistant to remember, "
+                    "store, keep for future conversations, or always apply a user preference/profile fact. "
+                    "Return JSON with explicit=true only for direct memory/storage intent. "
+                    "Return explicit=false for ordinary questions, facts, status updates, or tasks that do not ask to remember."
+                ),
+                user_text=f"Latest user message:\n{text}",
+                max_output_tokens=min(model_config.max_output_tokens, 256),
+            )
+        except AgentCoreError:
+            return False
+        return bool(decision.get("explicit"))
+
+    async def _run_structured_json_model(
+        self,
+        *,
+        model_config: Any,
+        schema: dict[str, Any],
+        purpose: str,
+        session_id: str,
+        system_text: str,
+        user_text: str,
+        max_output_tokens: int,
+    ) -> dict[str, Any]:
+        request = _structured_json_request(
+            model_config=model_config,
+            schema=schema,
+            purpose=purpose,
+            session_id=session_id,
+            system_text=system_text,
+            user_text=user_text,
+            max_output_tokens=max_output_tokens,
+        )
+        provider = self._provider_for_model(model_config)
+        _ensure_provider_supports_request(provider, request)
+        delta_parts: list[str] = []
+        final_parts: list[str] = []
+        tool_payload: dict[str, Any] | None = None
+        async for model_event in provider.stream(request):
+            if model_event.event_type == "model_text_delta" and model_event.text_delta:
+                delta_parts.append(model_event.text_delta)
+            elif model_event.event_type == "model_failed":
+                error = model_event.error or ErrorPayload(code=ErrorCode.PROVIDER_ERROR, message=f"{purpose} provider failed")
+                raise AgentCoreError(error.code, error.message, details=error.details)
+            elif model_event.event_type == "model_completed":
+                for call in model_event.tool_calls:
+                    if call.name == "internal.structured_json":
+                        tool_payload = dict(call.arguments)
+                        break
+                for block in model_event.content:
+                    if getattr(block, "type", None) == "text":
+                        final_parts.append(getattr(block, "text", ""))
+                break
+        if tool_payload is not None:
+            return tool_payload
+        text = ("".join(final_parts) if final_parts else "".join(delta_parts)).strip()
+        parsed = _parse_json_object(text)
+        if parsed is None:
+            raise AgentCoreError(ErrorCode.PROVIDER_ERROR, f"{purpose} returned invalid JSON")
+        return parsed
 
     async def _run_memory_extraction_for_sources(
         self,
@@ -2899,66 +2977,31 @@ class AgentRuntime:
             project_dir=self.paths.project_dir,
         ) / "MEMORY.md"
         catalog_text = catalog.read_text(encoding="utf-8", errors="replace") if catalog.exists() else "# Memory Catalog\n"
-        request = ModelRequest(
-            model=model_config.name,
-            system=[
-                SystemBlock(
-                    block_id="memory.extraction",
-                    source="memory_extraction",
-                    content=(
-                        "You are the Soong Agent memory extraction job. "
-                        "Decide whether new user-visible context should be written as long-term memory. "
-                        "Return only one JSON object with a top-level memories array. "
-                        "For each memory, decision must be \"new\". "
-                        "Category must be exactly one of these strings: \"user\", \"feedback\", or \"reference\". "
-                        "Use category \"user\" for user profile, preferences, skills, and facts explicitly requested to remember. "
-                        "Do not output combined category strings such as \"user|reference\". "
-                        "Filename must be a local lowercase markdown filename ending in .md, for example backend_developer.md. "
-                        "source_node_ids must copy node IDs exactly from the source nodes. "
-                        "Use an empty memories array when nothing should be stored. "
-                        "Never store secrets, credentials, transient task state, plans, full transcripts, or command output."
-                    ),
-                    priority=900,
-                    dynamic=True,
-                )
-            ],
-            messages=[
-                ModelMessage(
-                    role=ModelRole.USER,
-                    content=[
-                        TextBlock(
-                            text=(
-                                f"Session: {session_id}\n\n"
-                                f"Existing MEMORY.md catalog:\n{catalog_text[:12000]}\n\n"
-                                f"New source nodes:\n{source_text}"
-                            )
-                        )
-                    ],
-                    node_type="memory_extraction_input",
-                )
-            ],
-            tools=[],
-            temperature=model_config.temperature,
+        payload = await self._run_structured_json_model(
+            model_config=model_config,
+            schema=_MEMORY_EXTRACTION_SCHEMA,
+            purpose="memory_extraction",
+            session_id=session_id,
+            system_text=(
+                "You are the Soong Agent memory extraction job. "
+                "Decide whether new user-visible context should be written as long-term memory. "
+                "For each memory, decision must be \"new\". "
+                "Category must be exactly one of these strings: \"user\", \"feedback\", or \"reference\". "
+                "Use category \"user\" for user profile, preferences, skills, and facts explicitly requested to remember. "
+                "Do not output combined category strings such as \"user|reference\". "
+                "Filename must be a local lowercase markdown filename ending in .md, for example backend_developer.md. "
+                "source_node_ids must copy node IDs exactly from the source nodes. "
+                "Use an empty memories array when nothing should be stored. "
+                "Never store secrets, credentials, transient task state, plans, full transcripts, or command output."
+            ),
+            user_text=(
+                f"Session: {session_id}\n\n"
+                f"Existing MEMORY.md catalog:\n{catalog_text[:12000]}\n\n"
+                f"New source nodes:\n{source_text}"
+            ),
             max_output_tokens=model_config.max_output_tokens,
-            provider_options=_memory_extraction_provider_options(model_config),
-            metadata={"session_id": session_id, "purpose": "memory_extraction"},
         )
-        provider = self._provider_for_model(model_config)
-        _ensure_provider_supports_request(provider, request)
-        delta_parts: list[str] = []
-        final_parts: list[str] = []
-        async for model_event in provider.stream(request):
-            if model_event.event_type == "model_text_delta" and model_event.text_delta:
-                delta_parts.append(model_event.text_delta)
-            elif model_event.event_type == "model_failed":
-                error = model_event.error or ErrorPayload(code=ErrorCode.PROVIDER_ERROR, message="memory extraction provider failed")
-                raise AgentCoreError(error.code, error.message, details=error.details)
-            elif model_event.event_type == "model_completed":
-                for block in model_event.content:
-                    if getattr(block, "type", None) == "text":
-                        final_parts.append(getattr(block, "text", ""))
-                break
-        return ("".join(final_parts) if final_parts else "".join(delta_parts)).strip()
+        return json.dumps(payload, ensure_ascii=False)
 
     async def _run_observe_hook(
         self,
@@ -3822,59 +3865,72 @@ def _estimate_message_tokens(message: ModelMessage) -> int:
     return max(char_count // 4, 1)
 
 
-def _memory_extraction_trigger_reason(
+def _structured_json_request(
     *,
-    sources: list[tuple[int, Node]],
-    latest_user_text: str,
-    max_pending_messages: int,
-    token_threshold: int,
-) -> str | None:
-    if _has_explicit_memory_intent(latest_user_text):
-        return "explicit"
-    if len(sources) >= max_pending_messages:
-        return "message_backlog"
-    if _estimate_memory_source_tokens([node for _seq, node in sources]) >= token_threshold:
-        return "token_backlog"
-    return None
+    model_config: Any,
+    schema: dict[str, Any],
+    purpose: str,
+    session_id: str,
+    system_text: str,
+    user_text: str,
+    max_output_tokens: int,
+) -> ModelRequest:
+    provider = getattr(model_config, "provider", None)
+    if provider == "anthropic":
+        tool_name = "internal.structured_json"
+        return ModelRequest(
+            model=model_config.name,
+            system=[
+                SystemBlock(
+                    block_id=purpose,
+                    source=purpose,
+                    content=system_text + " Use the provided tool exactly once with the JSON object.",
+                    priority=900,
+                    dynamic=True,
+                )
+            ],
+            messages=[ModelMessage(role=ModelRole.USER, content=[TextBlock(text=user_text)], node_type=purpose)],
+            tools=[
+                ToolDefinition(
+                    name=tool_name,
+                    description="Return the structured JSON object for this classifier/selector.",
+                    input_schema=schema,
+                    permission="readonly",
+                    tags={"internal", "structured_json"},
+                )
+            ],
+            tool_choice={"type": "tool", "name": tool_name},
+            temperature=model_config.temperature,
+            max_output_tokens=max_output_tokens,
+            metadata={"session_id": session_id, "purpose": purpose},
+        )
+    return ModelRequest(
+        model=model_config.name,
+        system=[
+            SystemBlock(
+                block_id=purpose,
+                source=purpose,
+                content=system_text + "\nReturn only one JSON object matching this schema:\n" + json.dumps(schema, ensure_ascii=False),
+                priority=900,
+                dynamic=True,
+            )
+        ],
+        messages=[ModelMessage(role=ModelRole.USER, content=[TextBlock(text=user_text)], node_type=purpose)],
+        tools=[],
+        temperature=model_config.temperature,
+        max_output_tokens=max_output_tokens,
+        provider_options=_structured_json_provider_options(model_config, schema),
+        metadata={"session_id": session_id, "purpose": purpose},
+    )
 
 
-def _memory_extraction_provider_options(model_config: Any) -> dict[str, Any]:
-    if getattr(model_config, "provider", None) == "ollama":
-        return {"ollama": {"format": _MEMORY_EXTRACTION_OLLAMA_FORMAT}}
+def _structured_json_provider_options(model_config: Any, schema: dict[str, Any]) -> dict[str, Any]:
+    provider = getattr(model_config, "provider", None)
+    if provider == "ollama":
+        return {"ollama": {"format": schema}}
+    if provider == "openai-compatible":
+        return {"openai-compatible": {"response_format": {"type": "json_schema", "json_schema": {"name": "structured_json", "schema": schema}}}}
     return {}
-
-
-_EXPLICIT_MEMORY_PATTERNS = [
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in [
-        r"\bremember\b",
-        r"\bdon't forget\b",
-        r"\bdo not forget\b",
-        r"\balways\b",
-        r"\bnever\b",
-        r"\bi prefer\b",
-        r"\bmy preference\b",
-        r"记住",
-        r"记一下",
-        r"帮我记",
-        r"别忘",
-        r"不要忘",
-        r"以后都",
-        r"以后不要",
-        r"我的偏好",
-        r"我偏好",
-        r"我喜欢",
-        r"我不喜欢",
-        r"我常用",
-    ]
-]
-
-
-def _has_explicit_memory_intent(text: str) -> bool:
-    normalized = text.strip()
-    if not normalized:
-        return False
-    return any(pattern.search(normalized) for pattern in _EXPLICIT_MEMORY_PATTERNS)
 
 
 def _estimate_memory_source_tokens(nodes: list[Node]) -> int:
@@ -3965,7 +4021,8 @@ def _memory_frontmatter_candidates(memory_root: Path) -> list[dict[str, Any]]:
     for path in sorted(memory_root.glob("*/*.md")):
         if path.parent.name not in {"user", "feedback", "reference"}:
             continue
-        metadata = _simple_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        metadata = _simple_frontmatter(text)
         candidates.append(
             {
                 "path": str(path),
@@ -3973,12 +4030,44 @@ def _memory_frontmatter_candidates(memory_root: Path) -> list[dict[str, Any]]:
                 "id": metadata.get("id") or path.stem,
                 "category": metadata.get("category") or path.parent.name,
                 "summary": metadata.get("summary") or path.stem,
+                "tags": _frontmatter_list(metadata.get("tags")),
+                "excerpt": _memory_candidate_excerpt(text),
             }
         )
     return candidates
 
 
-def _parse_selected_memory_paths(text: str) -> list[str]:
+def _memory_candidate_selector_line(item: dict[str, Any]) -> str:
+    tags = item.get("tags") or []
+    tag_text = f" tags={', '.join(str(tag) for tag in tags)}" if tags else ""
+    excerpt = str(item.get("excerpt") or "").replace("\n", " ").strip()
+    excerpt_text = f" excerpt={excerpt[:800]}" if excerpt else ""
+    return f"- {item['relative_path']} [{item.get('category')}] id={item.get('id')} summary={item.get('summary')}{tag_text}{excerpt_text}"
+
+
+def _memory_candidate_excerpt(text: str) -> str:
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            rest = text.find("\n", end + 4)
+            text = text[rest + 1 :] if rest != -1 else ""
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())[:1200]
+
+
+def _frontmatter_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            return [item.strip().strip('"').strip("'") for item in text[1:-1].split(",") if item.strip()]
+        return [text]
+    return []
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
     stripped = text.strip()
     if stripped.startswith("```"):
         lines = stripped.splitlines()
@@ -3990,11 +4079,8 @@ def _parse_selected_memory_paths(text: str) -> list[str]:
     try:
         payload = json.loads(stripped)
     except json.JSONDecodeError:
-        return []
-    values = payload.get("selected_paths") if isinstance(payload, dict) else payload
-    if not isinstance(values, list):
-        return []
-    return [str(item) for item in values]
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _simple_frontmatter(text: str) -> dict[str, Any]:
@@ -4004,9 +4090,24 @@ def _simple_frontmatter(text: str) -> dict[str, Any]:
     if end == -1:
         return {}
     metadata: dict[str, Any] = {}
+    current_key: str | None = None
     for line in text[4:end].splitlines():
+        stripped = line.strip()
+        if current_key and stripped.startswith("- "):
+            value = stripped[2:].strip().strip('"').strip("'")
+            current = metadata.setdefault(current_key, [])
+            if isinstance(current, list):
+                current.append(value)
+            continue
+        current_key = None
         if ":" not in line or line.startswith(" "):
             continue
         key, value = line.split(":", 1)
-        metadata[key.strip()] = value.strip().strip('"').strip("'")
+        key = key.strip()
+        value = value.strip()
+        if value:
+            metadata[key] = value.strip('"').strip("'")
+        else:
+            metadata[key] = []
+            current_key = key
     return metadata

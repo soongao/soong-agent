@@ -72,7 +72,7 @@ async def recall_memory(context: ToolExecutionContext, args: dict) -> dict:
         selection = await runtime.select_memory(session_id=context.session_id, query=query, top_k=top_k)
         selected_by_model = bool(selection.get("selected_by_model"))
         selected_paths = [str(item) for item in selection.get("selected_paths") or []]
-    if not selected_paths:
+    if not selected_paths and not selected_by_model:
         selected_paths = _fallback_selected_paths(memory_dir, query, top_k=top_k)
     matches: list[dict] = []
     budget = int(context.config.memory.memory_context_token_budget) * 4

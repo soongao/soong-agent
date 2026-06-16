@@ -9,7 +9,9 @@ from agent_core.config.models import ModelConfig, RetryConfig
 from agent_core.errors.codes import ErrorCode
 from agent_core.providers.base import ModelMessage, ModelRequest, ModelRole, SystemBlock
 from agent_core.providers.errors import classify_provider_exception, retry_delay_seconds
+from agent_core.providers.anthropic import build_anthropic_payload
 from agent_core.providers.ollama import OllamaProvider
+from agent_core.providers.openai_compatible import build_openai_chat_payload
 from agent_core.types.content import TextBlock, ToolCallBlock, ToolResultBlock
 from agent_core.types.tools import ToolDefinition
 
@@ -227,6 +229,48 @@ def test_provider_error_classification() -> None:
     assert classify_provider_exception(rate_limited).retry_after_ms == 2000
     assert classify_provider_exception(server_error).retryable
     assert retry_delay_seconds(attempt_index=2, retry=RetryConfig(initial_backoff_ms=10, max_backoff_ms=15)) == 0.015
+
+
+def test_openai_payload_includes_provider_neutral_tool_choice() -> None:
+    payload = build_openai_chat_payload(
+        ModelRequest(
+            model="gpt-test",
+            messages=[ModelMessage(role=ModelRole.USER, content=[TextBlock(text="return json")])],
+            tools=[
+                ToolDefinition(
+                    name="internal.structured_json",
+                    description="Return JSON",
+                    input_schema={"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]},
+                    permission="readonly",
+                )
+            ],
+            tool_choice={"type": "function", "function": {"name": "internal.structured_json"}},
+        )
+    )
+
+    assert payload["tool_choice"] == {"type": "function", "function": {"name": "internal__structured_json"}}
+    assert payload["tools"][0]["function"]["name"] == "internal__structured_json"
+
+
+def test_anthropic_payload_includes_provider_neutral_tool_choice() -> None:
+    payload = build_anthropic_payload(
+        ModelRequest(
+            model="claude-test",
+            messages=[ModelMessage(role=ModelRole.USER, content=[TextBlock(text="return json")])],
+            tools=[
+                ToolDefinition(
+                    name="internal.structured_json",
+                    description="Return JSON",
+                    input_schema={"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]},
+                    permission="readonly",
+                )
+            ],
+            tool_choice={"type": "tool", "name": "internal.structured_json"},
+        )
+    )
+
+    assert payload["tool_choice"] == {"type": "tool", "name": "internal__structured_json"}
+    assert payload["tools"][0]["name"] == "internal__structured_json"
 
 
 @pytest.mark.asyncio

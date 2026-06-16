@@ -73,7 +73,7 @@ async def test_ollama_gemma4_tool_call_list_dir(isolated_dirs, ollama_server) ->
 @pytest.mark.asyncio
 async def test_ollama_gemma4_memory_extraction_writes_user_memory(isolated_dirs, ollama_server) -> None:
     home, project = isolated_dirs
-    write_config(home, provider="ollama", base_url=ollama_server, model_name="gemma4")
+    write_config(home, provider="ollama", base_url=ollama_server, model_name="gemma4", memory_enabled=True)
     config_path = home / "config.toml"
     text = config_path.read_text(encoding="utf-8")
     text = text.replace("timeout_ms = 1000", "timeout_ms = 60000")

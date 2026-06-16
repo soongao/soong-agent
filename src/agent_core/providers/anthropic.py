@@ -166,6 +166,8 @@ def build_anthropic_payload(request: ModelRequest) -> dict[str, Any]:
             }
             for tool in request.tools
         ]
+    if request.tool_choice is not None:
+        payload["tool_choice"] = _anthropic_tool_choice(request.tool_choice)
     return {key: value for key, value in payload.items() if value is not None}
 
 
@@ -257,6 +259,15 @@ def _tool_result_text(block: Any) -> str:
     if text:
         return text
     return json.dumps(getattr(block, "metadata", {}) or {}, ensure_ascii=False)
+
+
+def _anthropic_tool_choice(tool_choice: str | dict[str, Any]) -> str | dict[str, Any]:
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    choice = dict(tool_choice)
+    if isinstance(choice.get("name"), str):
+        choice["name"] = to_provider_tool_name(choice["name"])
+    return choice
 
 
 def _failed(message: str) -> ModelEvent:

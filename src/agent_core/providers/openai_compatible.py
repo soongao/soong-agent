@@ -160,6 +160,8 @@ def build_openai_chat_payload(request: ModelRequest) -> dict[str, Any]:
             }
             for tool in request.tools
         ]
+    if request.tool_choice is not None:
+        payload["tool_choice"] = _openai_tool_choice(request.tool_choice)
     return payload
 
 
@@ -172,7 +174,7 @@ def _openai_provider_options(request: ModelRequest) -> tuple[dict[str, Any], str
     options = request.provider_options.get("openai-compatible") or {}
     if not isinstance(options, dict):
         return {}, "provider_options.openai-compatible must be an object"
-    allowed_keys = {"response_format", "seed", "parallel_tool_calls", "tool_choice"}
+    allowed_keys = {"response_format", "seed", "parallel_tool_calls"}
     unknown_keys = sorted(key for key in options if key not in allowed_keys)
     if unknown_keys:
         return {}, f"unsupported openai-compatible provider_options: {', '.join(unknown_keys)}"
@@ -251,6 +253,16 @@ def _openai_role(role: ModelRole) -> str:
     if role == ModelRole.TOOL:
         return "tool"
     return role.value
+
+
+def _openai_tool_choice(tool_choice: str | dict[str, Any]) -> str | dict[str, Any]:
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    choice = dict(tool_choice)
+    function = choice.get("function")
+    if isinstance(function, dict) and isinstance(function.get("name"), str):
+        choice["function"] = {**function, "name": to_provider_tool_name(function["name"])}
+    return choice
 
 
 def _failed(message: str) -> ModelEvent:

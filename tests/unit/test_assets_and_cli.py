@@ -26,6 +26,10 @@ def _chat_stdin(text: str) -> StringIO:
     return StringIO(text)
 
 
+def _memory_intent_response(explicit: bool = False) -> str:
+    return f'{{"explicit": {str(explicit).lower()}, "reason": "test"}}'
+
+
 def test_required_assets_exist() -> None:
     for package, names in {
         "agent_core.assets.templates": [
@@ -252,6 +256,188 @@ async def test_tui_permission_prompt_is_inline_and_waits(isolated_dirs) -> None:
         assert not list(app.query(InlinePermissionPrompt))
 
 
+def _tui_text(app) -> str:
+    return "\n".join(str(widget.render()) for widget in app.query(".message"))
+
+
+@pytest.mark.asyncio
+async def test_tui_slash_help_and_unknown_do_not_start_runtime(isolated_dirs) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
+
+    _home, project = isolated_dirs
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_tui_slash", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("/help")
+        await app._submit_prompt()
+        await pilot.pause()
+
+        text = _tui_text(app)
+        assert "slash commands" in text
+        assert "/new [session_id]" in text
+        assert app.runtime is None
+        assert prompt.text == ""
+
+        prompt.load_text("/missing")
+        await app._submit_prompt()
+        await pilot.pause()
+
+        text = _tui_text(app)
+        assert "unknown slash command: /missing" in text
+        assert app.runtime is None
+
+
+@pytest.mark.asyncio
+async def test_tui_slash_suggestions_filter_and_complete(isolated_dirs) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
+    from textual.widgets import Static
+
+    _home, project = isolated_dirs
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_tui_suggest", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+        suggestions = app.query_one("#slash-suggestions", Static)
+
+        prompt.load_text("/")
+        await pilot.pause()
+        assert suggestions.display is True
+        text = str(suggestions.render())
+        assert "/help" in text
+        assert "/session" in text
+
+        prompt.load_text("/se")
+        await pilot.pause()
+        text = str(suggestions.render())
+        assert "/session" in text
+        assert "/help" not in text
+
+        await pilot.press("tab")
+        await pilot.pause()
+        assert prompt.text == "/session"
+        assert "/session" in str(suggestions.render())
+
+        prompt.load_text("//help")
+        await pilot.pause()
+        assert suggestions.display is False
+
+
+@pytest.mark.asyncio
+async def test_tui_slash_new_session_history_and_autoscroll(isolated_dirs) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
+
+    _home, project = isolated_dirs
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_old", "orchestrator": True, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+        app._record_history("first prompt")
+        app._record_history("second prompt")
+
+        prompt.load_text("/history 1")
+        await app._submit_prompt()
+        await pilot.pause()
+        text = _tui_text(app)
+        assert "prompt history" in text
+        assert "second prompt" in text
+        assert "first prompt" not in text
+
+        prompt.load_text("/autoscroll")
+        await app._submit_prompt()
+        await pilot.pause()
+        assert app._auto_scroll is False
+        assert "autoscroll off" in _tui_text(app)
+
+        prompt.load_text("/new sess_next")
+        await app._submit_prompt()
+        await pilot.pause()
+        assert app.session_id == "sess_next"
+        assert app._turn_count == 0
+        assert app.runtime is None
+        assert "previous session: sess_old" in _tui_text(app)
+
+
+@pytest.mark.asyncio
+async def test_tui_slash_clear_and_status_commands(isolated_dirs) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
+
+    home, project = isolated_dirs
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_status", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+
+        prompt.load_text("/clear")
+        await app._submit_prompt()
+        await pilot.pause()
+        text = _tui_text(app)
+        assert "transcript cleared" in text
+        assert "TUI ready" not in text
+
+        prompt.load_text("/session")
+        await app._submit_prompt()
+        prompt.load_text("/config")
+        await app._submit_prompt()
+        prompt.load_text("/cancel")
+        await app._submit_prompt()
+        await pilot.pause()
+
+        text = _tui_text(app)
+        assert "session_id: sess_status" in text
+        assert f"project: {project}" in text
+        assert f"config: {home / 'config.toml'}" in text
+        assert "no active run to cancel" in text
+        assert app.runtime is None
+
+
+@pytest.mark.asyncio
+async def test_tui_double_slash_sends_literal_slash_to_runtime(isolated_dirs, monkeypatch, scripted_ollama: ScriptedOllama) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
+
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_text("literal slash ok")
+    scripted_ollama.enqueue_text(_memory_intent_response())
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_literal_slash", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+        prompt.load_text("//help is text")
+        await app._submit_prompt()
+        await pilot.pause()
+        assert app.runtime is not None
+        assert _tui_text(app).count("USER\n/help is text") == 1
+        await asyncio.wait_for(app.event_task, timeout=2)
+        assert scripted_ollama.requests[0]["messages"][-1]["content"] == "/help is text"
+
+
 def test_cli_bootstrap_creates_default_config(isolated_dirs) -> None:
     home, _project = isolated_dirs
 
@@ -298,8 +484,9 @@ async def test_cli_chat_exit_commands_return_zero(isolated_dirs, monkeypatch, ca
 @pytest.mark.asyncio
 async def test_cli_chat_uses_ollama_provider(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, base_url=scripted_ollama.base_url)
+    write_config(home, base_url=scripted_ollama.base_url, memory_enabled=True)
     scripted_ollama.enqueue_text("cli ok")
+    scripted_ollama.enqueue_text(_memory_intent_response())
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
     monkeypatch.setattr("sys.stdin", _chat_stdin("hello from cli\n/exit\n"))
@@ -309,16 +496,19 @@ async def test_cli_chat_uses_ollama_provider(isolated_dirs, monkeypatch, capsys,
     assert code == 0
     assert "cli ok" in captured.out
     assert captured.err == ""
-    assert len(scripted_ollama.requests) == 1
+    assert len(scripted_ollama.requests) == 2
     assert scripted_ollama.requests[0]["model"] == "gemma4"
+    assert scripted_ollama.requests[1]["format"]["required"] == ["explicit", "reason"]
 
 
 @pytest.mark.asyncio
 async def test_cli_chat_two_inputs_share_one_session(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, base_url=scripted_ollama.base_url)
+    write_config(home, base_url=scripted_ollama.base_url, memory_enabled=True)
     scripted_ollama.enqueue_text("first answer")
+    scripted_ollama.enqueue_text(_memory_intent_response())
     scripted_ollama.enqueue_text("second answer")
+    scripted_ollama.enqueue_text(_memory_intent_response())
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
     monkeypatch.setattr("sys.stdin", _chat_stdin("first question\nsecond question\n/exit\n"))
 
@@ -329,8 +519,8 @@ async def test_cli_chat_two_inputs_share_one_session(isolated_dirs, monkeypatch,
     assert "first answer" in captured.out
     assert "second answer" in captured.out
     assert captured.err == ""
-    assert len(scripted_ollama.requests) == 2
-    second_messages = scripted_ollama.requests[1]["messages"]
+    assert len(scripted_ollama.requests) == 4
+    second_messages = scripted_ollama.requests[2]["messages"]
     assert any(message["role"] == "user" and "first question" in message["content"] for message in second_messages)
     assert any(message["role"] == "assistant" and "first answer" in message["content"] for message in second_messages)
     with sqlite3.connect(home / "sessions.sqlite") as conn:
@@ -341,8 +531,9 @@ async def test_cli_chat_two_inputs_share_one_session(isolated_dirs, monkeypatch,
 @pytest.mark.asyncio
 async def test_cli_chat_fixed_session_id(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, base_url=scripted_ollama.base_url)
+    write_config(home, base_url=scripted_ollama.base_url, memory_enabled=True)
     scripted_ollama.enqueue_text("fixed answer")
+    scripted_ollama.enqueue_text(_memory_intent_response())
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
     monkeypatch.setattr("sys.stdin", _chat_stdin("hello fixed session\n/exit\n"))
 
@@ -363,8 +554,9 @@ async def test_cli_path_file_uses_parent_dir(isolated_dirs, monkeypatch, capsys,
     source = project / "src" / "a.py"
     source.parent.mkdir()
     source.write_text("print('x')\n", encoding="utf-8")
-    write_config(home, base_url=scripted_ollama.base_url)
+    write_config(home, base_url=scripted_ollama.base_url, memory_enabled=True)
     scripted_ollama.enqueue_text("file path ok")
+    scripted_ollama.enqueue_text(_memory_intent_response())
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
     monkeypatch.setattr("sys.stdin", _chat_stdin("hello from file path\n/exit\n"))
@@ -385,11 +577,12 @@ async def test_cli_path_file_uses_parent_dir(isolated_dirs, monkeypatch, capsys,
 @pytest.mark.asyncio
 async def test_cli_permission_allow_once_writes_file(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, base_url=scripted_ollama.base_url)
+    write_config(home, base_url=scripted_ollama.base_url, memory_enabled=True)
     scripted_ollama.enqueue_tool_calls(
         [ToolCall(tool_call_id="write", name="code.write_file", arguments={"path": "allowed.txt", "content": "ok"})]
     )
     scripted_ollama.enqueue_text("write done")
+    scripted_ollama.enqueue_text(_memory_intent_response())
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
     monkeypatch.setattr("sys.stdin", _chat_stdin("write a file\n1\n/exit\n"))
@@ -408,7 +601,7 @@ async def test_cli_permission_allow_for_session_reuses_scope(
     isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama
 ) -> None:
     home, project = isolated_dirs
-    write_config(home, base_url=scripted_ollama.base_url)
+    write_config(home, base_url=scripted_ollama.base_url, memory_enabled=True)
     scripted_ollama.enqueue_tool_calls(
         [ToolCall(tool_call_id="write_first", name="code.write_file", arguments={"path": "session.txt", "content": "one"})]
     )
@@ -422,6 +615,7 @@ async def test_cli_permission_allow_for_session_reuses_scope(
         ]
     )
     scripted_ollama.enqueue_text("session write done")
+    scripted_ollama.enqueue_text(_memory_intent_response())
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
     monkeypatch.setattr("sys.stdin", _chat_stdin("write the same file twice\n2\n/exit\n"))
@@ -438,11 +632,12 @@ async def test_cli_permission_allow_for_session_reuses_scope(
 @pytest.mark.asyncio
 async def test_cli_permission_deny_blocks_write(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, base_url=scripted_ollama.base_url)
+    write_config(home, base_url=scripted_ollama.base_url, memory_enabled=True)
     scripted_ollama.enqueue_tool_calls(
         [ToolCall(tool_call_id="write", name="code.write_file", arguments={"path": "denied.txt", "content": "no"})]
     )
     scripted_ollama.enqueue_text("write denied")
+    scripted_ollama.enqueue_text(_memory_intent_response())
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
     monkeypatch.setattr("sys.stdin", _chat_stdin("try writing a file\n3\n/exit\n"))
@@ -461,7 +656,7 @@ async def test_cli_permission_deny_stops_following_write_tool_calls(
     isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama
 ) -> None:
     home, project = isolated_dirs
-    write_config(home, base_url=scripted_ollama.base_url)
+    write_config(home, base_url=scripted_ollama.base_url, memory_enabled=True)
     scripted_ollama.enqueue_tool_calls(
         [
             ToolCall(tool_call_id="denied", name="code.write_file", arguments={"path": "denied.txt", "content": "no"}),
@@ -469,6 +664,7 @@ async def test_cli_permission_deny_stops_following_write_tool_calls(
         ]
     )
     scripted_ollama.enqueue_text("writes stopped")
+    scripted_ollama.enqueue_text(_memory_intent_response())
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
     monkeypatch.setattr("sys.stdin", _chat_stdin("try writing two files\n3\n/exit\n"))
@@ -487,7 +683,7 @@ async def test_cli_permission_deny_stops_following_write_tool_calls(
 @pytest.mark.asyncio
 async def test_cli_orchestrator_dispatches_worker_with_ollama(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
-    write_config(home, base_url=scripted_ollama.base_url, worker_pool=True)
+    write_config(home, base_url=scripted_ollama.base_url, worker_pool=True, memory_enabled=True)
     scripted_ollama.enqueue_tool_calls(
         [
             ToolCall(
@@ -526,6 +722,7 @@ async def test_cli_orchestrator_dispatches_worker_with_ollama(isolated_dirs, mon
     )
     scripted_ollama.enqueue_text("worker done")
     scripted_ollama.enqueue_text("orchestrator done")
+    scripted_ollama.enqueue_text(_memory_intent_response())
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
     monkeypatch.setattr("sys.stdin", _chat_stdin("orchestrate cli task\n1\n1\n1\n/exit\n"))
 
@@ -535,7 +732,7 @@ async def test_cli_orchestrator_dispatches_worker_with_ollama(isolated_dirs, mon
     assert code == 0
     assert "orchestrator done" in captured.out
     assert captured.err == ""
-    assert len(scripted_ollama.requests) == 6
+    assert len(scripted_ollama.requests) == 7
     wal_files = list((project / ".soong-agent" / "tasks").glob("*/cli_task.wal.jsonl"))
     assert len(wal_files) == 1
     wal_text = wal_files[0].read_text(encoding="utf-8")

@@ -32,6 +32,7 @@ def write_config(
     worker_pool: bool = False,
     disabled_tools: list[str] | None = None,
     tool_overrides: dict[str, dict] | None = None,
+    memory_enabled: bool | None = False,
 ) -> Path:
     path = home / "config.toml"
     path.write_text(
@@ -71,6 +72,7 @@ stdout_limit_bytes = 64
 stderr_limit_bytes = 64
 sensitive_paths = ["~/.ssh", "~/.gnupg", "~/.aws", "~/.config/gcloud", "*.pem", "*.key", ".env", ".env.*"]
 """.strip()
+        + _memory_toml(memory_enabled)
         + _tool_overrides_toml(tool_overrides or {})
         + (
             """
@@ -90,6 +92,12 @@ allowed_tools = ["agent.task_get", "agent.task_query_steps", "agent.task_claim_s
         encoding="utf-8",
     )
     return path
+
+
+def _memory_toml(enabled: bool | None) -> str:
+    if enabled is None:
+        return ""
+    return f"\n\n[memory]\nenabled = {str(enabled).lower()}"
 
 
 def _tool_overrides_toml(overrides: dict[str, dict]) -> str:
