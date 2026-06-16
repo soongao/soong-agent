@@ -24,10 +24,16 @@ mkdir -p ~/.soong-agent
 cp src/agent_core/assets/templates/config_default.toml ~/.soong-agent/config.toml
 ```
 
-Then run the interactive CLI:
+Then run the TUI chat:
 
 ```bash
 soong-agent chat --path .
+```
+
+For a plain stdin/stdout loop, use:
+
+```bash
+soong-agent chat --path . --plain
 ```
 
 The default config uses local Ollama at `http://127.0.0.1:11434` with model `gemma4`, so make sure Ollama is running and the model is available.

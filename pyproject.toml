@@ -13,6 +13,8 @@ dependencies = [
     "httpx>=0.27",
     "aiosqlite>=0.19",
     "PyYAML>=6.0",
+    "rich>=13",
+    "textual>=0.85",
 ]
 
 [project.optional-dependencies]

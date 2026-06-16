@@ -69,6 +69,30 @@ from agent_core.types.tools import error_tool_result
 
 PermissionCallback = Callable[[PermissionRequest], Awaitable[PermissionDecision]]
 RAW_DEBUG_METADATA_KEY = "raw_debug"
+_MEMORY_EXTRACTION_OLLAMA_FORMAT: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "memories": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "decision": {"type": "string", "enum": ["new"]},
+                    "category": {"type": "string", "enum": ["user", "feedback", "reference"]},
+                    "filename": {"type": "string", "pattern": r"^[a-z0-9][a-z0-9_-]*\.md$"},
+                    "summary": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "source_node_ids": {"type": "array", "items": {"type": "string"}},
+                    "content": {"type": "string"},
+                },
+                "required": ["decision", "category", "filename", "summary", "tags", "source_node_ids", "content"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["memories"],
+    "additionalProperties": False,
+}
 
 
 @dataclass(frozen=True)
@@ -2883,10 +2907,14 @@ class AgentRuntime:
                     source="memory_extraction",
                     content=(
                         "You are the Soong Agent memory extraction job. "
-                        "Decide whether new user-visible context should be written as long-term user memory. "
-                        "Return only JSON: {\"memories\":[{\"decision\":\"new\",\"category\":\"user|feedback|reference\","
-                        "\"filename\":\"safe-name.md\",\"summary\":\"...\",\"tags\":[\"...\"],"
-                        "\"source_node_ids\":[\"node_...\"],\"content\":\"markdown body\"}]}. "
+                        "Decide whether new user-visible context should be written as long-term memory. "
+                        "Return only one JSON object with a top-level memories array. "
+                        "For each memory, decision must be \"new\". "
+                        "Category must be exactly one of these strings: \"user\", \"feedback\", or \"reference\". "
+                        "Use category \"user\" for user profile, preferences, skills, and facts explicitly requested to remember. "
+                        "Do not output combined category strings such as \"user|reference\". "
+                        "Filename must be a local lowercase markdown filename ending in .md, for example backend_developer.md. "
+                        "source_node_ids must copy node IDs exactly from the source nodes. "
                         "Use an empty memories array when nothing should be stored. "
                         "Never store secrets, credentials, transient task state, plans, full transcripts, or command output."
                     ),
@@ -2912,6 +2940,7 @@ class AgentRuntime:
             tools=[],
             temperature=model_config.temperature,
             max_output_tokens=model_config.max_output_tokens,
+            provider_options=_memory_extraction_provider_options(model_config),
             metadata={"session_id": session_id, "purpose": "memory_extraction"},
         )
         provider = self._provider_for_model(model_config)
@@ -3807,6 +3836,12 @@ def _memory_extraction_trigger_reason(
     if _estimate_memory_source_tokens([node for _seq, node in sources]) >= token_threshold:
         return "token_backlog"
     return None
+
+
+def _memory_extraction_provider_options(model_config: Any) -> dict[str, Any]:
+    if getattr(model_config, "provider", None) == "ollama":
+        return {"ollama": {"format": _MEMORY_EXTRACTION_OLLAMA_FORMAT}}
+    return {}
 
 
 _EXPLICIT_MEMORY_PATTERNS = [

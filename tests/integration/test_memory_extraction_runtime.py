@@ -104,6 +104,14 @@ max_output_tokens = 256
     memory_requests = [request for request in scripted_ollama.requests if request.get("model") == "memory-model"]
     assert memory_requests
     assert memory_requests[-1].get("tools") is None
+    assert memory_requests[-1]["format"]["properties"]["memories"]["items"]["properties"]["category"]["enum"] == [
+        "user",
+        "feedback",
+        "reference",
+    ]
+    memory_system_prompt = memory_requests[-1]["messages"][0]["content"]
+    assert '"user|feedback|reference"' not in memory_system_prompt
+    assert '"user", "feedback", or "reference"' in memory_system_prompt
     memory_file = home / "memory" / "user" / "prefs.md"
     assert memory_file.exists()
     memory_text = memory_file.read_text(encoding="utf-8")
