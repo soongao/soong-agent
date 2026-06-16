@@ -506,7 +506,8 @@ async def test_empty_body_child_definition_uses_default_sub_agent_instructions(
     system_text = "\n".join(
         message.get("content", "") for message in scripted_ollama.requests[0]["messages"] if message.get("role") == "system"
     )
-    assert "Handle the delegated task and return a concise result." in system_text
+    assert "You are a bounded sub agent." in system_text
+    assert "Keep the final result concise" in system_text
     assert "Uses fallback body" not in system_text
 
 

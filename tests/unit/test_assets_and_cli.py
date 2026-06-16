@@ -64,6 +64,43 @@ def test_asset_loader_reads_contract_asset_ids() -> None:
         assert get_asset(asset_id).resource_path
 
 
+def test_prompt_assets_replace_placeholder_contract_text() -> None:
+    prompt_expectations = {
+        "system.core": ["soong-agent", "Build context from the repository", "Preserve unrelated user"],
+        "system.tool_protocol": ["code.read_file", "code.edit_file", "internal.load_skill", "agent.dispatch_worker"],
+        "system.permissions": ["allow_once", "allow_for_session", "Hook errors and timeouts"],
+        "system.multi_agent": ["agent.create_sub_agent", "agent.fork_agent", "Task DAG", "no_step_claimed"],
+        "system.compact": ["compaction node", "first_kept_node_id", "Task/worker status"],
+        "system.todo": ["not a tool", "Task DAG", "private scratchpad"],
+        "system.memory": ["internal.recall_memory", "memory_context", "Project memory is not supported"],
+    }
+    old_placeholders = [
+        "Follow the Agent Core runtime contract",
+        "Use only tools exposed in the current effective tool set.",
+        "Todo is internal scratchpad state and is not persisted as a Task DAG.",
+        "Write, dangerous, network, and sensitive read operations require permission.",
+        "Sub agents and workers must stay within their effective tool set and assigned scope.",
+        "Memory is recalled progressively and only through approved internal mechanisms.",
+        "Compaction summarizes context without changing source conversation nodes.",
+    ]
+
+    for asset_id, expected_fragments in prompt_expectations.items():
+        text = read_asset(asset_id)
+        for fragment in expected_fragments:
+            assert fragment in text
+        for placeholder in old_placeholders:
+            assert placeholder not in text
+
+
+def test_agent_and_template_assets_are_expanded_for_runtime_semantics() -> None:
+    assert "bounded sub agent" in read_asset("agent.default_sub_agent")
+    assert "code.search" in read_asset("agent.default_fork_agent")
+    assert "agent.task_claim_step" in read_asset("agent.default_worker_agent")
+    assert "internal-only compaction agent" in read_asset("agent.default_compact_agent")
+    assert "decision-complete Markdown plan" in read_asset("template.plan.default")
+    assert "depends_on_step_ids" in read_asset("template.task_dag.default")
+
+
 def test_wheel_build_config_includes_typed_marker_and_assets() -> None:
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     wheel = data["tool"]["hatch"]["build"]["targets"]["wheel"]

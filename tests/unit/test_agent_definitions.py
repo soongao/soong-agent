@@ -72,8 +72,11 @@ def test_builtin_definitions_loaded_from_assets_and_compact_internal_hidden() ->
     compact = definitions.get("default_compact_agent")
     assert compact is not None
     assert compact.metadata["asset_path"] == "agents/default_compact_agent.md"
-    assert "internal-only" in compact.body
+    assert "internal-only compaction agent" in compact.body
     assert "default_compact_agent" not in {definition.agent_definition_id for definition in definitions.list()}
+    worker = definitions.get("default_worker_agent")
+    assert worker is not None
+    assert "agent.task_claim_step" in worker.body
 
 
 def test_user_cannot_override_default_compact_agent(isolated_dirs) -> None:

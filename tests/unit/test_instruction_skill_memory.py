@@ -93,6 +93,11 @@ def test_static_system_blocks_load_package_assets(isolated_dirs) -> None:
     assert "system.tool_protocol" in by_id
     assert by_id["system.core"].source == "package_asset"
     assert by_id["system.core"].content.strip()
+    assert "soong-agent" in by_id["system.core"].content
+    assert by_id["system.core"].metadata["asset_id"] == "system.core"
+    assert by_id["system.core"].metadata["asset_path"] == "prompts/system/core.md"
+    assert "code.read_file" in by_id["system.tool_protocol"].content
+    assert by_id["system.tool_protocol"].metadata["asset_id"] == "system.tool_protocol"
     assert by_id["system.instruction_catalog"].source == "instruction_catalog"
 
 
