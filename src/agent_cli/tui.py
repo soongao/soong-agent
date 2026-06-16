@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from agent_core.api import AgentRuntime, RunHandle
+from agent_core.context.skills import build_skill_catalog
 from agent_core.config.paths import resolve_home_dir, resolve_project_dir
 from agent_core.errors import AgentCoreError
 from agent_core.storage import new_id
@@ -21,9 +23,25 @@ from textual.events import Key
 from textual.widgets import Button, Footer, Header, Markdown, Static, TextArea
 
 
+SLASH_SUGGESTION_VISIBLE_ROWS = 8
+
+
+@dataclass(frozen=True)
+class SlashSuggestion:
+    completion: str
+    usage: str
+    description: str
+
+
 class PromptTextArea(TextArea):
     async def _on_key(self, event: Key) -> None:
+        if event.key not in {"up", "down"}:
+            self.app._history_browsing = False  # type: ignore[attr-defined]
         if event.key == "enter":
+            if self.app._accept_slash_suggestion(require_change=True):  # type: ignore[attr-defined]
+                event.stop()
+                event.prevent_default()
+                return
             event.stop()
             event.prevent_default()
             await self.app._submit_prompt()  # type: ignore[attr-defined]
@@ -40,12 +58,16 @@ class PromptTextArea(TextArea):
         await super()._on_key(event)
 
     def action_cursor_up(self, select: bool = False) -> None:
+        if not select and self.app._move_slash_selection(-1):  # type: ignore[attr-defined]
+            return
         if not select and self.cursor_location[0] == 0:
             self.app._show_history(-1)  # type: ignore[attr-defined]
             return
         super().action_cursor_up(select)
 
     def action_cursor_down(self, select: bool = False) -> None:
+        if not select and self.app._move_slash_selection(1):  # type: ignore[attr-defined]
+            return
         last_row = max(len(self.text.splitlines() or [""]) - 1, 0)
         if not select and self.cursor_location[0] >= last_row:
             self.app._show_history(1)  # type: ignore[attr-defined]
@@ -173,7 +195,7 @@ class SoongAgentTui(App[int]):
 
     #slash-suggestions {
         height: auto;
-        max-height: 8;
+        max-height: 9;
         margin-top: 1;
         padding: 0 1;
         border: solid $accent;
@@ -201,6 +223,10 @@ class SoongAgentTui(App[int]):
         self._draft_message = ""
         self._auto_scroll = True
         self._run_count = 0
+        self._slash_suggestions: list[SlashSuggestion] = []
+        self._slash_selected_index = 0
+        self._slash_window_start = 0
+        self._history_browsing = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -235,9 +261,9 @@ class SoongAgentTui(App[int]):
         message = prompt.text.strip()
         if not message:
             return
-        escaped_slash = message.startswith("//")
-        user_message = message[1:] if escaped_slash else message
-        if not escaped_slash and user_message.startswith("/") and await self._handle_slash_command(user_message):
+        user_message = message
+        if user_message.startswith("/") and await self._handle_slash_command(user_message):
+            self._record_history(user_message)
             prompt.clear()
             self._hide_slash_suggestions()
             prompt.focus()
@@ -277,43 +303,132 @@ class SoongAgentTui(App[int]):
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id == "prompt":
+            if self._history_browsing:
+                self._hide_slash_suggestions()
+                return
             self._update_slash_suggestions(event.text_area.text)
 
     def _update_slash_suggestions(self, text: str) -> None:
         widget = self.query_one("#slash-suggestions", Static)
-        stripped = text.strip()
-        if not stripped.startswith("/") or stripped.startswith("//") or "\n" in stripped:
-            widget.display = False
-            widget.update("")
+        command_text = text.lstrip()
+        stripped = command_text.strip()
+        if not command_text.startswith("/") or "\n" in command_text:
+            self._hide_slash_suggestions()
             return
-        matches = _matching_slash_commands(stripped)
-        if not matches:
+        suggestions = self._build_slash_suggestions(command_text)
+        if not suggestions:
+            self._slash_suggestions = []
+            self._slash_selected_index = 0
             widget.display = True
-            widget.update(f"No slash command matches {stripped!r}. Use // to send text that starts with /.")
+            widget.update(f"No slash command matches {stripped!r}.")
             return
-        rows = ["Slash commands (Tab completes first match)"]
-        rows.extend(f"{usage:<18} {description}" for _name, usage, description in matches[:8])
-        widget.display = True
-        widget.update("\n".join(rows))
+        self._slash_suggestions = suggestions
+        self._slash_selected_index = 0
+        self._slash_window_start = 0
+        self._render_slash_suggestions()
 
     def _hide_slash_suggestions(self) -> None:
         widget = self.query_one("#slash-suggestions", Static)
         widget.display = False
         widget.update("")
+        self._slash_suggestions = []
+        self._slash_selected_index = 0
+        self._slash_window_start = 0
 
     def _complete_slash_command(self) -> bool:
+        return self._accept_slash_suggestion()
+
+    def _accept_slash_suggestion(self, *, require_change: bool = False) -> bool:
+        suggestion = self._selected_slash_suggestion()
+        if suggestion is None:
+            return False
         prompt = self.query_one("#prompt", PromptTextArea)
-        stripped = prompt.text.strip()
-        if not stripped.startswith("/") or stripped.startswith("//") or " " in stripped or "\n" in stripped:
+        completion = suggestion.completion
+        if require_change and prompt.text.lstrip() == completion:
             return False
-        matches = _matching_slash_commands(stripped)
-        if not matches:
-            return False
-        completion = f"/{matches[0][0]}"
         prompt.load_text(completion)
         prompt.move_cursor((0, len(completion)))
         self._update_slash_suggestions(completion)
         return True
+
+    def _move_slash_selection(self, direction: int) -> bool:
+        if self._history_browsing:
+            return False
+        if not self._slash_suggestions or not self.query_one("#slash-suggestions", Static).display:
+            return False
+        self._slash_selected_index = (self._slash_selected_index + direction) % len(self._slash_suggestions)
+        self._sync_slash_window()
+        self._render_slash_suggestions()
+        return True
+
+    def _build_slash_suggestions(self, text: str) -> list[SlashSuggestion]:
+        if " " in text.strip():
+            return []
+        command_matches = [
+            SlashSuggestion(completion=f"/{name}", usage=usage, description=description)
+            for name, usage, description in _matching_slash_commands(text.strip())
+        ]
+        return command_matches + self._matching_skill_suggestions(text)
+
+    def _matching_skill_suggestions(self, text: str) -> list[SlashSuggestion]:
+        if not text.startswith("/") or " " in text.strip():
+            return []
+        prefix = text[1:].strip().lower()
+        skills = self._cached_skills_for_suggestions()
+        matches = [skill for skill in skills if skill.get("name", "").lower().startswith(prefix)]
+        command_names = {name for name, _usage, _description in SLASH_COMMANDS}
+        return [
+            SlashSuggestion(
+                completion=f"/{skill['name']}",
+                usage=f"/{skill['name']}",
+                description=skill.get("description") or "load skill",
+            )
+            for skill in matches
+            if skill["name"] not in command_names
+        ]
+
+    def _selected_slash_suggestion(self) -> SlashSuggestion | None:
+        if not self._slash_suggestions:
+            return None
+        index = min(self._slash_selected_index, len(self._slash_suggestions) - 1)
+        return self._slash_suggestions[index]
+
+    def _render_slash_suggestions(self) -> None:
+        widget = self.query_one("#slash-suggestions", Static)
+        if not self._slash_suggestions:
+            widget.display = False
+            widget.update("")
+            return
+        self._sync_slash_window()
+        visible = self._visible_slash_suggestions()
+        rows = ["Slash commands (Up/Down selects, Enter/Tab accepts)"]
+        for index, suggestion in visible:
+            marker = ">" if index == self._slash_selected_index else " "
+            rows.append(f"{marker} {suggestion.usage:<18} {suggestion.description}")
+        widget.display = True
+        widget.update("\n".join(rows))
+
+    def _visible_slash_suggestions(self) -> list[tuple[int, SlashSuggestion]]:
+        end = self._slash_window_start + SLASH_SUGGESTION_VISIBLE_ROWS
+        return list(enumerate(self._slash_suggestions))[self._slash_window_start : end]
+
+    def _sync_slash_window(self) -> None:
+        if not self._slash_suggestions:
+            self._slash_window_start = 0
+            return
+        max_start = max(len(self._slash_suggestions) - SLASH_SUGGESTION_VISIBLE_ROWS, 0)
+        if self._slash_selected_index < self._slash_window_start:
+            self._slash_window_start = self._slash_selected_index
+        elif self._slash_selected_index >= self._slash_window_start + SLASH_SUGGESTION_VISIBLE_ROWS:
+            self._slash_window_start = self._slash_selected_index - SLASH_SUGGESTION_VISIBLE_ROWS + 1
+        self._slash_window_start = min(max(self._slash_window_start, 0), max_start)
+
+    def _cached_skills_for_suggestions(self) -> list[dict[str, str]]:
+        if self.runtime is not None and self.runtime.paths is not None:
+            home_dir = self.runtime.paths.home_dir
+        else:
+            home_dir = resolve_home_dir()
+        return build_skill_catalog(home_dir)
 
     async def _handle_slash_command(self, message: str) -> bool:
         command, argument = _parse_slash_command(message)
@@ -342,6 +457,9 @@ class SoongAgentTui(App[int]):
         if command == "config":
             await self._write_message("system", self._config_info_text())
             return True
+        if command == "skills":
+            await self._show_skills()
+            return True
         if command == "history":
             await self._write_message("system", self._history_text(argument))
             return True
@@ -351,6 +469,8 @@ class SoongAgentTui(App[int]):
             return True
         if command == "cancel":
             await self._cancel_active_run()
+            return True
+        if not argument and self._skill_name_exists(command) and await self._load_skill_command(command):
             return True
         await self._write_message("warning", f"unknown slash command: /{command}. Use /help for commands.")
         return True
@@ -413,6 +533,41 @@ class SoongAgentTui(App[int]):
                 f"exists: {'yes' if config_path.exists() else 'no'}",
             ]
         )
+
+    async def _show_skills(self) -> None:
+        await self._ensure_runtime()
+        assert self.runtime is not None
+        skills = await self.runtime.list_skills()
+        if not skills:
+            await self._write_message("system", "no skills found")
+            return
+        rows = ["available skills"]
+        rows.extend(f"{skill.name} - {skill.description or skill.path}" for skill in skills)
+        await self._write_message("system", "\n".join(rows))
+
+    async def _load_skill_command(self, name: str) -> bool:
+        if self._has_active_run():
+            await self._write_message("warning", "cannot load a skill while a run is active; use /cancel first")
+            return True
+        name = name.strip()
+        if not name:
+            return False
+        await self._ensure_runtime()
+        assert self.runtime is not None
+        result = await self.runtime.load_skill(self.session_id, name, mode=self.mode)
+        if result.error is not None:
+            if str(result.error.code) == "skill_not_found":
+                return False
+            await self._write_message("error", result.error.message)
+            return True
+        if result.already_loaded:
+            await self._write_message("system", f"skill already loaded: {result.name}")
+            return True
+        await self._write_message("system", f"skill loaded: {result.name}")
+        return True
+
+    def _skill_name_exists(self, name: str) -> bool:
+        return any(skill.get("name") == name for skill in self._cached_skills_for_suggestions())
 
     def _history_text(self, argument: str = "") -> str:
         limit = _parse_positive_int(argument.strip()) or 10
@@ -527,6 +682,7 @@ class SoongAgentTui(App[int]):
             self._history.append(message)
         self._history_index = None
         self._draft_message = ""
+        self._history_browsing = False
 
     def _show_history(self, direction: int) -> None:
         if not self._history:
@@ -543,10 +699,14 @@ class SoongAgentTui(App[int]):
             else:
                 self._history_index += 1
         text = self._draft_message if self._history_index is None else self._history[self._history_index]
+        self._history_browsing = self._history_index is not None
         prompt.load_text(text)
         lines = text.splitlines() or [""]
         prompt.move_cursor((len(lines) - 1, len(lines[-1])))
-        self._update_slash_suggestions(text)
+        if self._history_browsing:
+            self._hide_slash_suggestions()
+        else:
+            self._update_slash_suggestions(text)
 
     def _set_status(self, state: str) -> None:
         self.query_one("#status", Static).update(self._status_text(state))
@@ -593,6 +753,7 @@ SLASH_COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("new", "/new [session_id]", "start a fresh session"),
     ("session", "/session", "show current session details"),
     ("config", "/config", "show config and home paths"),
+    ("skills", "/skills", "list available skills"),
     ("history", "/history [n]", "show recent prompts"),
     ("autoscroll", "/autoscroll", "toggle transcript autoscroll"),
     ("cancel", "/cancel", "cancel the active run"),
@@ -610,7 +771,6 @@ def _matching_slash_commands(text: str) -> list[tuple[str, str, str]]:
 def _slash_help_text() -> str:
     rows = ["slash commands"]
     rows.extend(f"{usage} - {description}" for _name, usage, description in SLASH_COMMANDS)
-    rows.append("//text - send a message that starts with /")
     return "\n".join(rows)
 
 

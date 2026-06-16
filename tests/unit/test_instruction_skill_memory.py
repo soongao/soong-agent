@@ -106,11 +106,17 @@ def test_skill_catalog_frontmatter_only(isolated_dirs) -> None:
     skills = home / "skills"
     skills.mkdir()
     (skills / "review.md").write_text("---\nname: review\ndescription: Review code\n---\nsecret body\n", encoding="utf-8")
+    nested = skills / "planner"
+    nested.mkdir()
+    (nested / "SKILL.md").write_text("---\nname: planner\ndescription: Plan work\n---\nplanner secret\n", encoding="utf-8")
     blocks = build_static_system_blocks(home_dir=home, project_dir=project)
     catalog = next(block for block in blocks if block.source == "skill_catalog")
     assert "review" in catalog.content
     assert "Review code" in catalog.content
+    assert "planner" in catalog.content
+    assert "Plan work" in catalog.content
     assert "secret body" not in catalog.content
+    assert "planner secret" not in catalog.content
 
 
 def test_memory_catalog_is_dynamic_system_block(isolated_dirs) -> None:
@@ -235,6 +241,21 @@ async def test_load_skill_uses_frontmatter_name_not_filename(isolated_dirs) -> N
     result = await registry.execute(ToolCall(tool_call_id="s1", name="internal.load_skill", arguments={"name": "review"}), context)
     assert not result.is_error
     assert result.content[0].data["path"].endswith("code-review.md")  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_load_skill_supports_directory_skill_md(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    skill_dir = home / "skills" / "planner"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: planner\ndescription: Plan work\n---\nPlanner body\n", encoding="utf-8")
+    registry = ToolRegistry()
+    register_internal_tools(registry)
+    context = await make_context(home, project, RuntimeContextState())
+    result = await registry.execute(ToolCall(tool_call_id="s1", name="internal.load_skill", arguments={"name": "planner"}), context)
+    assert not result.is_error
+    assert result.content[0].data["path"].endswith("skills/planner/SKILL.md")  # type: ignore[union-attr]
+    assert result.content[0].data["content"].startswith('<skill name="planner">')  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio

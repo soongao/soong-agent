@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from agent_core.context.skills import find_skill_by_name
+from agent_core.context.skills import find_skill_by_name, read_skill_body, skill_context_text
 from agent_core.errors import AgentCoreError
 from agent_core.errors.codes import ErrorCode
 from agent_core.memory.writer import resolve_memory_dir
@@ -43,8 +43,8 @@ async def load_skill(context: ToolExecutionContext, args: dict) -> dict:
     if entry.get("error") == "duplicate":
         raise AgentCoreError(ErrorCode.SKILL_LOAD_FAILED, f"duplicate skill name: {name}")
     path = Path(entry["path"]).resolve()
-    body = _body_without_frontmatter(path.read_text(encoding="utf-8"))
-    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    body = read_skill_body(path)
+    digest = _skill_digest(body)
     already_loaded = False
     if context.services and "context_state" in context.services:
         already_loaded = context.services["context_state"].mark_skill(name, path, body)
@@ -54,7 +54,7 @@ async def load_skill(context: ToolExecutionContext, args: dict) -> dict:
         "path": str(path),
         "hash": digest,
         "body": body,
-        "content": _skill_context_text(name=name, body=body),
+        "content": skill_context_text(name=name, body=body),
         "already_loaded": already_loaded,
     }
 
@@ -137,17 +137,8 @@ async def recall_memory(context: ToolExecutionContext, args: dict) -> dict:
     }
 
 
-def _body_without_frontmatter(text: str) -> str:
-    if not text.startswith("---\n"):
-        return text
-    end = text.find("\n---", 4)
-    if end == -1:
-        return text
-    return text[end + 4 :].lstrip("\n")
-
-
-def _skill_context_text(*, name: str, body: str) -> str:
-    return f'<skill name="{name}">\n{body}\n</skill>'
+def _skill_digest(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def _memory_context_text(*, query: str, matches: list[dict]) -> str:

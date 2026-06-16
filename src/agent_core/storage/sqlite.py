@@ -366,6 +366,7 @@ class SQLiteStore:
         return [(int(row["node_seq"]), _node_from_row(row)) for row in rows]
 
     async def has_active_runs(self, session_id: str) -> bool:
+        session_id = sanitize_session_id(session_id)
         async with self._lock:
             row = self._conn.execute(
                 "SELECT 1 FROM runs WHERE session_id=? AND status IN ('queued','pending','running') LIMIT 1",

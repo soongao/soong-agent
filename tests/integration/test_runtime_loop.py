@@ -418,9 +418,9 @@ async def test_plan_template_then_write_plan_file_uses_write_permission(
 async def test_load_skill_tool_persists_synthetic_context_node(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
     _write_ollama_config(home, scripted_ollama)
-    skills = home / "skills"
-    skills.mkdir()
-    (skills / "review.md").write_text("---\nname: review\ndescription: Review code\n---\nSkill body\n", encoding="utf-8")
+    skill_dir = home / "skills" / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: review\ndescription: Review code\n---\nSkill body\n", encoding="utf-8")
     scripted_ollama.enqueue_tool_calls(
         [ToolCall(tool_call_id="call_skill", name="internal.load_skill", arguments={"name": "review"})]
     )
@@ -438,6 +438,37 @@ async def test_load_skill_tool_persists_synthetic_context_node(isolated_dirs, sc
     assert context_nodes[0].metadata["source"] == "internal.load_skill"
     assert context_nodes[0].metadata["name"] == "review"
     text = "\n".join(_payload_texts(scripted_ollama.requests[1]))
+    assert '<skill name="review">' in text
+    assert "Skill body" in text
+
+
+@pytest.mark.asyncio
+async def test_runtime_explicit_load_skill_persists_session_context(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    skills = home / "skills"
+    skills.mkdir()
+    (skills / "review.md").write_text("---\nname: review\ndescription: Review code\n---\nSkill body\n", encoding="utf-8")
+    scripted_ollama.enqueue_text("used skill")
+    async with _runtime(project, scripted_ollama) as runtime:
+        catalog = await runtime.list_skills()
+        result = await runtime.load_skill("sess_explicit_skill", "review")
+        repeated = await runtime.load_skill("sess_explicit_skill", "review")
+        handle = await runtime.start("now use it", session_id="sess_explicit_skill")
+        _events = [event async for event in handle.events()]
+        replay = await runtime.replay_session("sess_explicit_skill")
+
+    assert [skill.name for skill in catalog] == ["review"]
+    assert result.loaded is True
+    assert result.already_loaded is False
+    assert result.node_id
+    assert repeated.loaded is True
+    assert repeated.already_loaded is True
+    context_nodes = [node for node in replay.nodes if node.node_type == "skill_context"]
+    assert len(context_nodes) == 1
+    assert context_nodes[0].metadata["source"] == "runtime.load_skill"
+    assert context_nodes[0].metadata["name"] == "review"
+    text = "\n".join(_payload_texts(scripted_ollama.requests[0]))
     assert '<skill name="review">' in text
     assert "Skill body" in text
 

@@ -299,7 +299,18 @@ async def test_tui_slash_suggestions_filter_and_complete(isolated_dirs) -> None:
     from agent_cli.tui import PromptTextArea, SoongAgentTui
     from textual.widgets import Static
 
-    _home, project = isolated_dirs
+    home, project = isolated_dirs
+    skills = home / "skills"
+    skills.mkdir()
+    (skills / "review.md").write_text("---\nname: review\ndescription: Review code\n---\nSkill body\n", encoding="utf-8")
+    nested_skill = skills / "planner"
+    nested_skill.mkdir()
+    (nested_skill / "SKILL.md").write_text("---\nname: planner\ndescription: Plan work\n---\nPlanner body\n", encoding="utf-8")
+    for index in range(10):
+        (skills / f"zeta-{index}.md").write_text(
+            f"---\nname: zeta-{index}\ndescription: Skill {index}\n---\nSkill body\n",
+            encoding="utf-8",
+        )
     args = type(
         "Args",
         (),
@@ -317,6 +328,23 @@ async def test_tui_slash_suggestions_filter_and_complete(isolated_dirs) -> None:
         assert "/help" in text
         assert "/session" in text
 
+        prompt.load_text("/z")
+        await pilot.pause()
+        first_page = str(suggestions.render())
+        assert "/zeta-0" in first_page
+        assert "/zeta-9" not in first_page
+        for _ in range(8):
+            await pilot.press("down")
+        await pilot.pause()
+        second_page = str(suggestions.render())
+        assert "/zeta-0" not in second_page
+        assert "/zeta-8" in second_page
+        await pilot.press("down")
+        await pilot.pause()
+        last_page = str(suggestions.render())
+        assert "/zeta-0" not in last_page
+        assert "/zeta-9" in last_page
+
         prompt.load_text("/se")
         await pilot.pause()
         text = str(suggestions.render())
@@ -328,7 +356,45 @@ async def test_tui_slash_suggestions_filter_and_complete(isolated_dirs) -> None:
         assert prompt.text == "/session"
         assert "/session" in str(suggestions.render())
 
-        prompt.load_text("//help")
+        prompt.load_text("/r")
+        await pilot.pause()
+        suggestion_text = str(suggestions.render())
+        assert "/review" in suggestion_text
+        assert "/planner" not in suggestion_text
+        assert "> /review" in suggestion_text
+
+        prompt.load_text("/re")
+        await pilot.press("tab")
+        await pilot.pause()
+        assert prompt.text == "/review"
+
+        prompt.load_text("/p")
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        selection_text = str(suggestions.render())
+        assert "> /planner" in selection_text
+        assert prompt.text == "/p"
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert prompt.text == "/planner"
+
+        prompt.load_text("/help")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "slash commands" in _tui_text(app)
+        assert prompt.text == ""
+
+        app._record_history("history prompt")
+        prompt.load_text("/p")
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        assert prompt.text == "/p"
+        assert "> /planner" in str(suggestions.render())
+
+        prompt.load_text("plain text")
         await pilot.pause()
         assert suggestions.display is False
 
@@ -363,12 +429,21 @@ async def test_tui_slash_new_session_history_and_autoscroll(isolated_dirs) -> No
         await pilot.pause()
         assert app._auto_scroll is False
         assert "autoscroll off" in _tui_text(app)
+        assert app._history[-2:] == ["/history 1", "/autoscroll"]
+
+        prompt.load_text("")
+        await pilot.press("up")
+        await pilot.pause()
+        assert prompt.text == "/autoscroll"
+        await pilot.press("up")
+        await pilot.pause()
+        assert prompt.text == "/history 1"
 
         prompt.load_text("/new sess_next")
         await app._submit_prompt()
         await pilot.pause()
         assert app.session_id == "sess_next"
-        assert app._turn_count == 0
+        assert app._run_count == 0
         assert app.runtime is None
         assert "previous session: sess_old" in _tui_text(app)
 
@@ -412,15 +487,57 @@ async def test_tui_slash_clear_and_status_commands(isolated_dirs) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tui_double_slash_sends_literal_slash_to_runtime(isolated_dirs, monkeypatch, scripted_ollama: ScriptedOllama) -> None:
+async def test_tui_slash_skills_and_skill_load_session_context(
+    isolated_dirs, monkeypatch, scripted_ollama: ScriptedOllama
+) -> None:
     pytest.importorskip("textual")
     from agent_cli.tui import PromptTextArea, SoongAgentTui
 
     home, project = isolated_dirs
     write_config(home, base_url=scripted_ollama.base_url)
-    scripted_ollama.enqueue_text("literal slash ok")
+    skills = home / "skills"
+    skills.mkdir()
+    (skills / "review.md").write_text("---\nname: review\ndescription: Review code\n---\nSkill body\n", encoding="utf-8")
+    scripted_ollama.enqueue_text("review skill used")
     scripted_ollama.enqueue_text(_memory_intent_response())
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_tui_skill", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+
+        prompt.load_text("/skills")
+        await app._submit_prompt()
+        prompt.load_text("/review")
+        await app._submit_prompt()
+        await pilot.pause()
+
+        text = _tui_text(app)
+        assert "available skills" in text
+        assert "review - Review code" in text
+        assert "skill loaded: review" in text
+        assert app.runtime is not None
+
+        prompt.load_text("use loaded skill")
+        await app._submit_prompt()
+        await pilot.pause()
+        await asyncio.wait_for(app.event_task, timeout=2)
+
+    request_text = "\n".join(str(message.get("content") or "") for message in scripted_ollama.requests[0].get("messages", []))
+    assert '<skill name="review">' in request_text
+    assert "Skill body" in request_text
+
+
+@pytest.mark.asyncio
+async def test_tui_double_slash_is_unknown_command(isolated_dirs) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
+
+    _home, project = isolated_dirs
     args = type(
         "Args",
         (),
@@ -432,10 +549,8 @@ async def test_tui_double_slash_sends_literal_slash_to_runtime(isolated_dirs, mo
         prompt.load_text("//help is text")
         await app._submit_prompt()
         await pilot.pause()
-        assert app.runtime is not None
-        assert _tui_text(app).count("USER\n/help is text") == 1
-        await asyncio.wait_for(app.event_task, timeout=2)
-        assert scripted_ollama.requests[0]["messages"][-1]["content"] == "/help is text"
+        assert app.runtime is None
+        assert "unknown slash command: /" in _tui_text(app)
 
 
 def test_cli_bootstrap_creates_default_config(isolated_dirs) -> None:

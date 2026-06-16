@@ -106,3 +106,20 @@ class SwitchNodeResult(StrictModel):
     node_id: str
     switched: bool
     error: ErrorPayload | None = None
+
+
+class SkillInfo(StrictModel):
+    name: str
+    description: str = ""
+    path: str
+
+
+class LoadSkillResult(StrictModel):
+    session_id: str
+    name: str
+    path: str | None = None
+    hash: str | None = None
+    node_id: str | None = None
+    loaded: bool
+    already_loaded: bool = False
+    error: ErrorPayload | None = None
