@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 from agent_core.agents.registry import AgentDefinitionRegistry
@@ -123,6 +124,7 @@ class AgentRuntime:
         self._child_managers: dict[str, ChildAgentManager] = {}
         self._child_run_streams: dict[str, EventStream] = {}
         self._session_child_counts: dict[str, int] = defaultdict(int)
+        self._memory_idle_tasks: dict[str, asyncio.Task[None]] = {}
         from agent_core.permissions import PermissionSessionCache
 
         self._permission_caches: dict[str, PermissionSessionCache] = defaultdict(PermissionSessionCache)
@@ -141,6 +143,11 @@ class AgentRuntime:
         if self._closed:
             return
         self._closed = True
+        for task in list(self._memory_idle_tasks.values()):
+            task.cancel()
+        if self._memory_idle_tasks:
+            await asyncio.gather(*self._memory_idle_tasks.values(), return_exceptions=True)
+            self._memory_idle_tasks.clear()
         if self._provider is not None:
             await self._provider.close()
         for provider in list(self._provider_cache.values()):
@@ -290,7 +297,7 @@ class AgentRuntime:
         timeout_seconds = _child_timeout_seconds(self.config, timeout_ms)
         try:
             async with asyncio.timeout(timeout_seconds):
-                for _turn in range(8):
+                for _turn in range(self.config.runtime.max_turns):
                     system_blocks = build_system_blocks(
                         home_dir=self.paths.home_dir,
                         project_dir=self.paths.project_dir,
@@ -737,7 +744,7 @@ class AgentRuntime:
         try:
             model_config = resolve_model_config(self.config, definition.model_profile)
             async with asyncio.timeout(_child_timeout_seconds(self.config, timeout_ms)):
-                for _turn in range(8):
+                for _turn in range(self.config.runtime.max_turns):
                     system_blocks = build_system_blocks(
                         home_dir=self.paths.home_dir,
                         project_dir=self.paths.project_dir,
@@ -1823,6 +1830,7 @@ class AgentRuntime:
 
     async def _run(self, handle: RunHandle, message: str | UserMessage) -> None:
         assert self.store and self.paths and self.config and self._provider and self.artifacts
+        self._cancel_memory_idle_task(handle.session_id)
         handle.status = RunStatus.RUNNING
         await self.store.update_run(run_id=handle.run_id, status=RunStatus.RUNNING.value)
         await self._emit(handle, "loop_started")
@@ -1867,7 +1875,7 @@ class AgentRuntime:
         model_parent_node_id: str | None = None
         empty_tool_result_retries = 0
         try:
-            for _turn in range(8):
+            for _turn in range(self.config.runtime.max_turns):
                 partial_text_parts = []
                 system_blocks = build_system_blocks(
                     home_dir=self.paths.home_dir,
@@ -2090,7 +2098,7 @@ class AgentRuntime:
                     )
                     await self._emit(handle, "run_completed", node_id=end_node_id)
                     await self._emit(handle, "loop_completed", node_id=end_node_id)
-                    await self._maybe_run_memory_extraction(handle)
+                    await self._maybe_run_memory_extraction(handle, prompt_text=prompt_text)
                     await self._maybe_start_background_compact(handle)
                     return
                 tool_results = await self._execute_tool_calls(handle, completed.tool_calls)
@@ -2709,7 +2717,7 @@ class AgentRuntime:
         )
         return {"messages": recovered_messages, "context_bundle": context_bundle, "end_node_id": result["compaction_node_id"]}
 
-    async def _maybe_run_memory_extraction(self, handle: RunHandle) -> None:
+    async def _maybe_run_memory_extraction(self, handle: RunHandle, *, prompt_text: str) -> None:
         assert self.config and self.paths and self.store
         if not self.config.memory.enabled:
             return
@@ -2718,15 +2726,34 @@ class AgentRuntime:
         sources = await self.store.memory_source_nodes_since(handle.session_id, cursor_seq)
         if not sources:
             return
-        if len(sources) < max(1, self.config.memory.extract_every_messages):
+        reason = _memory_extraction_trigger_reason(
+            sources=sources,
+            latest_user_text=prompt_text,
+            max_pending_messages=max(1, self.config.memory.extract_every_messages),
+            token_threshold=max(1, self.config.memory.extract_every_tokens),
+        )
+        if reason is None:
+            self._schedule_memory_idle_extraction(session_id=handle.session_id)
             return
+        await self._run_memory_extraction_for_sources(session_id=handle.session_id, cursor_seq=cursor_seq, sources=sources, reason=reason)
+
+    async def _run_memory_extraction_for_sources(
+        self,
+        *,
+        session_id: str,
+        cursor_seq: int,
+        sources: list[tuple[int, Node]],
+        reason: str,
+    ) -> None:
+        assert self.config and self.paths and self.store
         source_node_ids = [node.node_id for _seq, node in sources]
         max_seq = max(seq for seq, _node in sources)
         await self.store.add_event(
             make_event(
-                session_id=handle.session_id,
+                session_id=session_id,
                 event_type="memory_extraction_started",
                 payload={
+                    "reason": reason,
                     "from_node_seq": cursor_seq + 1,
                     "to_node_seq": max_seq,
                     "source_node_ids": source_node_ids,
@@ -2736,7 +2763,7 @@ class AgentRuntime:
         try:
             model_config = resolve_model_config(self.config, self.config.memory.extract_model_profile)
             text = await self._run_memory_extraction_model(
-                session_id=handle.session_id,
+                session_id=session_id,
                 model_config=model_config,
                 source_nodes=[node for _seq, node in sources],
             )
@@ -2763,18 +2790,19 @@ class AgentRuntime:
                     project_dir=self.paths.project_dir,
                 ),
                 cursor=MemoryScanCursor(node_seq=cursor_seq),
-                source_session_id=handle.session_id,
+                source_session_id=session_id,
             )
             result = job.apply(candidates, source_node_seq=max_seq)
             await self.store.update_session_metadata(
-                handle.session_id,
+                session_id,
                 {"memory_scan_node_seq": result.scan_cursor.node_seq},
             )
             await self.store.add_event(
                 make_event(
-                    session_id=handle.session_id,
+                    session_id=session_id,
                     event_type="memory_extraction_completed",
                     payload={
+                        "reason": reason,
                         "created_memory_ids": result.created,
                         "updated_memory_ids": result.updated,
                         "ignored_candidates": result.ignored,
@@ -2791,10 +2819,11 @@ class AgentRuntime:
             message = getattr(exc, "message", str(exc))
             await self.store.add_event(
                 make_event(
-                    session_id=handle.session_id,
+                    session_id=session_id,
                     event_type="memory_extraction_failed",
                     level="error",
                     payload={
+                        "reason": reason,
                         "code": str(code),
                         "message": redact_value(message[:500]),
                         "from_node_seq": cursor_seq + 1,
@@ -2803,6 +2832,38 @@ class AgentRuntime:
                     },
                 )
             )
+
+    def _schedule_memory_idle_extraction(self, *, session_id: str) -> None:
+        assert self.config
+        self._cancel_memory_idle_task(session_id)
+        idle_seconds = max(float(self.config.memory.idle_seconds), 0.0)
+        self._memory_idle_tasks[session_id] = asyncio.create_task(self._memory_idle_extraction_after_delay(session_id, idle_seconds))
+
+    def _cancel_memory_idle_task(self, session_id: str) -> None:
+        task = self._memory_idle_tasks.pop(session_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _memory_idle_extraction_after_delay(self, session_id: str, idle_seconds: float) -> None:
+        try:
+            await asyncio.sleep(idle_seconds)
+            assert self.config and self.store
+            metadata = await self.store.session_metadata(session_id)
+            cursor_seq = int(metadata.get("memory_scan_node_seq") or 0)
+            sources = await self.store.memory_source_nodes_since(session_id, cursor_seq)
+            if sources:
+                await self._run_memory_extraction_for_sources(
+                    session_id=session_id,
+                    cursor_seq=cursor_seq,
+                    sources=sources,
+                    reason="idle",
+                )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            current = self._memory_idle_tasks.get(session_id)
+            if current is asyncio.current_task():
+                self._memory_idle_tasks.pop(session_id, None)
 
     async def _run_memory_extraction_model(self, *, session_id: str, model_config: Any, source_nodes: list[Node]) -> str:
         assert self.paths
@@ -3730,6 +3791,66 @@ def _estimate_message_tokens(message: ModelMessage) -> int:
         elif getattr(block, "type", None) == "tool_result":
             char_count += len(json.dumps(getattr(block, "metadata", {}), ensure_ascii=False))
     return max(char_count // 4, 1)
+
+
+def _memory_extraction_trigger_reason(
+    *,
+    sources: list[tuple[int, Node]],
+    latest_user_text: str,
+    max_pending_messages: int,
+    token_threshold: int,
+) -> str | None:
+    if _has_explicit_memory_intent(latest_user_text):
+        return "explicit"
+    if len(sources) >= max_pending_messages:
+        return "message_backlog"
+    if _estimate_memory_source_tokens([node for _seq, node in sources]) >= token_threshold:
+        return "token_backlog"
+    return None
+
+
+_EXPLICIT_MEMORY_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"\bremember\b",
+        r"\bdon't forget\b",
+        r"\bdo not forget\b",
+        r"\balways\b",
+        r"\bnever\b",
+        r"\bi prefer\b",
+        r"\bmy preference\b",
+        r"记住",
+        r"记一下",
+        r"帮我记",
+        r"别忘",
+        r"不要忘",
+        r"以后都",
+        r"以后不要",
+        r"我的偏好",
+        r"我偏好",
+        r"我喜欢",
+        r"我不喜欢",
+        r"我常用",
+    ]
+]
+
+
+def _has_explicit_memory_intent(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+    return any(pattern.search(normalized) for pattern in _EXPLICIT_MEMORY_PATTERNS)
+
+
+def _estimate_memory_source_tokens(nodes: list[Node]) -> int:
+    char_count = 0
+    for node in nodes:
+        for block in node.content:
+            if getattr(block, "type", None) == "text":
+                char_count += len(getattr(block, "text", ""))
+            elif getattr(block, "type", None) == "json":
+                char_count += len(json.dumps(getattr(block, "data", None), ensure_ascii=False))
+    return max(char_count // 4, 0)
 
 
 async def _run_scheduled_tool_calls(calls: list[ToolCall], run_one: Any, definitions: list[ToolDefinition]) -> list[Any]:

@@ -38,6 +38,7 @@ def write_config(
         f"""
 [runtime]
 cancel_timeout_ms = 1000
+max_turns = 128
 
 [model]
 provider = "{provider}"

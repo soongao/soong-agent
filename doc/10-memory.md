@@ -78,10 +78,23 @@
 	- user
 	- feedback
 	- reference
-- Memory 触发条件:
-	- 新增消息数达到 N.
-	- 或新增 token 估算达到阈值.
-	- 或 session idle 超过一定时间.
+- Memory 触发条件采用 hybrid strategy, 避免固定每 N 条消息机械抽取:
+	- 显式记忆意图立即触发:
+		- 当前 root user message 出现明确长期记忆表达时, 本轮 run 完成后立即抽取.
+		- 典型表达包括: "记住", "remember", "以后都", "我的偏好", "I prefer", "don't forget", "always/never do".
+		- 显式触发只决定是否运行 Memory Extraction Job, 不绕过模型抽取和写入校验; 最终仍可返回 empty memories.
+	- Backlog 兜底触发:
+		- 未扫描 root user messages 数量达到 `memory.extract_every_messages` 时, 本轮 run 完成后抽取.
+		- 该字段语义是 `max_pending_messages`, 不是"每 N 条必定值得写 memory".
+	- Token 兜底触发:
+		- 未扫描 root user messages 的估算 token 数达到 `memory.extract_every_tokens` 时, 本轮 run 完成后抽取.
+		- token 估算只用于触发阈值, 不作为精确计费或上下文裁剪依据.
+	- Idle 整理触发:
+		- 如果本轮 run 完成后仍有未扫描 root user messages, 但未命中上述立即/兜底条件, runtime 安排一个 session-level idle job.
+		- `memory.idle_seconds` 内没有同 session 新 run 开始时, idle job 后台运行 Memory Extraction Job.
+		- 同 session 新 run 开始时取消旧 idle job, 等新 run 完成后重新评估.
+	- `memory.enabled = false` 时禁用所有 extraction 触发.
+	- 触发结果需要写入 `memory_extraction_started` / `completed` / `failed` event, payload 记录 `reason`: `explicit`, `message_backlog`, `token_backlog`, or `idle`.
 - Memory 文件结构:
 		- `${SOONG_AGENT_HOME}/memory/MEMORY.md`: 所有 memory md 的目录.
 		- `${SOONG_AGENT_HOME}/memory/user/*.md`

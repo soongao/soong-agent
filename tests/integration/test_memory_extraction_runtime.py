@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
@@ -117,6 +118,186 @@ max_output_tokens = 256
     assert completed[-1].payload["scan_cursor"]["node_seq"] == metadata["memory_scan_node_seq"]
     assert completed[-1].agent_id is None
     assert completed[-1].run_id is None
+
+
+@pytest.mark.asyncio
+async def test_memory_extraction_explicit_intent_triggers_immediately(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    config_path = _write_ollama_config(home, scripted_ollama)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + """
+
+[memory]
+enabled = true
+extract_every_messages = 99
+extract_every_tokens = 12000
+idle_seconds = 120
+catalog_max_tokens = 4000
+recall_top_k = 5
+memory_context_token_budget = 6000
+""",
+        encoding="utf-8",
+    )
+    memory_response = json.dumps(
+        {
+            "memories": [
+                {
+                    "decision": "new",
+                    "category": "user",
+                    "filename": "explicit.md",
+                    "summary": "Explicit preference",
+                    "source_node_ids": ["__NODE_ID__"],
+                    "content": "prefers terse answers",
+                }
+            ]
+        }
+    )
+    scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue(_memory_response_with_source(memory_response))
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("记住：我喜欢简洁回答", session_id="sess_memory_explicit")
+        _events = [event async for event in handle.events()]
+        replay = await runtime.replay_session("sess_memory_explicit")
+
+    assert (home / "memory" / "user" / "explicit.md").exists()
+    completed = [event for event in replay.events if event.event_type == "memory_extraction_completed"]
+    assert completed[-1].payload["reason"] == "explicit"
+
+
+@pytest.mark.asyncio
+async def test_memory_extraction_plain_message_waits_for_idle(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    config_path = _write_ollama_config(home, scripted_ollama)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + """
+
+[memory]
+enabled = true
+extract_every_messages = 99
+extract_every_tokens = 12000
+idle_seconds = 120
+catalog_max_tokens = 4000
+recall_top_k = 5
+memory_context_token_budget = 6000
+""",
+        encoding="utf-8",
+    )
+    scripted_ollama.enqueue_text("main done")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("ordinary status update", session_id="sess_memory_wait")
+        _events = [event async for event in handle.events()]
+        replay = await runtime.replay_session("sess_memory_wait")
+
+    assert [request for request in scripted_ollama.requests if request.get("metadata", {}).get("purpose") == "memory_extraction"] == []
+    assert not [event for event in replay.events if event.event_type.startswith("memory_extraction_")]
+
+
+@pytest.mark.asyncio
+async def test_memory_extraction_idle_triggers_after_delay(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    config_path = _write_ollama_config(home, scripted_ollama)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + """
+
+[memory]
+enabled = true
+extract_every_messages = 99
+extract_every_tokens = 12000
+idle_seconds = 0
+catalog_max_tokens = 4000
+recall_top_k = 5
+memory_context_token_budget = 6000
+""",
+        encoding="utf-8",
+    )
+    memory_response = json.dumps(
+        {
+            "memories": [
+                {
+                    "decision": "new",
+                    "category": "user",
+                    "filename": "idle.md",
+                    "summary": "Idle memory",
+                    "source_node_ids": ["__NODE_ID__"],
+                    "content": "idle extracted memory",
+                }
+            ]
+        }
+    )
+    scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue(_memory_response_with_source(memory_response))
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("ordinary idle input", session_id="sess_memory_idle")
+        _events = [event async for event in handle.events()]
+        for _ in range(20):
+            if (home / "memory" / "user" / "idle.md").exists():
+                break
+            await asyncio.sleep(0.01)
+        replay = await runtime.replay_session("sess_memory_idle")
+
+    assert (home / "memory" / "user" / "idle.md").exists()
+    completed = [event for event in replay.events if event.event_type == "memory_extraction_completed"]
+    assert completed[-1].payload["reason"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_memory_extraction_token_backlog_triggers(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    config_path = _write_ollama_config(home, scripted_ollama)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + """
+
+[memory]
+enabled = true
+extract_every_messages = 99
+extract_every_tokens = 2
+idle_seconds = 120
+catalog_max_tokens = 4000
+recall_top_k = 5
+memory_context_token_budget = 6000
+""",
+        encoding="utf-8",
+    )
+    memory_response = json.dumps(
+        {
+            "memories": [
+                {
+                    "decision": "new",
+                    "category": "reference",
+                    "filename": "token.md",
+                    "summary": "Token backlog",
+                    "source_node_ids": ["__NODE_ID__"],
+                    "content": "token backlog extracted memory",
+                }
+            ]
+        }
+    )
+    scripted_ollama.enqueue_text("main done")
+    scripted_ollama.enqueue(_memory_response_with_source(memory_response))
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("ordinary long input with enough characters", session_id="sess_memory_token")
+        _events = [event async for event in handle.events()]
+        replay = await runtime.replay_session("sess_memory_token")
+
+    assert (home / "memory" / "reference" / "token.md").exists()
+    completed = [event for event in replay.events if event.event_type == "memory_extraction_completed"]
+    assert completed[-1].payload["reason"] == "token_backlog"
 
 
 @pytest.mark.asyncio

@@ -77,6 +77,18 @@ default = "maybe"
     assert "network_policy" in str(exc_info.value.details["errors"])
 
 
+def test_invalid_runtime_max_turns_fails_schema_validation(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    path = write_config(home)
+    path.write_text(path.read_text(encoding="utf-8").replace("max_turns = 128", "max_turns = 0"), encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_runtime_config(project_dir=project)
+
+    assert exc_info.value.code.value == "config_error"
+    assert "max_turns" in str(exc_info.value.details["errors"])
+
+
 def test_invalid_tool_override_schema_fails_validation(isolated_dirs) -> None:
     home, project = isolated_dirs
     path = write_config(home)

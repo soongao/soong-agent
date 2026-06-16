@@ -1,5 +1,6 @@
 [runtime]
 cancel_timeout_ms = 10000
+max_turns = 128
 
 [model]
 provider = "ollama"
@@ -42,7 +43,7 @@ max_summary_tokens = 2048
 enabled = true
 memory_dir = "${SOONG_AGENT_HOME}/memory"
 categories = ["user", "feedback", "reference"]
-extract_every_messages = 8
+extract_every_messages = 32
 extract_every_tokens = 12000
 idle_seconds = 120
 catalog_max_tokens = 4000

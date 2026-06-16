@@ -27,6 +27,14 @@ class ModelConfig(StrictModel):
 
 class RuntimeConfig(StrictModel):
     cancel_timeout_ms: int = 10000
+    max_turns: int = 128
+
+    @field_validator("max_turns")
+    @classmethod
+    def validate_max_turns(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("runtime.max_turns must be >= 1")
+        return value
 
 
 class ContextConfig(StrictModel):
@@ -56,7 +64,7 @@ class MemoryConfig(StrictModel):
     enabled: bool = True
     memory_dir: str = "${SOONG_AGENT_HOME}/memory"
     categories: list[str] = Field(default_factory=lambda: ["user", "feedback", "reference"])
-    extract_every_messages: int = 8
+    extract_every_messages: int = 32
     extract_every_tokens: int = 12000
     idle_seconds: int = 120
     catalog_max_tokens: int = 4000

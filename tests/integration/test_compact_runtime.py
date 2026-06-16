@@ -33,7 +33,7 @@ async def test_runtime_compact_agent_writes_compaction_node(isolated_dirs, scrip
     scripted_ollama.enqueue_text("main")
     scripted_ollama.enqueue_text("compact summary")
     async with _runtime(project, scripted_ollama) as runtime:
-        handle = await runtime.start("remember this context", session_id="sess_compact")
+        handle = await runtime.start("use this context", session_id="sess_compact")
         _events = [event async for event in handle.events()]
         result = await runtime.run_compact_agent(session_id="sess_compact", reason="test")
         replay = await runtime.replay_session("sess_compact")
@@ -87,7 +87,7 @@ async def test_runtime_compact_agent_marks_stale_when_active_path_changes(
     scripted_ollama.enqueue_text("new active answer")
 
     async with _runtime(project, scripted_ollama) as runtime:
-        handle = await runtime.start("remember this context", session_id="sess_stale_compact")
+        handle = await runtime.start("use this context", session_id="sess_stale_compact")
         _events = [event async for event in handle.events()]
         compact_task = asyncio.create_task(runtime.run_compact_agent(session_id="sess_stale_compact", reason="test_stale"))
         await asyncio.wait_for(compact_started.wait(), timeout=1)

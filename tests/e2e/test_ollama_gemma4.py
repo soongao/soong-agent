@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from io import StringIO
+
 import pytest
 
 from agent_core import AgentRuntime
-from agent_core.cli import async_main
+from agent_cli.cli import async_main
 from tests.conftest import write_config
 from tests.fixtures.ollama import ollama_server
 
@@ -23,10 +25,11 @@ async def test_ollama_gemma4_simple_run(isolated_dirs, ollama_server) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cli_run_uses_local_ollama(isolated_dirs, ollama_server, capsys) -> None:
+async def test_cli_chat_uses_local_ollama(isolated_dirs, ollama_server, capsys, monkeypatch) -> None:
     home, project = isolated_dirs
     write_config(home, provider="ollama", base_url=ollama_server, model_name="gemma4")
-    code = await async_main(["run", "--path", str(project), "Reply with exactly: cli-pong"])
+    monkeypatch.setattr("sys.stdin", StringIO("Reply with exactly: cli-pong\n/exit\n"))
+    code = await async_main(["chat", "--path", str(project)])
     captured = capsys.readouterr()
     assert code == 0
     assert captured.err == ""

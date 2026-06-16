@@ -22,12 +22,13 @@ test = [
 ]
 
 [project.scripts]
-soong-agent = "agent_core.cli:main"
+soong-agent = "agent_cli.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agent_core"]
+packages = ["src/agent_core", "src/agent_cli"]
 include = [
     "src/agent_core/py.typed",
+    "src/agent_cli/py.typed",
     "src/agent_core/assets/**/*.md",
     "src/agent_core/assets/**/*.toml",
 ]

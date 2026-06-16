@@ -114,9 +114,9 @@
 	- enabled
 	- memory_dir: 用户级 memory 目录, 默认 `${SOONG_AGENT_HOME}/memory`.
 	- categories
-	- extract_every_messages
-	- extract_every_tokens
-	- idle_seconds
+	- extract_every_messages: pending root user messages backlog 兜底阈值.
+	- extract_every_tokens: pending root user messages token 估算兜底阈值.
+	- idle_seconds: session 空闲后后台整理 memory 的延迟.
 	- catalog_max_tokens
 	- recall_top_k
 	- memory_context_token_budget

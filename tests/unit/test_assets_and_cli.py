@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+from io import StringIO
 from importlib import resources
 from pathlib import Path
+import sqlite3
+import sys
 import tomllib
 
 import pytest
 
 from agent_core.assets.loader import get_asset, list_required_assets, read_asset
-from agent_core.cli import async_main, build_parser
+from agent_cli.cli import async_main, build_parser
 from agent_core.config import load_config
 from agent_core.permissions import stdin_permission_callback
 from agent_core.types.tools import ToolCall
 from tests.conftest import write_config
 from tests.fixtures.scripted_ollama import ScriptedOllama
+
+
+def _chat_stdin(text: str) -> StringIO:
+    return StringIO(text)
 
 
 def test_required_assets_exist() -> None:
@@ -105,8 +112,9 @@ def test_wheel_build_config_includes_typed_marker_and_assets() -> None:
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     wheel = data["tool"]["hatch"]["build"]["targets"]["wheel"]
 
-    assert wheel["packages"] == ["src/agent_core"]
+    assert wheel["packages"] == ["src/agent_core", "src/agent_cli"]
     assert "src/agent_core/py.typed" in wheel["include"]
+    assert "src/agent_cli/py.typed" in wheel["include"]
     assert "src/agent_core/assets/**/*.md" in wheel["include"]
     assert "src/agent_core/assets/**/*.toml" in wheel["include"]
 
@@ -118,6 +126,7 @@ def test_default_config_template_matches_contract(tmp_path) -> None:
 
     config = load_config(path)
 
+    assert config.runtime.max_turns == 128
     assert config.model.provider == "ollama"
     assert config.model.name == "gemma4"
     assert config.model_overrides["compact"]["max_output_tokens"] == 2048
@@ -127,38 +136,66 @@ def test_default_config_template_matches_contract(tmp_path) -> None:
     assert config.agents.worker_pools[0].workers[0].agent_definition_id == "default_worker_agent"
 
 
-def test_cli_help_has_run_but_no_init(capsys) -> None:
+def test_cli_help_has_chat_but_no_run_or_init(capsys) -> None:
     parser = build_parser()
     help_text = parser.format_help()
-    assert "run" in help_text
+    assert "chat" in help_text
+    assert "run" not in help_text
     assert "init" not in help_text
     assert "--json" not in help_text
 
-    run_parser = parser._subparsers._group_actions[0].choices["run"]  # type: ignore[attr-defined]
-    run_help = run_parser.format_help()
-    assert "--path" in run_help
-    assert "--orchestrator" in run_help
-    assert "--session-id" in run_help
-    assert "--json" not in run_help
+    chat_parser = parser._subparsers._group_actions[0].choices["chat"]  # type: ignore[attr-defined]
+    chat_help = chat_parser.format_help()
+    assert "--path" in chat_help
+    assert "--orchestrator" in chat_help
+    assert "--session-id" in chat_help
+    assert "--json" not in chat_help
 
 
 @pytest.mark.asyncio
 async def test_cli_missing_config_exits_nonzero(isolated_dirs, capsys) -> None:
     _home, project = isolated_dirs
-    code = await async_main(["run", "--path", str(project), "hi"])
+
+    old_stdin = sys.stdin
+    sys.stdin = _chat_stdin("hi\n")
+    try:
+        code = await async_main(["chat", "--path", str(project)])
+    finally:
+        sys.stdin = old_stdin
     captured = capsys.readouterr()
     assert code == 1
     assert "config" in captured.err.lower()
 
 
 @pytest.mark.asyncio
-async def test_cli_run_uses_ollama_provider(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
+async def test_cli_run_subcommand_is_not_available(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        await async_main(["run", "hello"])
+    captured = capsys.readouterr()
+    assert exc.value.code == 2
+    assert "invalid choice" in captured.err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stdin_text", ["/exit\n", "/quit\n", ""])
+async def test_cli_chat_exit_commands_return_zero(isolated_dirs, monkeypatch, capsys, stdin_text: str) -> None:
+    _home, project = isolated_dirs
+    monkeypatch.setattr("sys.stdin", _chat_stdin(stdin_text))
+    code = await async_main(["chat", "--path", str(project)])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.err == ""
+
+
+@pytest.mark.asyncio
+async def test_cli_chat_uses_ollama_provider(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
     write_config(home, base_url=scripted_ollama.base_url)
     scripted_ollama.enqueue_text("cli ok")
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
-    code = await async_main(["run", "--path", str(project), "hello from cli"])
+    monkeypatch.setattr("sys.stdin", _chat_stdin("hello from cli\n/exit\n"))
+    code = await async_main(["chat", "--path", str(project)])
     captured = capsys.readouterr()
 
     assert code == 0
@@ -166,6 +203,50 @@ async def test_cli_run_uses_ollama_provider(isolated_dirs, monkeypatch, capsys, 
     assert captured.err == ""
     assert len(scripted_ollama.requests) == 1
     assert scripted_ollama.requests[0]["model"] == "gemma4"
+
+
+@pytest.mark.asyncio
+async def test_cli_chat_two_inputs_share_one_session(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_text("first answer")
+    scripted_ollama.enqueue_text("second answer")
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+    monkeypatch.setattr("sys.stdin", _chat_stdin("first question\nsecond question\n/exit\n"))
+
+    code = await async_main(["chat", "--path", str(project)])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "first answer" in captured.out
+    assert "second answer" in captured.out
+    assert captured.err == ""
+    assert len(scripted_ollama.requests) == 2
+    second_messages = scripted_ollama.requests[1]["messages"]
+    assert any(message["role"] == "user" and "first question" in message["content"] for message in second_messages)
+    assert any(message["role"] == "assistant" and "first answer" in message["content"] for message in second_messages)
+    with sqlite3.connect(home / "sessions.sqlite") as conn:
+        rows = conn.execute("SELECT session_id FROM sessions").fetchall()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_cli_chat_fixed_session_id(isolated_dirs, monkeypatch, capsys, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_text("fixed answer")
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+    monkeypatch.setattr("sys.stdin", _chat_stdin("hello fixed session\n/exit\n"))
+
+    code = await async_main(["chat", "--path", str(project), "--session-id", "sess_fixed_cli"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "fixed answer" in captured.out
+    assert captured.err == ""
+    with sqlite3.connect(home / "sessions.sqlite") as conn:
+        row = conn.execute("SELECT session_id FROM sessions").fetchone()
+    assert row == ("sess_fixed_cli",)
 
 
 @pytest.mark.asyncio
@@ -178,7 +259,8 @@ async def test_cli_path_file_uses_parent_dir(isolated_dirs, monkeypatch, capsys,
     scripted_ollama.enqueue_text("file path ok")
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
-    code = await async_main(["run", "--path", str(source), "hello from file path"])
+    monkeypatch.setattr("sys.stdin", _chat_stdin("hello from file path\n/exit\n"))
+    code = await async_main(["chat", "--path", str(source)])
     captured = capsys.readouterr()
 
     assert code == 0
@@ -186,8 +268,6 @@ async def test_cli_path_file_uses_parent_dir(isolated_dirs, monkeypatch, capsys,
     assert captured.err == ""
     db_path = home / "sessions.sqlite"
     assert db_path.exists()
-    import sqlite3
-
     with sqlite3.connect(db_path) as conn:
         row = conn.execute("SELECT cwd FROM sessions").fetchone()
     assert row is not None
@@ -204,10 +284,8 @@ async def test_cli_permission_allow_once_writes_file(isolated_dirs, monkeypatch,
     scripted_ollama.enqueue_text("write done")
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
-    from io import StringIO
-
-    monkeypatch.setattr("sys.stdin", StringIO("1\n"))
-    code = await async_main(["run", "--path", str(project), "write a file"])
+    monkeypatch.setattr("sys.stdin", _chat_stdin("write a file\n1\n/exit\n"))
+    code = await async_main(["chat", "--path", str(project)])
     captured = capsys.readouterr()
 
     assert code == 0
@@ -238,10 +316,8 @@ async def test_cli_permission_allow_for_session_reuses_scope(
     scripted_ollama.enqueue_text("session write done")
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
-    from io import StringIO
-
-    monkeypatch.setattr("sys.stdin", StringIO("2\n"))
-    code = await async_main(["run", "--path", str(project), "write the same file twice"])
+    monkeypatch.setattr("sys.stdin", _chat_stdin("write the same file twice\n2\n/exit\n"))
+    code = await async_main(["chat", "--path", str(project)])
     captured = capsys.readouterr()
 
     assert code == 0
@@ -261,10 +337,8 @@ async def test_cli_permission_deny_blocks_write(isolated_dirs, monkeypatch, caps
     scripted_ollama.enqueue_text("write denied")
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
-    from io import StringIO
-
-    monkeypatch.setattr("sys.stdin", StringIO("3\n"))
-    code = await async_main(["run", "--path", str(project), "try writing a file"])
+    monkeypatch.setattr("sys.stdin", _chat_stdin("try writing a file\n3\n/exit\n"))
+    code = await async_main(["chat", "--path", str(project)])
     captured = capsys.readouterr()
 
     assert code == 0
@@ -289,10 +363,8 @@ async def test_cli_permission_deny_stops_following_write_tool_calls(
     scripted_ollama.enqueue_text("writes stopped")
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
 
-    from io import StringIO
-
-    monkeypatch.setattr("sys.stdin", StringIO("3\n"))
-    code = await async_main(["run", "--path", str(project), "try writing two files"])
+    monkeypatch.setattr("sys.stdin", _chat_stdin("try writing two files\n3\n/exit\n"))
+    code = await async_main(["chat", "--path", str(project)])
     captured = capsys.readouterr()
 
     assert code == 0
@@ -347,11 +419,9 @@ async def test_cli_orchestrator_dispatches_worker_with_ollama(isolated_dirs, mon
     scripted_ollama.enqueue_text("worker done")
     scripted_ollama.enqueue_text("orchestrator done")
     monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
-    from io import StringIO
+    monkeypatch.setattr("sys.stdin", _chat_stdin("orchestrate cli task\n1\n1\n1\n/exit\n"))
 
-    monkeypatch.setattr("sys.stdin", StringIO("1\n1\n1\n"))
-
-    code = await async_main(["run", "--path", str(project), "--orchestrator", "orchestrate cli task"])
+    code = await async_main(["chat", "--path", str(project), "--orchestrator"])
     captured = capsys.readouterr()
 
     assert code == 0

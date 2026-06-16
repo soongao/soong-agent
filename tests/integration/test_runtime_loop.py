@@ -796,7 +796,11 @@ async def test_stop_hook_deny_prevents_completion_and_continues_next_turn(
     isolated_dirs, scripted_ollama: ScriptedOllama
 ) -> None:
     home, project = isolated_dirs
-    _write_ollama_config(home, scripted_ollama)
+    config_path = _write_ollama_config(home, scripted_ollama)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("max_turns = 128", "max_turns = 8"),
+        encoding="utf-8",
+    )
     for index in range(8):
         scripted_ollama.enqueue_text("first final" if index == 0 else "second final")
     (home / "hooks.json").write_text(
