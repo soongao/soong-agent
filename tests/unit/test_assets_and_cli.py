@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from io import StringIO
 from importlib import resources
 from pathlib import Path
@@ -16,6 +17,7 @@ from agent_core.config import load_config
 from agent_core.permissions import stdin_permission_callback
 from agent_core.events import make_event
 from agent_core.types.tools import ToolCall
+from agent_cli.config_bootstrap import ensure_default_config
 from tests.conftest import write_config
 from tests.fixtures.scripted_ollama import ScriptedOllama
 
@@ -173,18 +175,104 @@ def test_cli_render_maps_core_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cli_missing_config_exits_nonzero(isolated_dirs, capsys) -> None:
-    _home, project = isolated_dirs
+async def test_tui_prompt_newline_history_and_markdown(isolated_dirs) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
 
-    old_stdin = sys.stdin
-    sys.stdin = _chat_stdin("hi\n")
-    try:
-        code = await async_main(["chat", "--path", str(project), "--plain"])
-    finally:
-        sys.stdin = old_stdin
-    captured = capsys.readouterr()
-    assert code == 1
-    assert "config" in captured.err.lower()
+    _home, project = isolated_dirs
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_tui", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+
+        prompt.load_text("hello")
+        prompt.move_cursor((0, 5))
+        await pilot.press("ctrl+j")
+        await pilot.pause()
+        assert prompt.text == "hello\n"
+
+        app._record_history("first")
+        app._record_history("second")
+        prompt.load_text("")
+        await pilot.press("up")
+        await pilot.pause()
+        assert prompt.text == "second"
+        await pilot.press("up")
+        await pilot.pause()
+        assert prompt.text == "first"
+        await pilot.press("down")
+        await pilot.pause()
+        assert prompt.text == "second"
+
+        await app._append_assistant_delta("**done**")
+        await app._finalize_assistant_stream()
+        await pilot.pause()
+        assert list(app.query(".assistant-markdown"))
+
+
+@pytest.mark.asyncio
+async def test_tui_permission_prompt_is_inline_and_waits(isolated_dirs) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import InlinePermissionPrompt, SoongAgentTui
+    from agent_core.types.permissions import PermissionRequest
+
+    _home, project = isolated_dirs
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_tui_perm", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    request = PermissionRequest(
+        request_id="perm_test",
+        session_id="sess_tui_perm",
+        agent_id="agent_main",
+        run_id="run_main",
+        agent_role="main",
+        tool_name="code.write_file",
+        permission="write",
+        tags=["write"],
+        args_summary="{'path': 'x.txt'}",
+        target_scope=str(project / "x.txt"),
+        cwd=str(project),
+    )
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        task = asyncio.create_task(app.permission_callback(request))
+        await pilot.pause()
+        assert not task.done()
+        prompts = list(app.query(InlinePermissionPrompt))
+        assert len(prompts) == 1
+        await pilot.click("#allow_once")
+        decision = await asyncio.wait_for(task, timeout=1)
+        assert decision.decision.value == "allow_once"
+        assert not list(app.query(InlinePermissionPrompt))
+
+
+def test_cli_bootstrap_creates_default_config(isolated_dirs) -> None:
+    home, _project = isolated_dirs
+
+    created = ensure_default_config()
+
+    assert created == home / "config.toml"
+    assert created.exists()
+    config = load_config(created)
+    assert config.model.provider == "ollama"
+    assert ensure_default_config() is None
+
+
+def test_cli_bootstrap_does_not_overwrite_existing_config(isolated_dirs) -> None:
+    home, _project = isolated_dirs
+    config_path = home / "config.toml"
+    config_path.write_text("[model]\nprovider = \"custom\"\nname = \"custom-model\"\n", encoding="utf-8")
+
+    created = ensure_default_config()
+
+    assert created is None
+    assert config_path.read_text(encoding="utf-8") == "[model]\nprovider = \"custom\"\nname = \"custom-model\"\n"
 
 
 @pytest.mark.asyncio

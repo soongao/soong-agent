@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import sys
 
+from agent_cli.config_bootstrap import ensure_default_config
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="soong-agent")
@@ -20,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
 async def async_main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "chat":
+        ensure_default_config()
         if args.plain:
             return await _run_plain_chat(args)
         return await _run_tui_chat(args)

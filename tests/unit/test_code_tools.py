@@ -276,6 +276,71 @@ async def test_list_dir_large_output_uses_artifact(isolated_dirs) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_command_readonly_ls_does_not_request_permission(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    (project / "visible.txt").write_text("ok", encoding="utf-8")
+    calls = []
+
+    async def callback(request):
+        calls.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.DENY)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(tool_call_id="call1", name="code.run_command", arguments={"argv": ["ls"], "cwd": str(project)}),
+        await make_context(home, project, callback),
+    )
+
+    assert not result.is_error
+    assert "visible.txt" in result.content[0].data["stdout"]  # type: ignore[union-attr]
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_command_write_like_command_still_requests_permission(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    calls = []
+
+    async def callback(request):
+        calls.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.DENY)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(tool_call_id="call1", name="code.run_command", arguments={"argv": ["python3", "-c", "print('x')"], "cwd": str(project)}),
+        await make_context(home, project, callback),
+    )
+
+    assert result.is_error
+    assert result.error and result.error.code.value == "permission_denied"
+    assert len(calls) == 1
+    assert calls[0].tool_name == "code.run_command"
+
+
+@pytest.mark.asyncio
+async def test_run_command_recursive_ls_still_requests_permission(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    calls = []
+
+    async def callback(request):
+        calls.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.DENY)
+
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+    result = await registry.execute(
+        ToolCall(tool_call_id="call1", name="code.run_command", arguments={"argv": ["ls", "-R"], "cwd": str(project)}),
+        await make_context(home, project, callback),
+    )
+
+    assert result.is_error
+    assert result.error and result.error.code.value == "permission_denied"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_search_large_output_uses_artifact(isolated_dirs) -> None:
     home, project = isolated_dirs
     for index in range(20):

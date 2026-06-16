@@ -61,6 +61,7 @@ class ToolRegistry:
                 error=ErrorPayload(code=ErrorCode.VALIDATION_ERROR, message=str(exc)),
             )
 
+        definition = _effective_definition_for_call(definition, call.arguments)
         target_path = _target_path(call.name, call.arguments, context)
         network_host = _network_host(call.arguments) if "network" in definition.tags else None
         target_scope = _target_scope(
@@ -259,6 +260,33 @@ async def _run_post_tool_hooks(
         }
         return result.model_copy(update={"metadata": metadata})
     return result
+
+
+def _effective_definition_for_call(definition: ToolDefinition, arguments: dict[str, Any]) -> ToolDefinition:
+    if definition.name != "code.run_command" or not _is_readonly_command(arguments):
+        return definition
+    tags = set(definition.tags)
+    tags.discard("dangerous")
+    tags.add("readonly")
+    return definition.model_copy(update={"permission": "readonly", "tags": tags})
+
+
+def _is_readonly_command(arguments: dict[str, Any]) -> bool:
+    argv = arguments.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+        return False
+    command = Path(argv[0]).name
+    if command == "pwd":
+        return len(argv) == 1
+    if command != "ls":
+        return False
+    for item in argv[1:]:
+        if item == ".":
+            continue
+        if item.startswith("-") and "R" not in item:
+            continue
+        return False
+    return True
 
 
 def _target_scope(
