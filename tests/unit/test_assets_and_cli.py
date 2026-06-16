@@ -338,11 +338,13 @@ async def test_tui_slash_suggestions_filter_and_complete(isolated_dirs) -> None:
         await pilot.pause()
         second_page = str(suggestions.render())
         assert "/zeta-0" not in second_page
+        assert "> /zeta-8" in second_page
         assert "/zeta-8" in second_page
         await pilot.press("down")
         await pilot.pause()
         last_page = str(suggestions.render())
         assert "/zeta-0" not in last_page
+        assert "> /zeta-9" in last_page
         assert "/zeta-9" in last_page
 
         prompt.load_text("/se")

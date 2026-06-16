@@ -23,7 +23,7 @@ from textual.events import Key
 from textual.widgets import Button, Footer, Header, Markdown, Static, TextArea
 
 
-SLASH_SUGGESTION_VISIBLE_ROWS = 8
+SLASH_SUGGESTION_VISIBLE_ROWS = 6
 
 
 @dataclass(frozen=True)
@@ -195,7 +195,7 @@ class SoongAgentTui(App[int]):
 
     #slash-suggestions {
         height: auto;
-        max-height: 9;
+        max-height: 8;
         margin-top: 1;
         padding: 0 1;
         border: solid $accent;
@@ -357,7 +357,6 @@ class SoongAgentTui(App[int]):
         if not self._slash_suggestions or not self.query_one("#slash-suggestions", Static).display:
             return False
         self._slash_selected_index = (self._slash_selected_index + direction) % len(self._slash_suggestions)
-        self._sync_slash_window()
         self._render_slash_suggestions()
         return True
 
@@ -399,9 +398,8 @@ class SoongAgentTui(App[int]):
             widget.display = False
             widget.update("")
             return
-        self._sync_slash_window()
         visible = self._visible_slash_suggestions()
-        rows = ["Slash commands (Up/Down selects, Enter/Tab accepts)"]
+        rows = []
         for index, suggestion in visible:
             marker = ">" if index == self._slash_selected_index else " "
             rows.append(f"{marker} {suggestion.usage:<18} {suggestion.description}")
@@ -409,6 +407,7 @@ class SoongAgentTui(App[int]):
         widget.update("\n".join(rows))
 
     def _visible_slash_suggestions(self) -> list[tuple[int, SlashSuggestion]]:
+        self._sync_slash_window()
         end = self._slash_window_start + SLASH_SUGGESTION_VISIBLE_ROWS
         return list(enumerate(self._slash_suggestions))[self._slash_window_start : end]
 
@@ -417,10 +416,9 @@ class SoongAgentTui(App[int]):
             self._slash_window_start = 0
             return
         max_start = max(len(self._slash_suggestions) - SLASH_SUGGESTION_VISIBLE_ROWS, 0)
-        if self._slash_selected_index < self._slash_window_start:
-            self._slash_window_start = self._slash_selected_index
-        elif self._slash_selected_index >= self._slash_window_start + SLASH_SUGGESTION_VISIBLE_ROWS:
-            self._slash_window_start = self._slash_selected_index - SLASH_SUGGESTION_VISIBLE_ROWS + 1
+        selected = min(max(self._slash_selected_index, 0), len(self._slash_suggestions) - 1)
+        half_window = SLASH_SUGGESTION_VISIBLE_ROWS // 2
+        self._slash_window_start = selected - half_window
         self._slash_window_start = min(max(self._slash_window_start, 0), max_start)
 
     def _cached_skills_for_suggestions(self) -> list[dict[str, str]]:
