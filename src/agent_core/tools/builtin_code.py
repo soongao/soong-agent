@@ -357,10 +357,7 @@ async def run_command(context: ToolExecutionContext, args: dict[str, Any]) -> To
         )
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_ms / 1000)
     except asyncio.TimeoutError as exc:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        await _kill_and_reap(proc)
         raise AgentCoreError(ErrorCode.TIMEOUT, "command timed out") from exc
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
@@ -590,3 +587,18 @@ def _artifact_json_if_large(
         ],
         metadata={"artifact_ids": [artifact.artifact_id], "output_artifact_id": artifact.artifact_id},
     )
+
+
+async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
+    try:
+        if proc.returncode is None:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        await proc.communicate()
+    except Exception:
+        try:
+            await proc.wait()
+        except Exception:
+            pass

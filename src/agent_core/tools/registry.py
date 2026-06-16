@@ -203,6 +203,8 @@ class ToolRegistry:
             result = normalize_tool_result(value, tool_call_id=call.tool_call_id, tool_name=definition.name)
             if result.tool_call_id != call.tool_call_id or result.tool_name != definition.name:
                 result = result.model_copy(update={"tool_call_id": call.tool_call_id, "tool_name": definition.name})
+            if hook_summary and "hook_summary" not in result.metadata:
+                result = result.model_copy(update={"metadata": {**result.metadata, "hook_summary": hook_summary}})
             return await _run_post_tool_hooks(context=context, call=call, definition=definition, target_path=target_path, result=result)
         except Exception as exc:
             code = getattr(exc, "code", ErrorCode.INTERNAL_ERROR)
@@ -216,6 +218,7 @@ class ToolRegistry:
                     retryable=bool(getattr(exc, "retryable", False)),
                     details=dict(getattr(exc, "details", {}) or {}),
                 ),
+                metadata={"hook_summary": hook_summary} if hook_summary else None,
             )
             return await _run_post_tool_hooks(context=context, call=call, definition=definition, target_path=target_path, result=result)
 

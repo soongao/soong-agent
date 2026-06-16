@@ -115,10 +115,7 @@ async def _run_command_hook(
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout_ms / 1000)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        await _kill_and_reap(proc)
         return HookDecision(error=ErrorPayload(code=ErrorCode.TIMEOUT, message="hook timed out"), hook=hook)
     stderr = stderr_b.decode("utf-8", errors="replace")
     if proc.returncode != 0:
@@ -141,3 +138,18 @@ async def _run_command_hook(
         logs=list(data.get("logs") or ([] if not stderr else [stderr])),
         hook=hook,
     )
+
+
+async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
+    try:
+        if proc.returncode is None:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        await proc.communicate()
+    except Exception:
+        try:
+            await proc.wait()
+        except Exception:
+            pass

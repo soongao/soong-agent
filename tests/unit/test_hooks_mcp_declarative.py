@@ -142,6 +142,80 @@ async def test_command_hook_deny_runs_before_permission_callback(isolated_dirs) 
 
 
 @pytest.mark.asyncio
+async def test_command_hook_timeout_is_reported_but_does_not_block_tool(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    requests = []
+
+    async def allow(request):
+        requests.append(request)
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    write_config(home)
+    config, paths = load_runtime_config(project_dir=project)
+    context = ToolExecutionContext(
+        session_id="sess",
+        run_id="run",
+        agent_id="agent",
+        agent_role="main",
+        project_dir=paths.project_dir,
+        home_dir=paths.home_dir,
+        config=config,
+        artifact_manager=ArtifactManager(home_dir=paths.home_dir),
+        permission_callback=allow,
+        permission_cache=PermissionSessionCache(),
+        hooks=[
+            {
+                "event_type": "tool_started",
+                "tool_name": "code.write_file",
+                "type": "command",
+                "command": [sys.executable, "-c", "import time; time.sleep(1)"],
+                "timeout_ms": 10,
+            }
+        ],
+    )
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="c1", name="code.write_file", arguments={"path": "x.txt", "content": "x"}),
+        context,
+    )
+
+    assert not result.is_error
+    assert (project / "x.txt").read_text(encoding="utf-8") == "x"
+    assert requests[0].hook_summary["error"]["code"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_readonly_hook_timeout_is_preserved_in_tool_result_metadata(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    (project / "a.txt").write_text("hello", encoding="utf-8")
+    registry = ToolRegistry()
+    register_builtin_code_tools(registry)
+
+    result = await registry.execute(
+        ToolCall(tool_call_id="c1", name="code.read_file", arguments={"path": "a.txt"}),
+        await make_context(
+            home,
+            project,
+            hooks=[
+                {
+                    "event_type": "tool_started",
+                    "tool_name": "code.read_file",
+                    "type": "command",
+                    "command": [sys.executable, "-c", "import time; time.sleep(1)"],
+                    "timeout_ms": 10,
+                }
+            ],
+        ),
+    )
+
+    assert not result.is_error
+    assert result.content[0].data["content"] == "hello"  # type: ignore[union-attr]
+    assert result.metadata["hook_summary"]["error"]["code"] == "timeout"
+
+
+@pytest.mark.asyncio
 async def test_pre_tool_hook_summary_is_passed_to_permission_callback(isolated_dirs) -> None:
     home, project = isolated_dirs
     script = home / "allow_hook.py"

@@ -99,10 +99,7 @@ def _make_handler(data: dict[str, Any]):
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(stdin_payload), timeout=timeout_ms / 1000)
         except asyncio.TimeoutError as exc:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            await _kill_and_reap(proc)
             raise AgentCoreError(ErrorCode.TIMEOUT, "declarative tool timed out") from exc
         stdout = stdout_b.decode("utf-8", errors="replace")
         stderr = stderr_b.decode("utf-8", errors="replace")
@@ -264,3 +261,18 @@ def _declarative_cwd(context: ToolExecutionContext, data: dict[str, Any]) -> Pat
     if not resolved.is_dir():
         raise AgentCoreError(ErrorCode.FILE_NOT_FOUND, f"declarative working_dir not found: {resolved}")
     return resolved
+
+
+async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
+    try:
+        if proc.returncode is None:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        await proc.communicate()
+    except Exception:
+        try:
+            await proc.wait()
+        except Exception:
+            pass
