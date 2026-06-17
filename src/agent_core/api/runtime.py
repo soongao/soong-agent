@@ -49,6 +49,7 @@ from agent_core.types import (
     CleanupResult,
     DeleteSessionResult,
     ErrorPayload,
+    ForkSessionResult,
     InspectResult,
     JsonBlock,
     LoadSkillResult,
@@ -59,6 +60,8 @@ from agent_core.types import (
     RunMode,
     RunStatus,
     RuntimeEvent,
+    SessionInfo,
+    SessionNodeInfo,
     SkillInfo,
     TextBlock,
     ToolCall,
@@ -1599,6 +1602,121 @@ class AgentRuntime:
         await self._ensure_started()
         assert self.store
         return await self.store.get_node_path(node_id)
+
+    async def list_sessions(self, limit: int = 20, offset: int = 0) -> list[SessionInfo]:
+        await self._ensure_started()
+        assert self.store
+        rows = await self.store.list_sessions(limit=max(limit, 1), offset=max(offset, 0))
+        return [_session_info_from_row(row) for row in rows]
+
+    async def list_session_nodes(self, session_id: str, limit: int = 20, offset: int = 0) -> list[SessionNodeInfo]:
+        await self._ensure_started()
+        assert self.store
+        session = await self.store.get_session(session_id)
+        if session is None:
+            return []
+        active_node_id = session.get("active_node_id")
+        nodes = await self.store.list_session_nodes(session_id, limit=max(limit, 1), offset=max(offset, 0))
+        return [
+            SessionNodeInfo(
+                node_id=node.node_id,
+                parent_id=node.parent_id,
+                role=node.role,
+                node_type=node.node_type,
+                content_preview=_node_content_preview(node),
+                created_at=node.created_at,
+                active=node.node_id == active_node_id,
+            )
+            for node in nodes
+        ]
+
+    async def fork_session(
+        self,
+        source_session_id: str,
+        node_id: str | None = None,
+        new_session_id: str | None = None,
+        mode: Literal["normal", "orchestrator"] = "normal",
+    ) -> ForkSessionResult:
+        await self._ensure_started()
+        assert self.store and self.paths
+        if source_session_id in self._session_active or self._session_queues.get(source_session_id):
+            return ForkSessionResult(
+                source_session_id=source_session_id,
+                forked=False,
+                error=ErrorPayload(code=ErrorCode.SESSION_ACTIVE, message="cannot fork a session with active or queued runs"),
+            )
+        if await self.store.has_active_runs(source_session_id):
+            return ForkSessionResult(
+                source_session_id=source_session_id,
+                forked=False,
+                error=ErrorPayload(code=ErrorCode.SESSION_ACTIVE, message="cannot fork a session with active or queued runs"),
+            )
+        source_session = await self.store.get_session(source_session_id)
+        if source_session is None:
+            return ForkSessionResult(
+                source_session_id=source_session_id,
+                forked=False,
+                error=ErrorPayload(code=ErrorCode.VALIDATION_ERROR, message="source session not found"),
+            )
+        source_node_id = node_id or source_session.get("active_node_id")
+        if not source_node_id:
+            return ForkSessionResult(
+                source_session_id=source_session_id,
+                forked=False,
+                error=ErrorPayload(code=ErrorCode.VALIDATION_ERROR, message="source session has no active node"),
+            )
+        path = await self.store.get_session_node_path(source_session_id, str(source_node_id))
+        if not path:
+            return ForkSessionResult(
+                source_session_id=source_session_id,
+                source_node_id=str(source_node_id),
+                forked=False,
+                error=ErrorPayload(code=ErrorCode.VALIDATION_ERROR, message="node not found in source session"),
+            )
+        run_mode = RunMode(mode)
+        target_session_id = new_session_id or new_id("sess")
+        root_agent_id = self._root_agent_id(session_id=target_session_id, mode=run_mode)
+        try:
+            result = await self.store.fork_session_from_path(
+                source_session_id=source_session_id,
+                new_session_id=target_session_id,
+                cwd=str(source_session.get("cwd") or self.paths.project_dir),
+                root_agent_id=root_agent_id,
+                agent_type="orchestrator" if run_mode == RunMode.ORCHESTRATOR else "main",
+                nodes=path,
+                metadata={
+                    "forked_from_session_id": source_session_id,
+                    "forked_from_node_id": str(source_node_id),
+                },
+            )
+        except ValueError as exc:
+            return ForkSessionResult(
+                source_session_id=source_session_id,
+                source_node_id=str(source_node_id),
+                session_id=target_session_id,
+                forked=False,
+                error=ErrorPayload(code=ErrorCode.VALIDATION_ERROR, message=str(exc)),
+            )
+        await self.store.add_event(
+            make_event(
+                session_id=target_session_id,
+                event_type="session_forked",
+                node_id=result.get("active_node_id"),
+                payload={
+                    "source_session_id": source_session_id,
+                    "source_node_id": str(source_node_id),
+                    "copied_nodes": result.get("copied_nodes", 0),
+                },
+            )
+        )
+        return ForkSessionResult(
+            source_session_id=source_session_id,
+            source_node_id=str(source_node_id),
+            session_id=target_session_id,
+            active_node_id=result.get("active_node_id"),
+            forked=True,
+            copied_nodes=int(result.get("copied_nodes") or 0),
+        )
 
     async def list_skills(self) -> list[SkillInfo]:
         await self._ensure_started()
@@ -3606,6 +3724,41 @@ def _model_request_views_from_events(events: list[RuntimeEvent], *, run_id: str 
             }
         )
     return views
+
+
+def _session_info_from_row(row: dict[str, Any]) -> SessionInfo:
+    try:
+        metadata = json.loads(row.get("metadata_json") or "{}")
+    except json.JSONDecodeError:
+        metadata = {}
+    return SessionInfo(
+        session_id=str(row.get("session_id") or ""),
+        cwd=str(row.get("cwd") or ""),
+        root_agent_id=str(row.get("root_agent_id") or ""),
+        active_node_id=row.get("active_node_id"),
+        parent_session_id=row.get("parent_session_id"),
+        status=str(row.get("status") or ""),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+        metadata=metadata,
+    )
+
+
+def _node_content_preview(node: Node, limit: int = 120) -> str:
+    parts: list[str] = []
+    for block in node.content:
+        text = getattr(block, "text", None)
+        if text:
+            parts.append(str(text))
+            continue
+        data = getattr(block, "data", None)
+        if data is not None:
+            parts.append(json.dumps(data, ensure_ascii=False))
+    preview = " ".join(part.strip() for part in parts if part.strip())
+    preview = " ".join(preview.split())
+    if len(preview) > limit:
+        return preview[: max(limit - 3, 0)] + "..."
+    return preview
 
 
 def _text_sha256(text: str) -> str:

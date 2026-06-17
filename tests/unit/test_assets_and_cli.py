@@ -212,7 +212,7 @@ async def test_tui_prompt_newline_history_and_markdown(isolated_dirs) -> None:
         await pilot.pause()
         assert prompt.text == "second"
 
-        await app._append_assistant_delta("**done**")
+        await app._append_assistant_delta("run_test", "**done**")
         await app._finalize_assistant_stream()
         await pilot.pause()
         assert list(app.query(".assistant-markdown"))
@@ -488,6 +488,141 @@ async def test_tui_slash_clear_and_status_commands(isolated_dirs) -> None:
         assert f"config: {home / 'config.toml'}" in text
         assert "no active run to cancel" in text
         assert app.runtime is None
+
+
+@pytest.mark.asyncio
+async def test_tui_session_branch_and_fork_commands(
+    isolated_dirs, monkeypatch, scripted_ollama: ScriptedOllama
+) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
+    from textual.widgets import Static
+
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_text("first answer")
+    scripted_ollama.enqueue_text(_memory_intent_response())
+    scripted_ollama.enqueue_text("second answer")
+    scripted_ollama.enqueue_text(_memory_intent_response())
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_tui_branch", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+
+        prompt.load_text("first prompt")
+        await app._submit_prompt()
+        await pilot.pause()
+        await asyncio.wait_for(app.event_task, timeout=2)
+
+        prompt.load_text("second prompt")
+        await app._submit_prompt()
+        await pilot.pause()
+        await asyncio.wait_for(app.event_task, timeout=2)
+
+        prompt.load_text("/sessions")
+        await app._submit_prompt()
+        prompt.load_text("/branch")
+        await app._submit_prompt()
+        await pilot.pause()
+
+        text = _tui_text(app)
+        assert "sessions" in text
+        assert "sess_tui_branch" in text
+        suggestions = str(app.query_one("#slash-suggestions", Static).render())
+        assert "branch candidates" in suggestions
+        assert "first prompt" in suggestions
+        assert "first answer" not in suggestions
+
+        assert app.runtime is not None
+        nodes = await app.runtime.list_session_nodes(app.session_id, limit=20)
+        first_node = next(node for node in nodes if "first prompt" in node.content_preview)
+
+        prompt.load_text(f"/branch {first_node.node_id}")
+        await app._submit_prompt()
+        await pilot.pause()
+        assert "active node switched" in _tui_text(app)
+
+        prompt.load_text("/branch")
+        await app._submit_prompt()
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert prompt.text == ""
+        assert "active node switched" in _tui_text(app)
+
+        prompt.load_text("/fork-session")
+        await app._submit_prompt()
+        await pilot.pause()
+        forked_session = app.session_id
+        assert forked_session != "sess_tui_branch"
+        text = _tui_text(app)
+        assert "forked session:" in text
+        assert "source session: sess_tui_branch" in text
+
+        prompt.load_text("/mode orchestrator")
+        await app._submit_prompt()
+        prompt.load_text("/mode")
+        await app._submit_prompt()
+        await pilot.pause()
+        assert app.mode == "orchestrator"
+        assert "mode: orchestrator" in _tui_text(app)
+
+        prompt.load_text("/use sess_tui_branch")
+        await app._submit_prompt()
+        await pilot.pause()
+        assert app.session_id == "sess_tui_branch"
+        assert "using session: sess_tui_branch" in _tui_text(app)
+
+
+@pytest.mark.asyncio
+async def test_tui_allows_input_while_run_is_active_and_queues(
+    isolated_dirs, monkeypatch, scripted_ollama: ScriptedOllama
+) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
+    from agent_core.types.runtime import RunStatus
+
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    gate = asyncio.Event()
+    scripted_ollama.enqueue_text("first answer", block=lambda: gate.wait())
+    scripted_ollama.enqueue_text(_memory_intent_response())
+    scripted_ollama.enqueue_text("second answer")
+    scripted_ollama.enqueue_text(_memory_intent_response())
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_tui_queue", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+
+        prompt.load_text("first prompt")
+        await app._submit_prompt()
+        await pilot.pause()
+        assert prompt.disabled is False
+
+        prompt.load_text("second prompt")
+        await app._submit_prompt()
+        await pilot.pause()
+        assert any(handle.status == RunStatus.QUEUED for handle in app._handles.values())
+        assert "queued: second prompt" in _tui_text(app)
+        assert "queued:" in str(app.query_one("#status").render())
+
+        tasks = list(app._event_tasks.values())
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=3)
+        await pilot.pause()
+        assert app._run_count == 2
 
 
 @pytest.mark.asyncio

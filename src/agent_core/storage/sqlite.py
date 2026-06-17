@@ -293,6 +293,18 @@ class SQLiteStore:
             row = self._conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
         return dict(row) if row else None
 
+    async def list_sessions(self, *, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM sessions
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (max(limit, 0), max(offset, 0)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     async def node_exists(self, session_id: str, node_id: str) -> bool:
         session_id = sanitize_session_id(session_id)
         async with self._lock:
@@ -306,6 +318,20 @@ class SQLiteStore:
             ensure_session_tables(self._conn, session_id)
             row = self._conn.execute(f"SELECT * FROM nodes_{session_id} WHERE node_id=?", (node_id,)).fetchone()
         return _node_from_row(row) if row else None
+
+    async def list_session_nodes(self, session_id: str, *, limit: int = 20, offset: int = 0) -> list[Node]:
+        session_id = sanitize_session_id(session_id)
+        async with self._lock:
+            ensure_session_tables(self._conn, session_id)
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM nodes_{session_id}
+                ORDER BY node_seq DESC
+                LIMIT ? OFFSET ?
+                """,
+                (max(limit, 0), max(offset, 0)),
+            ).fetchall()
+        return [_node_from_row(row) for row in rows]
 
     async def set_active_node(self, session_id: str, node_id: str) -> None:
         session_id = sanitize_session_id(session_id)
@@ -412,6 +438,118 @@ class SQLiteStore:
                     (parent_id,),
                 ).fetchone()
         return list(reversed([_node_from_row(row) for row in path_rows]))
+
+    async def get_session_node_path(self, session_id: str, node_id: str) -> list[Node]:
+        session_id = sanitize_session_id(session_id)
+        async with self._lock:
+            ensure_session_tables(self._conn, session_id)
+            table = f"nodes_{session_id}"
+            current = self._conn.execute(f"SELECT * FROM {table} WHERE node_id=?", (node_id,)).fetchone()
+            if current is None:
+                return []
+            path_rows = []
+            while current:
+                path_rows.append(current)
+                parent_id = current["parent_id"]
+                if not parent_id:
+                    break
+                current = self._conn.execute(f"SELECT * FROM {table} WHERE node_id=?", (parent_id,)).fetchone()
+        return list(reversed([_node_from_row(row) for row in path_rows]))
+
+    async def fork_session_from_path(
+        self,
+        *,
+        source_session_id: str,
+        new_session_id: str,
+        cwd: str,
+        root_agent_id: str,
+        agent_type: str,
+        nodes: list[Node],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        source_session_id = sanitize_session_id(source_session_id)
+        new_session_id = sanitize_session_id(new_session_id)
+        async with self._lock:
+            existing = self._conn.execute("SELECT 1 FROM sessions WHERE session_id=?", (new_session_id,)).fetchone()
+            if existing is not None:
+                raise ValueError(f"session already exists: {new_session_id}")
+            ensure_session_tables(self._conn, new_session_id)
+            now = utc_iso()
+            fork_metadata = dict(metadata or {})
+            fork_metadata.setdefault("forked_from_session_id", source_session_id)
+            fork_metadata.setdefault("forked_from_node_id", nodes[-1].node_id if nodes else None)
+            self._conn.execute(
+                """
+                INSERT INTO sessions(
+                    session_id, cwd, root_agent_id, active_node_id, parent_session_id,
+                    status, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, NULL, ?, 'active', ?, ?, ?)
+                """,
+                (
+                    new_session_id,
+                    cwd,
+                    root_agent_id,
+                    source_session_id,
+                    json.dumps(fork_metadata, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO agents(
+                    agent_id, session_id, parent_agent_id, agent_type, created_by_run_id,
+                    fork_from_node_id, status, result_json, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, NULL, ?, NULL, ?, 'idle', NULL, ?, ?, ?)
+                """,
+                (
+                    root_agent_id,
+                    new_session_id,
+                    agent_type,
+                    nodes[-1].node_id if nodes else None,
+                    json.dumps({"forked_from_session_id": source_session_id}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            table = f"nodes_{new_session_id}"
+            id_map: dict[str, str] = {}
+            for index, node in enumerate(nodes, start=1):
+                from agent_core.storage.ids import new_id
+
+                copied_node_id = new_id("node")
+                id_map[node.node_id] = copied_node_id
+                copied_parent_id = id_map.get(node.parent_id or "")
+                metadata_json = dict(node.metadata)
+                metadata_json["forked_from_session_id"] = source_session_id
+                metadata_json["forked_from_node_id"] = node.node_id
+                self._conn.execute(
+                    f"""
+                    INSERT INTO {table}(
+                        node_id, node_seq, parent_id, agent_id, run_id, role, node_type,
+                        content_json, metadata_json, token_count, created_at
+                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        copied_node_id,
+                        index,
+                        copied_parent_id,
+                        root_agent_id,
+                        node.role,
+                        node.node_type,
+                        json.dumps([_model_dump(block) for block in node.content], ensure_ascii=False),
+                        json.dumps(metadata_json, ensure_ascii=False),
+                        node.token_count,
+                        utc_iso(node.created_at),
+                    ),
+                )
+            active_node_id = id_map[nodes[-1].node_id] if nodes else None
+            self._conn.execute(
+                "UPDATE sessions SET active_node_id=?, updated_at=? WHERE session_id=?",
+                (active_node_id, now, new_session_id),
+            )
+            self._conn.commit()
+        return {"active_node_id": active_node_id, "copied_nodes": len(nodes)}
 
     async def list_artifacts(self, session_id: str | None = None) -> list[dict[str, Any]]:
         async with self._lock:

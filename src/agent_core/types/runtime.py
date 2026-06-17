@@ -72,6 +72,38 @@ class ReplayResult(StrictModel):
     task_wal_errors: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class SessionInfo(StrictModel):
+    session_id: str
+    cwd: str
+    root_agent_id: str
+    active_node_id: str | None = None
+    parent_session_id: str | None = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionNodeInfo(StrictModel):
+    node_id: str
+    parent_id: str | None = None
+    role: str
+    node_type: str
+    content_preview: str = ""
+    created_at: datetime
+    active: bool = False
+
+
+class ForkSessionResult(StrictModel):
+    source_session_id: str
+    session_id: str | None = None
+    source_node_id: str | None = None
+    active_node_id: str | None = None
+    forked: bool
+    copied_nodes: int = 0
+    error: ErrorPayload | None = None
+
+
 class CancelResult(StrictModel):
     run_id: str
     status: RunStatus

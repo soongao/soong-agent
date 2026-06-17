@@ -746,6 +746,43 @@ async def test_switch_node_changes_next_run_active_path(isolated_dirs, scripted_
 
 
 @pytest.mark.asyncio
+async def test_list_and_fork_session_from_active_path(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    scripted_ollama.enqueue_text("first answer")
+    scripted_ollama.enqueue_text("second answer")
+    scripted_ollama.enqueue_text("fork answer")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        first = await runtime.start("first path", session_id="sess_fork_source")
+        _first_events = [event async for event in first.events()]
+        second = await runtime.start("second path", session_id="sess_fork_source")
+        _second_events = [event async for event in second.events()]
+
+        sessions = await runtime.list_sessions(limit=5)
+        assert any(session.session_id == "sess_fork_source" for session in sessions)
+
+        nodes = await runtime.list_session_nodes("sess_fork_source", limit=10)
+        assert any(node.active and "second answer" in node.content_preview for node in nodes)
+
+        result = await runtime.fork_session("sess_fork_source", mode="normal")
+        assert result.forked is True
+        assert result.session_id is not None
+        assert result.copied_nodes >= 4
+
+        forked_replay = await runtime.replay_session(result.session_id)
+        assert forked_replay.nodes
+        assert all(node.run_id is None for node in forked_replay.nodes)
+        forked = await runtime.start("continue fork", session_id=result.session_id)
+        _forked_events = [event async for event in forked.events()]
+
+    texts = _payload_texts(scripted_ollama.requests[-1])
+    assert "first path" in texts
+    assert "second path" in texts
+    assert "continue fork" in texts
+
+
+@pytest.mark.asyncio
 async def test_context_messages_use_latest_compaction_summary(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
     _write_ollama_config(home, scripted_ollama)
