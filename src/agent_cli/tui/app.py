@@ -149,7 +149,7 @@ class SoongAgentTui(CommandMixin, SuggestionMixin, App[int]):
     async def on_mount(self) -> None:
         self.query_one("#slash-suggestions", Static).display = False
         self.query_one("#prompt", PromptTextArea).focus()
-        await self._write_message("system", "soong-agent TUI ready. Use /help for commands.")
+        await self._write_message("system", "agentcli TUI ready. Use /help for commands.")
 
     async def on_unmount(self) -> None:
         tasks = [task for task in self._event_tasks.values() if not task.done()]

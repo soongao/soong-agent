@@ -74,4 +74,3 @@ def resolve_runtime_paths(
         plan_dir=plan_dir,
         task_dir=task_dir,
     )
-

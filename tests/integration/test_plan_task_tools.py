@@ -58,6 +58,8 @@ async def test_plan_template_returns_instruction(isolated_dirs) -> None:
     data = result.content[0].data  # type: ignore[union-attr]
     assert data["node_type"] == "plan_instruction"
     assert "Default Plan Template" in data["content"]
+    assert "<project>/.soong-agent/plans" in data["content"]
+    assert data["suggested_dir"] == str((project / ".soong-agent" / "plans").resolve())
     assert data["template_id"] == "template.plan.default"
     assert data["template_version"] == "1"
 
@@ -67,7 +69,7 @@ async def test_plan_template_uses_configured_default_dir(isolated_dirs) -> None:
     home, project = isolated_dirs
     write_config(home)
     config_path = home / "config.toml"
-    config_path.write_text(config_path.read_text(encoding="utf-8") + "\n[plan]\ndefault_dir = \"<project>/plans/custom\"\n", encoding="utf-8")
+    config_path.write_text(config_path.read_text(encoding="utf-8") + "\n[plan]\ndefault_dir = \"<project>/.soong-agent/plans/custom\"\n", encoding="utf-8")
     config, paths = load_runtime_config(project_dir=project)
 
     async def allow(_request):
@@ -92,7 +94,7 @@ async def test_plan_template_uses_configured_default_dir(isolated_dirs) -> None:
         context,
     )
     data = result.content[0].data  # type: ignore[union-attr]
-    assert data["suggested_dir"] == str((project / "plans" / "custom").resolve())
+    assert data["suggested_dir"] == str((project / ".soong-agent" / "plans" / "custom").resolve())
 
 
 @pytest.mark.asyncio
@@ -110,6 +112,7 @@ async def test_runtime_creates_only_project_plan_and_task_dirs(
     project_state = project / ".soong-agent"
     assert (project_state / "plans").is_dir()
     assert (project_state / "tasks").is_dir()
+    assert not (project / "plans").exists()
     for name in ["hooks", "tools", "agents", "skills", "memory", "rules"]:
         assert not (project_state / name).exists()
 

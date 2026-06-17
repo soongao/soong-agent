@@ -13,7 +13,7 @@ from agent_core.storage import new_id
 from agent_core.types.runtime import RunStatus
 
 
-PROMPT = "soong-agent> "
+PROMPT = "agentcli> "
 EXIT_COMMANDS = {"/exit", "/quit"}
 
 

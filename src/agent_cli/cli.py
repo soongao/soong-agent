@@ -8,7 +8,7 @@ from agent_cli.config_bootstrap import ensure_default_config
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="soong-agent")
+    parser = argparse.ArgumentParser(prog="agentcli")
     sub = parser.add_subparsers(dest="command", required=True)
     chat = sub.add_parser("chat")
     chat.add_argument("--path", type=str, default=None)

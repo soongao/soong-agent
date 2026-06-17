@@ -236,6 +236,21 @@ async def test_openai_provider_applies_openai_provider_options() -> None:
     assert events[-1].metadata["provider"] == "openai"
 
 
+def test_openai_payload_fills_empty_assistant_message_content() -> None:
+    payload = build_openai_chat_payload(
+        ModelRequest(
+            model="gpt-test",
+            messages=[
+                ModelMessage(role=ModelRole.USER, content=[TextBlock(text="hi")]),
+                ModelMessage(role=ModelRole.ASSISTANT, content=[]),
+                ModelMessage(role=ModelRole.USER, content=[TextBlock(text="next")]),
+            ],
+        )
+    )
+
+    assert payload["messages"][1] == {"role": "assistant", "content": "(empty assistant message)"}
+
+
 @pytest.mark.asyncio
 async def test_openai_provider_rejects_unknown_provider_options_namespace() -> None:
     from agent_core.providers.openai_compatible import OpenAICompatibleProvider

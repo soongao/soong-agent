@@ -8,6 +8,9 @@ from agent_core.providers.message_parts import message_text, tool_result_text
 from agent_core.providers.tool_mapping import to_provider_tool_name
 
 
+EMPTY_ASSISTANT_CONTENT = "(empty assistant message)"
+
+
 def openai_messages(message: ModelMessage) -> list[dict[str, Any]]:
     if message.role == ModelRole.ASSISTANT:
         tool_calls = []
@@ -24,7 +27,10 @@ def openai_messages(message: ModelMessage) -> list[dict[str, Any]]:
                     },
                 }
             )
-        payload: dict[str, Any] = {"role": "assistant", "content": message_text(message.content) or None}
+        content = message_text(message.content)
+        if not content and not tool_calls:
+            content = EMPTY_ASSISTANT_CONTENT
+        payload: dict[str, Any] = {"role": "assistant", "content": content or None}
         if tool_calls:
             payload["tool_calls"] = tool_calls
         return [payload]

@@ -118,8 +118,11 @@ def test_agent_and_template_assets_are_expanded_for_runtime_semantics() -> None:
 
 def test_wheel_build_config_includes_typed_marker_and_assets() -> None:
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    scripts = data["project"]["scripts"]
     wheel = data["tool"]["hatch"]["build"]["targets"]["wheel"]
 
+    assert scripts["agentcli"] == "agent_cli.cli:main"
+    assert "soong-agent" not in scripts
     assert wheel["packages"] == ["src/agent_core", "src/agent_cli"]
     assert "src/agent_core/py.typed" in wheel["include"]
     assert "src/agent_cli/py.typed" in wheel["include"]
@@ -147,6 +150,8 @@ def test_default_config_template_matches_contract(tmp_path) -> None:
 def test_cli_help_has_chat_but_no_run_or_init(capsys) -> None:
     parser = build_parser()
     help_text = parser.format_help()
+    assert "usage: agentcli" in help_text
+    assert "soong-agent" not in help_text
     assert "chat" in help_text
     assert "run" not in help_text
     assert "init" not in help_text

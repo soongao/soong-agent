@@ -2,6 +2,12 @@
 
 Create a decision-complete Markdown plan for the requested goal. The plan should be specific enough that another agent can implement it without choosing architecture, APIs, test scope, or sequencing.
 
+After using this template, choose a concise lowercase slug for the plan file, generate the complete Markdown body yourself, and write it with `code.write_file` to:
+
+`<suggested_dir>/<slug>.md`
+
+The default suggested directory is `<project>/.soong-agent/plans`. Use the suggested directory unless the user explicitly asks for another location.
+
 Use this structure:
 
 1. `Goal`: one sentence describing the verified end state.

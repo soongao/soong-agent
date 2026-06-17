@@ -1,2 +1,1 @@
-"""Command line interface package for soong-agent."""
-
+"""Command line interface package for agentcli."""

@@ -24,7 +24,7 @@ test = [
 ]
 
 [project.scripts]
-soong-agent = "agent_cli.cli:main"
+agentcli = "agent_cli.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_core", "src/agent_cli"]
