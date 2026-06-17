@@ -10,6 +10,7 @@ import httpx
 from agent_core.errors.codes import ErrorCode
 from agent_core.providers.base import ModelEvent, ModelRequest, ProviderAdapter, StopReason, Usage
 from agent_core.providers.errors import classify_provider_exception, retry_delay_seconds
+from agent_core.providers.message_parts import message_text, tool_result_text
 from agent_core.providers.tool_mapping import from_provider_tool_name, to_provider_tool_name
 from agent_core.types.common import ErrorPayload
 from agent_core.types.content import TextBlock
@@ -177,7 +178,7 @@ def _ollama_messages(message: Any) -> list[dict[str, Any]]:
                     }
                 }
             )
-        payload: dict[str, Any] = {"role": "assistant", "content": _message_text(message.content)}
+        payload: dict[str, Any] = {"role": "assistant", "content": message_text(message.content)}
         if tool_calls:
             payload["tool_calls"] = tool_calls
         return [payload]
@@ -186,31 +187,9 @@ def _ollama_messages(message: Any) -> list[dict[str, Any]]:
             {
                 "role": "tool",
                 "name": to_provider_tool_name(str(getattr(block, "metadata", {}).get("tool_name") or "")),
-                "content": _tool_result_text(block),
+                "content": tool_result_text(block),
             }
             for block in message.content
             if getattr(block, "type", None) == "tool_result"
         ]
-    return [{"role": message.role.value, "content": _message_text(message.content)}]
-
-
-def _message_text(content: list[Any]) -> str:
-    parts: list[str] = []
-    for block in content:
-        if getattr(block, "type", None) == "text":
-            parts.append(getattr(block, "text", ""))
-        elif getattr(block, "type", None) == "json":
-            parts.append(json.dumps(getattr(block, "data", None), ensure_ascii=False))
-        elif getattr(block, "type", None) == "artifact_ref":
-            parts.append(f"[artifact:{getattr(block, 'artifact_id', '')}] {getattr(block, 'summary', '') or ''}".strip())
-    return "\n".join(part for part in parts if part)
-
-
-def _tool_result_text(block: Any) -> str:
-    if getattr(block, "is_error", False) and getattr(block, "error", None) is not None:
-        error = getattr(block, "error")
-        return json.dumps({"error": error.model_dump(mode="json")}, ensure_ascii=False)
-    text = _message_text(getattr(block, "content", []) or [])
-    if text:
-        return text
-    return json.dumps(getattr(block, "metadata", {}) or {}, ensure_ascii=False)
+    return [{"role": message.role.value, "content": message_text(message.content)}]

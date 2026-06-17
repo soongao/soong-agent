@@ -11,6 +11,7 @@ import httpx
 from agent_core.errors.codes import ErrorCode
 from agent_core.providers.base import ModelEvent, ModelRequest, ModelRole, ProviderAdapter, StopReason
 from agent_core.providers.errors import classify_provider_exception, retry_delay_seconds
+from agent_core.providers.message_parts import message_text, tool_result_text
 from agent_core.providers.tool_mapping import from_provider_tool_name, to_provider_tool_name
 from agent_core.types.common import ErrorPayload
 from agent_core.types.content import TextBlock
@@ -209,7 +210,7 @@ def anthropic_sse_to_events(event_name: str, data: dict[str, Any], state: Anthro
 def _anthropic_message(message: ModelMessage) -> dict[str, Any]:
     if message.role == ModelRole.ASSISTANT:
         content: list[dict[str, Any]] = []
-        text = _message_text(message.content)
+        text = message_text(message.content)
         if text:
             content.append({"type": "text", "text": text})
         for block in message.content:
@@ -229,36 +230,14 @@ def _anthropic_message(message: ModelMessage) -> dict[str, Any]:
             {
                 "type": "tool_result",
                 "tool_use_id": getattr(block, "tool_call_id"),
-                "content": _tool_result_text(block),
+                "content": tool_result_text(block),
                 "is_error": bool(getattr(block, "is_error", False)),
             }
             for block in message.content
             if getattr(block, "type", None) == "tool_result"
         ]
         return {"role": "user", "content": content}
-    return {"role": "user", "content": _message_text(message.content)}
-
-
-def _message_text(content: list[Any]) -> str:
-    parts: list[str] = []
-    for block in content:
-        if getattr(block, "type", None) == "text":
-            parts.append(getattr(block, "text", ""))
-        elif getattr(block, "type", None) == "json":
-            parts.append(json.dumps(getattr(block, "data", None), ensure_ascii=False))
-        elif getattr(block, "type", None) == "artifact_ref":
-            parts.append(f"[artifact:{getattr(block, 'artifact_id', '')}] {getattr(block, 'summary', '') or ''}".strip())
-    return "\n".join(part for part in parts if part)
-
-
-def _tool_result_text(block: Any) -> str:
-    if getattr(block, "is_error", False) and getattr(block, "error", None) is not None:
-        error = getattr(block, "error")
-        return json.dumps({"error": error.model_dump(mode="json")}, ensure_ascii=False)
-    text = _message_text(getattr(block, "content", []) or [])
-    if text:
-        return text
-    return json.dumps(getattr(block, "metadata", {}) or {}, ensure_ascii=False)
+    return {"role": "user", "content": message_text(message.content)}
 
 
 def _anthropic_tool_choice(tool_choice: str | dict[str, Any]) -> str | dict[str, Any]:

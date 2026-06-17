@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from agent_core.storage.codecs import event_from_row, model_dump, node_from_row
 from agent_core.storage.ids import sanitize_session_id
 from agent_core.storage.migrations import ensure_session_tables, migrate
 from agent_core.types.common import utc_iso, utc_now
@@ -202,7 +203,7 @@ class SQLiteStore:
 
             node_id = new_id("node")
             now_dt = utc_now()
-            content_json = json.dumps([_model_dump(block) for block in content], ensure_ascii=False)
+            content_json = json.dumps([model_dump(block) for block in content], ensure_ascii=False)
             self._conn.execute(
                 f"""
                 INSERT INTO {table}(
@@ -317,7 +318,7 @@ class SQLiteStore:
         async with self._lock:
             ensure_session_tables(self._conn, session_id)
             row = self._conn.execute(f"SELECT * FROM nodes_{session_id} WHERE node_id=?", (node_id,)).fetchone()
-        return _node_from_row(row) if row else None
+        return node_from_row(row) if row else None
 
     async def list_session_nodes(self, session_id: str, *, limit: int = 20, offset: int = 0) -> list[Node]:
         session_id = sanitize_session_id(session_id)
@@ -331,7 +332,7 @@ class SQLiteStore:
                 """,
                 (max(limit, 0), max(offset, 0)),
             ).fetchall()
-        return [_node_from_row(row) for row in rows]
+        return [node_from_row(row) for row in rows]
 
     async def set_active_node(self, session_id: str, node_id: str) -> None:
         session_id = sanitize_session_id(session_id)
@@ -389,7 +390,7 @@ class SQLiteStore:
                 """,
                 (after_node_seq, session["root_agent_id"]),
             ).fetchall()
-        return [(int(row["node_seq"]), _node_from_row(row)) for row in rows]
+        return [(int(row["node_seq"]), node_from_row(row)) for row in rows]
 
     async def has_active_runs(self, session_id: str) -> bool:
         session_id = sanitize_session_id(session_id)
@@ -437,7 +438,7 @@ class SQLiteStore:
                     f"SELECT * FROM nodes_{found_session} WHERE node_id=?",
                     (parent_id,),
                 ).fetchone()
-        return list(reversed([_node_from_row(row) for row in path_rows]))
+        return list(reversed([node_from_row(row) for row in path_rows]))
 
     async def get_session_node_path(self, session_id: str, node_id: str) -> list[Node]:
         session_id = sanitize_session_id(session_id)
@@ -454,7 +455,7 @@ class SQLiteStore:
                 if not parent_id:
                     break
                 current = self._conn.execute(f"SELECT * FROM {table} WHERE node_id=?", (parent_id,)).fetchone()
-        return list(reversed([_node_from_row(row) for row in path_rows]))
+        return list(reversed([node_from_row(row) for row in path_rows]))
 
     async def fork_session_from_path(
         self,
@@ -537,7 +538,7 @@ class SQLiteStore:
                         root_agent_id,
                         node.role,
                         node.node_type,
-                        json.dumps([_model_dump(block) for block in node.content], ensure_ascii=False),
+                        json.dumps([model_dump(block) for block in node.content], ensure_ascii=False),
                         json.dumps(metadata_json, ensure_ascii=False),
                         node.token_count,
                         utc_iso(node.created_at),
@@ -626,7 +627,7 @@ class SQLiteStore:
                 params.append(to_seq)
             where = "WHERE " + " AND ".join(clauses) if clauses else ""
             event_rows = self._conn.execute(f"SELECT * FROM events_{session_id} {where} ORDER BY seq", params).fetchall()
-        return [_node_from_row(row) for row in nodes_rows], [_event_from_row(row, session_id) for row in event_rows]
+        return [node_from_row(row) for row in nodes_rows], [event_from_row(row, session_id) for row in event_rows]
 
     async def replay_run(self, session_id: str, run_id: str):
         session_id = sanitize_session_id(session_id)
@@ -638,50 +639,9 @@ class SQLiteStore:
             event_rows = self._conn.execute(
                 f"SELECT * FROM events_{session_id} WHERE run_id=? ORDER BY seq", (run_id,)
             ).fetchall()
-        return [_node_from_row(row) for row in node_rows], [_event_from_row(row, session_id) for row in event_rows]
+        return [node_from_row(row) for row in node_rows], [event_from_row(row, session_id) for row in event_rows]
 
     async def find_run_session(self, run_id: str) -> str | None:
         async with self._lock:
             row = self._conn.execute("SELECT session_id FROM runs WHERE run_id=?", (run_id,)).fetchone()
             return row["session_id"] if row else None
-
-
-def _model_dump(value: Any) -> dict[str, Any]:
-    return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
-
-
-def _node_from_row(row: sqlite3.Row) -> Node:
-    from pydantic import TypeAdapter
-
-    from agent_core.types.content import ContentBlock
-
-    adapter = TypeAdapter(list[ContentBlock])
-    return Node(
-        node_id=row["node_id"],
-        parent_id=row["parent_id"],
-        agent_id=row["agent_id"],
-        run_id=row["run_id"],
-        role=row["role"],
-        node_type=row["node_type"],
-        content=adapter.validate_python(json.loads(row["content_json"])),
-        metadata=json.loads(row["metadata_json"] or "{}"),
-        token_count=row["token_count"],
-        created_at=row["created_at"],
-    )
-
-
-def _event_from_row(row: sqlite3.Row, session_id: str) -> RuntimeEvent:
-    return RuntimeEvent(
-        event_id=row["event_id"],
-        seq=row["seq"],
-        run_seq=row["run_seq"],
-        session_id=session_id,
-        agent_id=row["agent_id"],
-        run_id=row["run_id"],
-        level=row["level"],
-        event_type=row["event_type"],
-        node_id=row["node_id"],
-        tool_call_id=row["tool_call_id"],
-        payload=json.loads(row["payload_json"] or "{}"),
-        created_at=row["created_at"],
-    )
