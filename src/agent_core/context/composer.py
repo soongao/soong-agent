@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_core.assets.loader import get_asset, read_asset
-from agent_core.context.instructions import build_instruction_catalog, instruction_catalog_text
+from agent_core.context.instructions import build_auto_instruction_entries, build_instruction_catalog, instruction_catalog_text
 from agent_core.context.skills import build_skill_catalog, skill_catalog_text
 from agent_core.memory.writer import resolve_memory_dir
 from agent_core.providers.base import SystemBlock
@@ -23,6 +23,7 @@ SYSTEM_PROMPT_ASSETS: tuple[tuple[str, str, int], ...] = (
 
 def build_static_system_blocks(*, home_dir: Path, project_dir: Path) -> list[SystemBlock]:
     entries, truncated = build_instruction_catalog(home_dir=home_dir, project_dir=project_dir)
+    auto_entries = build_auto_instruction_entries(home_dir=home_dir, project_dir=project_dir)
     skills = build_skill_catalog(home_dir)
     blocks = [
         SystemBlock(
@@ -45,6 +46,20 @@ def build_static_system_blocks(*, home_dir: Path, project_dir: Path) -> list[Sys
             metadata={"truncated": truncated},
         ),
     )
+    for index, entry in enumerate(auto_entries):
+        content = _read_instruction(entry.path)
+        if content is None:
+            continue
+        blocks.append(
+            SystemBlock(
+                block_id=f"system.auto_instruction.{index}",
+                source="auto_instruction",
+                content=content,
+                priority=805,
+                dynamic=False,
+                metadata={"path": str(entry.path), "metadata": entry.metadata},
+            )
+        )
     blocks.append(
         SystemBlock(
             block_id="system.skill_catalog",
@@ -56,6 +71,13 @@ def build_static_system_blocks(*, home_dir: Path, project_dir: Path) -> list[Sys
         ),
     )
     return blocks
+
+
+def _read_instruction(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
 
 
 def build_dynamic_system_blocks(

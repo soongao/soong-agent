@@ -33,6 +33,12 @@ class SlashSuggestion:
     description: str
 
 
+@dataclass(frozen=True)
+class SlashCommandResult:
+    handled: bool
+    run_message: str | None = None
+
+
 class PromptTextArea(TextArea):
     async def _on_key(self, event: Key) -> None:
         if event.key not in {"up", "down"}:
@@ -261,27 +267,33 @@ class SoongAgentTui(App[int]):
         message = prompt.text.strip()
         if not message:
             return
-        user_message = message
-        if user_message.startswith("/") and await self._handle_slash_command(user_message):
-            self._record_history(user_message)
-            prompt.clear()
-            self._hide_slash_suggestions()
-            prompt.focus()
-            return
+        display_message = message
+        run_message = message
+        if display_message.startswith("/"):
+            slash_result = await self._handle_slash_command(display_message)
+            if not slash_result.handled:
+                return
+            if slash_result.run_message is None:
+                self._record_history(display_message)
+                prompt.clear()
+                self._hide_slash_suggestions()
+                prompt.focus()
+                return
+            run_message = slash_result.run_message
         if self._has_active_run():
             await self._write_message("warning", "run already active; wait or press Ctrl-C to cancel")
             return
         await self._ensure_runtime()
         assert self.runtime is not None
         self._close_assistant_stream()
-        self._record_history(user_message)
+        self._record_history(display_message)
         prompt.clear()
         self._hide_slash_suggestions()
-        await self._write_message("user", user_message)
+        await self._write_message("user", display_message)
         prompt.disabled = True
         self._set_status("running")
         try:
-            handle = await self.runtime.start(user_message, session_id=self.session_id, mode=self.mode)
+            handle = await self.runtime.start(run_message, session_id=self.session_id, mode=self.mode)
         except AgentCoreError as exc:
             await self._write_message("error", exc.message)
             prompt.disabled = False
@@ -313,6 +325,9 @@ class SoongAgentTui(App[int]):
         command_text = text.lstrip()
         stripped = command_text.strip()
         if not command_text.startswith("/") or "\n" in command_text:
+            self._hide_slash_suggestions()
+            return
+        if any(char.isspace() for char in command_text[1:]):
             self._hide_slash_suggestions()
             return
         suggestions = self._build_slash_suggestions(command_text)
@@ -378,9 +393,9 @@ class SoongAgentTui(App[int]):
         command_names = {name for name, _usage, _description in SLASH_COMMANDS}
         return [
             SlashSuggestion(
-                completion=f"/{skill['name']}",
-                usage=f"/{skill['name']}",
-                description=skill.get("description") or "load skill",
+                completion=f"/{skill['name']} ",
+                usage=f"/{skill['name']} <message>",
+                description=skill.get("description") or "run with skill",
             )
             for skill in matches
             if skill["name"] not in command_names
@@ -428,50 +443,55 @@ class SoongAgentTui(App[int]):
             home_dir = resolve_home_dir()
         return build_skill_catalog(home_dir)
 
-    async def _handle_slash_command(self, message: str) -> bool:
+    async def _handle_slash_command(self, message: str) -> SlashCommandResult:
         command, argument = _parse_slash_command(message)
         if command in {"exit", "quit"}:
             self.exit(0)
-            return True
+            return SlashCommandResult(handled=True)
         if command == "help":
             await self._write_message("system", _slash_help_text())
-            return True
+            return SlashCommandResult(handled=True)
         if command == "clear":
             if self._has_active_run():
                 await self._write_message("warning", "cannot clear the transcript while a run is active; use /cancel first")
-                return True
+                return SlashCommandResult(handled=True)
             await self._clear_transcript()
             await self._write_message("system", "transcript cleared")
-            return True
+            return SlashCommandResult(handled=True)
         if command == "new":
             if self._has_active_run():
                 await self._write_message("warning", "cannot start a new session while a run is active; use /cancel first")
-                return True
+                return SlashCommandResult(handled=True)
             await self._new_session(argument)
-            return True
+            return SlashCommandResult(handled=True)
         if command == "session":
             await self._write_message("system", self._session_info_text())
-            return True
+            return SlashCommandResult(handled=True)
         if command == "config":
             await self._write_message("system", self._config_info_text())
-            return True
+            return SlashCommandResult(handled=True)
         if command == "skills":
             await self._show_skills()
-            return True
+            return SlashCommandResult(handled=True)
         if command == "history":
             await self._write_message("system", self._history_text(argument))
-            return True
+            return SlashCommandResult(handled=True)
         if command == "autoscroll":
             self.action_toggle_auto_scroll()
             await self._write_message("system", f"autoscroll {'on' if self._auto_scroll else 'off'}")
-            return True
+            return SlashCommandResult(handled=True)
         if command == "cancel":
             await self._cancel_active_run()
-            return True
-        if not argument and self._skill_name_exists(command) and await self._load_skill_command(command):
-            return True
+            return SlashCommandResult(handled=True)
+        if self._skill_name_exists(command):
+            if not argument:
+                await self._write_message("warning", f"usage: /{command} <message>")
+                return SlashCommandResult(handled=True)
+            if await self._load_skill_for_run(command):
+                return SlashCommandResult(handled=True, run_message=argument)
+            return SlashCommandResult(handled=True)
         await self._write_message("warning", f"unknown slash command: /{command}. Use /help for commands.")
-        return True
+        return SlashCommandResult(handled=True)
 
     async def _clear_transcript(self) -> None:
         await self._finalize_assistant_stream()
@@ -541,12 +561,13 @@ class SoongAgentTui(App[int]):
             return
         rows = ["available skills"]
         rows.extend(f"{skill.name} - {skill.description or skill.path}" for skill in skills)
+        rows.append("Use /<skill_name> <message> to load a skill and run the message.")
         await self._write_message("system", "\n".join(rows))
 
-    async def _load_skill_command(self, name: str) -> bool:
+    async def _load_skill_for_run(self, name: str) -> bool:
         if self._has_active_run():
             await self._write_message("warning", "cannot load a skill while a run is active; use /cancel first")
-            return True
+            return False
         name = name.strip()
         if not name:
             return False
@@ -557,11 +578,7 @@ class SoongAgentTui(App[int]):
             if str(result.error.code) == "skill_not_found":
                 return False
             await self._write_message("error", result.error.message)
-            return True
-        if result.already_loaded:
-            await self._write_message("system", f"skill already loaded: {result.name}")
-            return True
-        await self._write_message("system", f"skill loaded: {result.name}")
+            return False
         return True
 
     def _skill_name_exists(self, name: str) -> bool:
@@ -769,6 +786,7 @@ def _matching_slash_commands(text: str) -> list[tuple[str, str, str]]:
 def _slash_help_text() -> str:
     rows = ["slash commands"]
     rows.extend(f"{usage} - {description}" for _name, usage, description in SLASH_COMMANDS)
+    rows.append("/<skill_name> <message> - load a skill and run the message")
     return "\n".join(rows)
 
 

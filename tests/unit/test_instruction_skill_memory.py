@@ -101,6 +101,31 @@ def test_static_system_blocks_load_package_assets(isolated_dirs) -> None:
     assert by_id["system.instruction_catalog"].source == "instruction_catalog"
 
 
+def test_static_system_blocks_auto_load_entry_claude_without_linked_rules(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    home_rules = home / "rules"
+    home_rules.mkdir()
+    (home / "CLAUDE.md").write_text("home rule: always say home\nsee rules/home.md\n", encoding="utf-8")
+    (home_rules / "home.md").write_text("linked home rule body\n", encoding="utf-8")
+    (project / "CLAUDE.md").write_text("project rule: always say project\nsee rules/project.md\n", encoding="utf-8")
+    project_rules = project / "rules"
+    project_rules.mkdir()
+    (project_rules / "project.md").write_text("linked project rule body\n", encoding="utf-8")
+
+    blocks = build_static_system_blocks(home_dir=home, project_dir=project)
+    auto_blocks = [block for block in blocks if block.source == "auto_instruction"]
+
+    assert [block.metadata["path"] for block in auto_blocks] == [
+        str((home / "CLAUDE.md").resolve()),
+        str((project / "CLAUDE.md").resolve()),
+    ]
+    auto_text = "\n".join(block.content for block in auto_blocks)
+    assert "home rule: always say home" in auto_text
+    assert "project rule: always say project" in auto_text
+    assert "linked home rule body" not in auto_text
+    assert "linked project rule body" not in auto_text
+
+
 def test_skill_catalog_frontmatter_only(isolated_dirs) -> None:
     home, project = isolated_dirs
     skills = home / "skills"

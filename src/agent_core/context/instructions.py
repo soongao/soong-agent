@@ -14,6 +14,20 @@ class InstructionEntry:
     metadata: dict[str, Any]
 
 
+def build_auto_instruction_entries(*, home_dir: Path, project_dir: Path) -> list[InstructionEntry]:
+    entries: list[InstructionEntry] = []
+    seen: set[Path] = set()
+    for path in (home_dir / "CLAUDE.md", project_dir / "CLAUDE.md"):
+        if not path.exists() or not path.is_file():
+            continue
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        entries.append(InstructionEntry(path=resolved, metadata=_frontmatter_metadata(path)))
+    return entries
+
+
 def build_instruction_catalog(*, home_dir: Path, project_dir: Path, limit: int = 200) -> tuple[list[InstructionEntry], bool]:
     candidates: list[Path] = []
     home_claude = home_dir / "CLAUDE.md"

@@ -212,9 +212,11 @@ async def test_loaded_instruction_context_is_scoped_to_session(
 ) -> None:
     home, project = isolated_dirs
     _write_ollama_config(home, scripted_ollama)
-    (project / "CLAUDE.md").write_text("session scoped instruction body\n", encoding="utf-8")
+    instruction_dir = project / "pkg"
+    instruction_dir.mkdir()
+    (instruction_dir / "CLAUDE.md").write_text("session scoped instruction body\n", encoding="utf-8")
     scripted_ollama.enqueue_tool_calls(
-        [ToolCall(tool_call_id="read_instruction", name="code.read_file", arguments={"path": "CLAUDE.md"})]
+        [ToolCall(tool_call_id="read_instruction", name="code.read_file", arguments={"path": "pkg/CLAUDE.md"})]
     )
     scripted_ollama.enqueue_text("loaded instruction")
     scripted_ollama.enqueue_text("other session")
@@ -228,6 +230,27 @@ async def test_loaded_instruction_context_is_scoped_to_session(
     second_system = _payload_system_text(scripted_ollama.requests[2])
     assert "session scoped instruction body" not in second_system
     assert "session scoped instruction body" not in "\n".join(_payload_texts(scripted_ollama.requests[2]))
+
+
+@pytest.mark.asyncio
+async def test_root_claude_md_is_auto_loaded_without_reading_linked_rules(
+    isolated_dirs, scripted_ollama: ScriptedOllama
+) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama)
+    rules_dir = project / "rules"
+    rules_dir.mkdir()
+    (project / "CLAUDE.md").write_text("project entry instruction\nsee rules/detail.md\n", encoding="utf-8")
+    (rules_dir / "detail.md").write_text("linked rule should not auto load\n", encoding="utf-8")
+    scripted_ollama.enqueue_text("ok")
+
+    async with _runtime(project, scripted_ollama) as runtime:
+        handle = await runtime.start("check instructions", session_id="sess_auto_claude")
+        _events = [event async for event in handle.events()]
+
+    system_text = _payload_system_text(scripted_ollama.requests[0])
+    assert "project entry instruction" in system_text
+    assert "linked rule should not auto load" not in system_text
 
 
 @pytest.mark.asyncio

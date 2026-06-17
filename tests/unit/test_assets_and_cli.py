@@ -368,7 +368,8 @@ async def test_tui_slash_suggestions_filter_and_complete(isolated_dirs) -> None:
         prompt.load_text("/re")
         await pilot.press("tab")
         await pilot.pause()
-        assert prompt.text == "/review"
+        assert prompt.text == "/review "
+        assert suggestions.display is False
 
         prompt.load_text("/p")
         await pilot.pause()
@@ -380,7 +381,8 @@ async def test_tui_slash_suggestions_filter_and_complete(isolated_dirs) -> None:
 
         await pilot.press("enter")
         await pilot.pause()
-        assert prompt.text == "/planner"
+        assert prompt.text == "/planner "
+        assert suggestions.display is False
 
         prompt.load_text("/help")
         await pilot.press("enter")
@@ -489,7 +491,7 @@ async def test_tui_slash_clear_and_status_commands(isolated_dirs) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tui_slash_skills_and_skill_load_session_context(
+async def test_tui_slash_skills_and_skill_command_runs_message_with_context(
     isolated_dirs, monkeypatch, scripted_ollama: ScriptedOllama
 ) -> None:
     pytest.importorskip("textual")
@@ -514,24 +516,49 @@ async def test_tui_slash_skills_and_skill_load_session_context(
 
         prompt.load_text("/skills")
         await app._submit_prompt()
+        prompt.load_text("/review use selected skill")
+        await app._submit_prompt()
+        await pilot.pause()
+        await asyncio.wait_for(app.event_task, timeout=2)
+
+        text = _tui_text(app)
+        assert "available skills" in text
+        assert "review - Review code" in text
+        assert "Use /<skill_name> <message>" in text
+        assert app.runtime is not None
+        assert "/review use selected skill" in text
+
+    request_text = "\n".join(str(message.get("content") or "") for message in scripted_ollama.requests[0].get("messages", []))
+    assert '<skill name="review">' in request_text
+    assert "Skill body" in request_text
+    assert "use selected skill" in request_text
+
+
+@pytest.mark.asyncio
+async def test_tui_bare_skill_slash_shows_usage_without_loading(isolated_dirs, monkeypatch) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
+
+    home, project = isolated_dirs
+    write_config(home)
+    skills = home / "skills"
+    skills.mkdir()
+    (skills / "review.md").write_text("---\nname: review\ndescription: Review code\n---\nSkill body\n", encoding="utf-8")
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_tui_skill_usage", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
         prompt.load_text("/review")
         await app._submit_prompt()
         await pilot.pause()
 
         text = _tui_text(app)
-        assert "available skills" in text
-        assert "review - Review code" in text
-        assert "skill loaded: review" in text
-        assert app.runtime is not None
-
-        prompt.load_text("use loaded skill")
-        await app._submit_prompt()
-        await pilot.pause()
-        await asyncio.wait_for(app.event_task, timeout=2)
-
-    request_text = "\n".join(str(message.get("content") or "") for message in scripted_ollama.requests[0].get("messages", []))
-    assert '<skill name="review">' in request_text
-    assert "Skill body" in request_text
+        assert "usage: /review <message>" in text
+        assert app.runtime is None
 
 
 @pytest.mark.asyncio
