@@ -105,7 +105,7 @@ PYTHONPATH=src python3 -m agent_hub.backend
 - 未来增加仓库根目录脚本：
 
 ```bash
-./soong-hub
+./agenthub
 ```
 
 ## 5. 术语
@@ -129,7 +129,7 @@ PYTHONPATH=src python3 -m agent_hub.backend
 
 ### 6.1 首次启动
 
-1. 用户运行 `./soong-hub` 或前端 dev 命令。
+1. 用户运行 `./agenthub` 或前端 dev 命令。
 2. Electron 主进程启动 Python 后端。
 3. 后端检查 `~/.soong-agent/config.toml`。
 4. 如果配置不存在，后端用内置默认模板创建。
@@ -757,7 +757,7 @@ name = "qwen2.5:7b"
 
 V1 完成时至少满足：
 
-1. `./soong-hub` 可以启动桌面应用和后端。
+1. `./agenthub` 可以启动桌面应用和后端。
 2. 缺少 `~/.soong-agent/config.toml` 时自动创建默认配置。
 3. `/health` 返回 provider/model/config 状态。
 4. 可以创建新 conversation。

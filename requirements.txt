@@ -4,4 +4,6 @@ aiosqlite>=0.19
 PyYAML>=6.0
 rich>=13
 textual>=0.85
+fastapi>=0.111
+uvicorn>=0.30
 .

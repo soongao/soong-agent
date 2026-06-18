@@ -24,7 +24,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Footer, Header, Markdown, Static
 
 
-class SoongAgentTui(CommandMixin, SuggestionMixin, App[int]):
+class AgentTui(CommandMixin, SuggestionMixin, App[int]):
     CSS = """
     Screen {
         layout: vertical;
@@ -416,6 +416,6 @@ class SoongAgentTui(CommandMixin, SuggestionMixin, App[int]):
 
 
 async def run_tui_chat(args: argparse.Namespace) -> int:
-    app = SoongAgentTui(args)
+    app = AgentTui(args)
     result = await app.run_async()
     return int(result or 0)

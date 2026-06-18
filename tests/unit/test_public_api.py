@@ -135,6 +135,7 @@ def test_error_code_contract_subset() -> None:
         "invalid_agent_override",
         "child_agent_limit_exceeded",
         "worker_busy",
+        "worker_queue_full",
         "worker_not_available",
         "worker_pool_busy",
         "task_not_found",

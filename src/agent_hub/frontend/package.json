@@ -1,0 +1,35 @@
+{
+  "name": "agenthub-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build:electron": "tsc -p tsconfig.node.json && cp dist-electron/electron/preload.js dist-electron/electron/preload.cjs",
+    "build": "tsc -p tsconfig.json --noEmit && npm run build:electron && vite build",
+    "preview": "vite preview",
+    "electron:dev": "npm run build:electron && concurrently --kill-others --success first \"vite --host 127.0.0.1\" \"tsc -p tsconfig.node.json --watch --preserveWatchOutput\" \"wait-on http://127.0.0.1:5173 dist-electron/electron/main.js dist-electron/electron/preload.cjs && electron .\"",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.3.0",
+    "electron": "^31.0.0",
+    "vite": "^5.4.0",
+    "typescript": "^5.5.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "lucide-react": "^0.468.0"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.4.0",
+    "@testing-library/react": "^15.0.0",
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "concurrently": "^8.2.0",
+    "jsdom": "^24.1.0",
+    "wait-on": "^7.2.0",
+    "vitest": "^2.0.0"
+  },
+  "main": "dist-electron/electron/main.js"
+}

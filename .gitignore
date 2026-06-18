@@ -11,3 +11,11 @@ build/
 .DS_Store
 CLAUDE.md
 .soong-agent
+node_modules/
+dist-electron/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+examples

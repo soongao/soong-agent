@@ -81,6 +81,7 @@ async def run_main_loop(runtime: Any, handle: RunHandle, message: str | UserMess
                 memory_enabled=self.config.memory.enabled,
                 memory_dir_template=self.config.memory.memory_dir,
             )
+            system_blocks.extend(_directive_system_blocks(handle))
             system_budget = _apply_system_block_budget(system_blocks, self.config.context.dynamic_system_budget)
             system_blocks = system_budget["system_blocks"]
             tools = self._effective_tools(agent_role="orchestrator" if handle.mode == RunMode.ORCHESTRATOR else "main")
@@ -399,3 +400,35 @@ async def run_main_loop(runtime: Any, handle: RunHandle, message: str | UserMess
         self._session_active.pop(handle.session_id, None)
         await handle._stream.close()
         await self._start_next_queued(handle.session_id)
+
+
+def _directive_system_blocks(handle: RunHandle) -> list[Any]:
+    directives = handle.directives or {}
+    mentioned = directives.get("mentioned_worker") if isinstance(directives, dict) else None
+    if not isinstance(mentioned, dict) or not mentioned.get("worker_id"):
+        return []
+    from agent_core.providers import SystemBlock
+
+    worker_id = str(mentioned.get("worker_id"))
+    worker_agent_id = str(mentioned.get("worker_agent_id") or "")
+    worker_pool_id = str(mentioned.get("worker_pool_id") or "")
+    name = str(mentioned.get("name") or worker_id)
+    content = (
+        "The user explicitly mentioned a worker for this run.\n"
+        f"- Worker id: {worker_id}\n"
+        f"- Worker agent id: {worker_agent_id}\n"
+        f"- Worker pool id: {worker_pool_id}\n"
+        f"- Worker name: {name}\n\n"
+        "If you dispatch work with agent.dispatch_worker, dispatch only to this worker. "
+        "Do not dispatch to a different worker. If no worker_agent_id is provided, the tool will use this worker automatically."
+    )
+    return [
+        SystemBlock(
+            block_id="run_directive.mentioned_worker",
+            source="run_directive",
+            content=content,
+            priority=850,
+            dynamic=True,
+            metadata={"mentioned_worker": mentioned},
+        )
+    ]

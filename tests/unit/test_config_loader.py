@@ -175,6 +175,18 @@ def test_openai_provider_name_is_supported(isolated_dirs) -> None:
     assert "provider = \"openai\"" in path.read_text(encoding="utf-8")
 
 
+def test_openai_direct_api_key_config_is_supported(isolated_dirs) -> None:
+    home, project = isolated_dirs
+    path = write_config(home, provider="openai", base_url="http://127.0.0.1:11434/v1")
+    path.write_text(path.read_text(encoding="utf-8").replace('api_key_env = ""', 'api_key = "ollama"\napi_key_env = ""'), encoding="utf-8")
+
+    config, _paths = load_runtime_config(project_dir=project)
+    provider = default_provider_registry().create(config.model.provider, config.model)
+
+    assert config.model.api_key == "ollama"
+    assert provider is not None
+
+
 def test_explicit_home_overrides_environment(isolated_dirs, tmp_path, monkeypatch) -> None:
     env_home, project = isolated_dirs
     explicit_home = tmp_path / "explicit-home"

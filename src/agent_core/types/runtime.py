@@ -94,6 +94,17 @@ class SessionNodeInfo(StrictModel):
     active: bool = False
 
 
+class BranchableNodeView(StrictModel):
+    session_id: str
+    node_id: str
+    parent_id: str | None = None
+    role: str
+    node_type: str
+    content_preview: str = ""
+    created_at: datetime
+    active: bool = False
+
+
 class ForkSessionResult(StrictModel):
     source_session_id: str
     session_id: str | None = None

@@ -24,20 +24,34 @@ class WorkerPoolRuntime:
     def __init__(self, config: AgentsConfig) -> None:
         self._workers: dict[str, WorkerRuntimeState] = {}
         self._by_pool: dict[str, list[str]] = {}
+        self.configure(config)
+
+    def configure(self, config: AgentsConfig) -> None:
+        workers: dict[str, WorkerRuntimeState] = {}
+        by_pool: dict[str, list[str]] = {}
         for pool in config.worker_pools:
             ids: list[str] = []
             for index, worker in enumerate(pool.workers):
                 worker_id = worker.worker_id or f"{pool.pool_id}_{worker.agent_definition_id}_{index}"
-                if worker_id in self._workers:
+                if worker_id in workers:
                     raise AgentCoreError(ErrorCode.CONFIG_ERROR, f"duplicate worker_id: {worker_id}")
-                self._workers[worker_id] = WorkerRuntimeState(
-                    worker_id=worker_id,
-                    pool_id=pool.pool_id,
-                    agent_definition_id=worker.agent_definition_id,
-                    allowed_tools=worker.allowed_tools,
-                )
+                existing = self._workers.get(worker_id)
+                if existing is not None:
+                    existing.pool_id = pool.pool_id
+                    existing.agent_definition_id = worker.agent_definition_id
+                    existing.allowed_tools = worker.allowed_tools
+                    workers[worker_id] = existing
+                else:
+                    workers[worker_id] = WorkerRuntimeState(
+                        worker_id=worker_id,
+                        pool_id=pool.pool_id,
+                        agent_definition_id=worker.agent_definition_id,
+                        allowed_tools=worker.allowed_tools,
+                    )
                 ids.append(worker_id)
-            self._by_pool[pool.pool_id] = ids
+            by_pool[pool.pool_id] = ids
+        self._workers = workers
+        self._by_pool = by_pool
 
     def list_workers(self, worker_pool_id: str | None = None) -> list[WorkerRuntimeState]:
         if worker_pool_id:

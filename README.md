@@ -37,3 +37,31 @@ agentcli chat --path . --plain
 ```
 
 The default config uses local Ollama at `http://127.0.0.1:11434` with model `gemma4`, so make sure Ollama is running and the model is available.
+
+## Agent Hub
+
+Agent Hub is the local Electron/React desktop layer for `agent_core`.
+
+Run only the backend:
+
+```bash
+./agenthub --backend
+```
+
+Run the desktop app in development mode:
+
+```bash
+cd src/agent_hub/frontend
+npm install
+cd ../../..
+./agenthub
+```
+
+If Electron cannot download its binary on your network, install with a mirror:
+
+```bash
+cd src/agent_hub/frontend
+ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install
+```
+
+The backend starts with `PYTHONPATH=src python3 -m agent_hub.backend`, creates `~/.soong-agent/config.toml` only when it is missing, and uses the directory where you run `./agenthub` as the project directory.

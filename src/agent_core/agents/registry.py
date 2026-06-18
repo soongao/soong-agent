@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent_core.agents.builtin import builtin_agent_definitions
+from agent_core.agents.dynamic import load_json_agent_definitions
 from agent_core.agents.parsing import parse_agent_definition_file
 from agent_core.errors import AgentCoreError
 from agent_core.errors.codes import ErrorCode
@@ -14,8 +15,15 @@ class AgentDefinitionRegistry:
 
     def __init__(self) -> None:
         self._definitions: dict[str, AgentDefinition] = {}
+        self.reset_to_builtin()
+
+    def reset_to_builtin(self) -> None:
+        self._definitions = {}
         for definition in builtin_agent_definitions():
             self._definitions[definition.agent_definition_id] = definition
+
+    def code_definitions(self) -> list[AgentDefinition]:
+        return [definition for definition in self._definitions.values() if definition.source == "code"]
 
     def register(self, definition: AgentDefinition, *, source: str = "code") -> None:
         if definition.agent_definition_id in self.INTERNAL_ONLY_IDS and source != "builtin":
@@ -33,6 +41,18 @@ class AgentDefinitionRegistry:
         _validate_override(definition, existing)
         if source == "user" and existing.source != "builtin":
             raise AgentCoreError(ErrorCode.INVALID_AGENT_OVERRIDE, "user definitions can only override builtin definitions")
+        self._definitions[definition.agent_definition_id] = _with_registry_metadata(
+            definition,
+            source=source,
+            overridden=existing,
+        )
+
+    def register_overlay(self, definition: AgentDefinition, *, source: str) -> None:
+        if definition.agent_definition_id in self.INTERNAL_ONLY_IDS and source != "builtin":
+            raise AgentCoreError(ErrorCode.INVALID_AGENT_OVERRIDE, f"cannot override internal agent definition: {definition.agent_definition_id}")
+        existing = self._definitions.get(definition.agent_definition_id)
+        if existing is not None and existing.source == "code" and source != "code":
+            raise AgentCoreError(ErrorCode.DUPLICATE_AGENT_DEFINITION, "cannot override code registered definition")
         self._definitions[definition.agent_definition_id] = _with_registry_metadata(
             definition,
             source=source,
@@ -67,6 +87,12 @@ class AgentDefinitionRegistry:
                 raise AgentCoreError(ErrorCode.DUPLICATE_AGENT_DEFINITION, definition.agent_definition_id)
             seen.add(definition.agent_definition_id)
             self.register(definition, source=definition.source)
+
+    def load_json_dir(self, path: Path) -> list[AgentDefinition]:
+        definitions = load_json_agent_definitions(path)
+        for definition in definitions:
+            self.register_overlay(definition, source=definition.source)
+        return definitions
 
 
 def _validate_override(definition: AgentDefinition, existing: AgentDefinition) -> None:

@@ -90,6 +90,47 @@ def migrate(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_definitions_dynamic (
+            agent_definition_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            model_profile TEXT,
+            model_json TEXT,
+            system_prompt TEXT NOT NULL DEFAULT '',
+            suggested_tools_json TEXT NOT NULL DEFAULT '[]',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            deleted_at TEXT,
+            source TEXT NOT NULL DEFAULT 'hub',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS worker_configs_dynamic (
+            worker_id TEXT PRIMARY KEY,
+            worker_pool_id TEXT NOT NULL DEFAULT 'default',
+            agent_definition_id TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            system_prompt TEXT,
+            model_profile TEXT,
+            model_json TEXT,
+            allowed_tools_json TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            deleted_at TEXT,
+            source TEXT NOT NULL DEFAULT 'hub',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
         (SCHEMA_VERSION, utc_iso()),
     )

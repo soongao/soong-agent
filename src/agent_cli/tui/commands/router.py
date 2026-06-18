@@ -4,7 +4,7 @@ from agent_cli.tui.commands.branch import BranchCommandsMixin
 from agent_cli.tui.commands.meta import MetaCommandsMixin
 from agent_cli.tui.commands.session import SessionCommandsMixin
 from agent_cli.tui.commands.skills import SkillCommandsMixin
-from agent_cli.tui.slash import parse_slash_command, slash_help_text
+from agent_cli.tui.slash import parse_slash_command, plan_request_message, slash_help_text
 from agent_cli.tui.types import SlashCommandResult
 
 
@@ -33,6 +33,11 @@ class CommandMixin(SessionCommandsMixin, BranchCommandsMixin, SkillCommandsMixin
         if command == "mode":
             await self._mode_command(argument)
             return SlashCommandResult(handled=True)
+        if command == "plan":
+            if not argument:
+                await self._write_message("warning", "usage: /plan <goal>")
+                return SlashCommandResult(handled=True)
+            return SlashCommandResult(handled=True, run_message=plan_request_message(argument))
         if command == "session":
             await self._write_message("system", self._session_info_text())
             return SlashCommandResult(handled=True)

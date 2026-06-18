@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FRONTEND_DIR="$ROOT_DIR/src/agent_hub/frontend"
+PROJECT_DIR="${AGENTHUB_PROJECT_DIR:-$(pwd)}"
+
+export PYTHONPATH="${PYTHONPATH:-$ROOT_DIR/src}"
+export AGENTHUB_REPO_ROOT="$ROOT_DIR"
+export AGENTHUB_PROJECT_DIR="$PROJECT_DIR"
+export AGENTHUB_PYTHONPATH="$PYTHONPATH"
+export AGENTHUB_BACKEND_PORT="${AGENTHUB_BACKEND_PORT:-8765}"
+
+if [[ "${1:-}" == "--backend" ]]; then
+  shift
+  cd "$PROJECT_DIR"
+  exec python3 -m agent_hub.backend "$@"
+fi
+
+if [[ ! -d "$FRONTEND_DIR/node_modules" ]]; then
+  echo "Missing frontend dependencies in $FRONTEND_DIR/node_modules" >&2
+  echo "Run: cd $FRONTEND_DIR && npm install" >&2
+  exit 1
+fi
+
+if [[ ! -d "$FRONTEND_DIR/node_modules/electron/dist" ]]; then
+  echo "Electron is installed as an npm package, but its binary is missing." >&2
+  echo "Run: cd $FRONTEND_DIR && ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm install" >&2
+  exit 1
+fi
+
+cd "$FRONTEND_DIR"
+unset ELECTRON_RUN_AS_NODE
+exec npm run electron:dev

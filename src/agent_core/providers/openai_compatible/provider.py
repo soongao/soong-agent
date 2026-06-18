@@ -23,6 +23,7 @@ class OpenAICompatibleProvider(ProviderAdapter):
         self.config = config
         self.base_url = (getattr(config, "base_url", None) or "").rstrip("/")
         self.model = getattr(config, "name", "")
+        self.api_key = getattr(config, "api_key", None) or ""
         self.api_key_env = getattr(config, "api_key_env", "") or ""
         self.retry = getattr(config, "retry", None)
         timeout_ms = getattr(config, "timeout_ms", 60000) or 60000
@@ -49,6 +50,8 @@ class OpenAICompatibleProvider(ProviderAdapter):
                 )
                 return
             headers["Authorization"] = f"Bearer {api_key}"
+        elif self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         payload = build_openai_chat_payload(request)
         payload.update(provider_options)
         known_names = {tool.name for tool in request.tools}

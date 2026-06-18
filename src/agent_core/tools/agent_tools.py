@@ -170,6 +170,7 @@ async def dispatch_worker(context: ToolExecutionContext, args: dict, workers: Wo
     _ensure_agent_tool_role(context, "agent.dispatch_worker", {"orchestrator"})
     if workers is None:
         raise AgentCoreError(ErrorCode.WORKER_NOT_AVAILABLE, "worker runtime not configured")
+    args = _apply_mentioned_worker_directive(context, args)
     if context.services and "runtime" in context.services:
         runtime = context.service("runtime")
         return await runtime.run_worker_agent(
@@ -234,6 +235,33 @@ async def dispatch_worker(context: ToolExecutionContext, args: dict, workers: Wo
         }
     finally:
         workers.mark_idle(worker)
+
+
+def _apply_mentioned_worker_directive(context: ToolExecutionContext, args: dict) -> dict:
+    directives = (context.services or {}).get("run_directives") or {}
+    mentioned = directives.get("mentioned_worker") if isinstance(directives, dict) else None
+    if not isinstance(mentioned, dict) or not mentioned.get("worker_id"):
+        return args
+    worker_id = str(mentioned["worker_id"])
+    worker_agent_id = str(mentioned.get("worker_agent_id") or "")
+    worker_pool_id = str(mentioned.get("worker_pool_id") or "")
+    requested_worker = args.get("worker_agent_id")
+    if requested_worker is not None and requested_worker not in {worker_id, worker_agent_id}:
+        raise AgentCoreError(
+            ErrorCode.WORKER_NOT_AVAILABLE,
+            f"this run is constrained to mentioned worker {worker_id}; cannot dispatch to {requested_worker}",
+        )
+    requested_pool = args.get("worker_pool_id")
+    if requested_pool is not None and worker_pool_id and requested_pool != worker_pool_id:
+        raise AgentCoreError(
+            ErrorCode.WORKER_NOT_AVAILABLE,
+            f"this run is constrained to worker pool {worker_pool_id}; cannot dispatch to {requested_pool}",
+        )
+    updated = dict(args)
+    updated["worker_agent_id"] = worker_id
+    if worker_pool_id:
+        updated["worker_pool_id"] = worker_pool_id
+    return updated
 
 
 def _definition_catalog_item(context: ToolExecutionContext, definition) -> dict:

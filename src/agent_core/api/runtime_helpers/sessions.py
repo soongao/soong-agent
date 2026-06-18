@@ -9,6 +9,7 @@ from agent_core.errors.codes import ErrorCode
 from agent_core.events import make_event
 from agent_core.storage import new_id
 from agent_core.types import (
+    BranchableNodeView,
     DeleteSessionResult,
     ErrorPayload,
     ForkSessionResult,
@@ -36,6 +37,29 @@ async def list_session_nodes(runtime: Any, session_id: str, *, limit: int = 20, 
     nodes = await runtime.store.list_session_nodes(session_id, limit=max(limit, 1), offset=max(offset, 0))
     return [
         SessionNodeInfo(
+            node_id=node.node_id,
+            parent_id=node.parent_id,
+            role=node.role,
+            node_type=node.node_type,
+            content_preview=_node_content_preview(node),
+            created_at=node.created_at,
+            active=node.node_id == active_node_id,
+        )
+        for node in nodes
+    ]
+
+
+async def list_branchable_nodes(runtime: Any, session_id: str, *, limit: int = 100, offset: int = 0) -> list[BranchableNodeView]:
+    await runtime._ensure_started()
+    assert runtime.store
+    session = await runtime.store.get_session(session_id)
+    if session is None:
+        return []
+    active_node_id = session.get("active_node_id")
+    nodes = await runtime.store.list_branchable_nodes(session_id, limit=max(limit, 1), offset=max(offset, 0))
+    return [
+        BranchableNodeView(
+            session_id=session_id,
             node_id=node.node_id,
             parent_id=node.parent_id,
             role=node.role,

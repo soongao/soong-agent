@@ -35,6 +35,7 @@ class ErrorCode(StrEnum):
     INVALID_AGENT_OVERRIDE = "invalid_agent_override"
     CHILD_AGENT_LIMIT_EXCEEDED = "child_agent_limit_exceeded"
     WORKER_BUSY = "worker_busy"
+    WORKER_QUEUE_FULL = "worker_queue_full"
     WORKER_NOT_AVAILABLE = "worker_not_available"
     WORKER_POOL_BUSY = "worker_pool_busy"
 
@@ -54,4 +55,3 @@ class ErrorCode(StrEnum):
     MEMORY_WRITE_FAILED = "memory_write_failed"
     SKILL_NOT_FOUND = "skill_not_found"
     SKILL_LOAD_FAILED = "skill_load_failed"
-

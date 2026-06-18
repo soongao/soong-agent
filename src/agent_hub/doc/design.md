@@ -123,10 +123,10 @@ src/agent_hub/
 Repository helper:
 
 ```text
-soong-hub
+agenthub
 ```
 
-`soong-hub` 只负责开发期快速启动，不承担安装包职责。
+`agenthub` 只负责开发期快速启动，不承担安装包职责。
 
 ## 4. 启动与生命周期
 
@@ -1796,7 +1796,7 @@ npm run dev
 Future helper:
 
 ```bash
-./soong-hub
+./agenthub
 ```
 
 ## 13. Implementation phases
@@ -1864,7 +1864,7 @@ Deliverables:
 - Health wait loop.
 - Renderer preload config.
 - Startup error screen.
-- `./soong-hub` helper script.
+- `./agenthub` helper script.
 
 Exit criteria:
 

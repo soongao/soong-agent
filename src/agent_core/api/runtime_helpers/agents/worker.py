@@ -54,11 +54,30 @@ async def run_worker_agent(
     if allowed_step_ids == []:
         raise AgentCoreError(ErrorCode.VALIDATION_ERROR, "allowed_step_ids cannot be empty")
     step_scope = list(dict.fromkeys(str(item) for item in allowed_step_ids)) if allowed_step_ids is not None else None
-    worker = self.worker_runtime.select_worker(
-        worker_pool_id=worker_pool_id,
-        worker_agent_id=worker_agent_id,
-        session_id=session_id,
-    )
+    selection_worker_agent_id = worker_agent_id
+    queued = False
+    while True:
+        try:
+            worker = self.worker_runtime.select_worker(
+                worker_pool_id=worker_pool_id,
+                worker_agent_id=selection_worker_agent_id,
+                session_id=session_id,
+            )
+            break
+        except AgentCoreError as exc:
+            if exc.code != ErrorCode.WORKER_BUSY or selection_worker_agent_id is None:
+                raise
+            queued = True
+            selection_worker_agent_id = await _wait_for_worker_queue_turn(
+                self,
+                session_id=session_id,
+                parent_run_id=parent_run_id,
+                parent_agent_id=parent_agent_id,
+                task_id=task_id,
+                worker_pool_id=worker_pool_id,
+                worker_agent_id=selection_worker_agent_id,
+                parent_handle=parent_handle,
+            )
     definition = self.agent_definitions.get(worker.agent_definition_id)
     if definition is None:
         raise AgentCoreError(ErrorCode.INVALID_AGENT_DEFINITION, f"worker agent definition not found: {worker.agent_definition_id}")
@@ -87,7 +106,7 @@ async def run_worker_agent(
             "worker_id": worker.worker_id,
             "child_run_id": None,
             "stream_id": None,
-            "selection_reason": "first_idle" if worker_agent_id is None else "specified_worker",
+            "selection_reason": _worker_selection_reason(worker_agent_id=worker_agent_id, queued=queued),
             "worker_result": None,
             "claimed_step_id": None,
             "step_status": None,
@@ -374,6 +393,7 @@ async def run_worker_agent(
             node_id=end_node_id,
             payload={
                 "task_id": task_id,
+                "parent_run_id": parent_run_id,
                 "summary": summary,
                 "worker_id": worker.worker_id,
                 "worker_agent_id": agent_id,
@@ -396,7 +416,7 @@ async def run_worker_agent(
             "worker_id": worker.worker_id,
             "child_run_id": run_id,
             "stream_id": run_id,
-            "selection_reason": "first_idle" if worker_agent_id is None else "specified_worker",
+            "selection_reason": _worker_selection_reason(worker_agent_id=worker_agent_id, queued=queued),
             "worker_result": worker_result or {"text": final_text},
             **summary,
         }
@@ -430,6 +450,7 @@ async def run_worker_agent(
             node_id=end_node_id,
             payload={
                 "task_id": task_id,
+                "parent_run_id": parent_run_id,
                 "code": ErrorCode.TIMEOUT.value,
                 "message": "worker agent timed out",
                 "worker_id": worker.worker_id,
@@ -473,6 +494,7 @@ async def run_worker_agent(
             node_id=end_node_id,
             payload={
                 "task_id": task_id,
+                "parent_run_id": parent_run_id,
                 "worker_id": worker.worker_id,
                 "worker_agent_id": agent_id,
                 "child_run_id": run_id,
@@ -517,6 +539,7 @@ async def run_worker_agent(
             node_id=end_node_id,
             payload={
                 "task_id": task_id,
+                "parent_run_id": parent_run_id,
                 "code": str(code),
                 "message": message_text,
                 "worker_id": worker.worker_id,
@@ -535,4 +558,96 @@ async def run_worker_agent(
         self._worker_run_tasks.pop(run_id, None)
         self._worker_run_meta.pop(run_id, None)
         self.worker_runtime.mark_idle(worker)
+        _wake_next_worker_queue_item(self, worker.worker_id)
         await self._close_child_run_stream(run_id)
+
+
+async def _wait_for_worker_queue_turn(
+    runtime: Any,
+    *,
+    session_id: str,
+    parent_run_id: str,
+    parent_agent_id: str,
+    task_id: str,
+    worker_pool_id: str | None,
+    worker_agent_id: str,
+    parent_handle: RunHandle | None,
+) -> str:
+    worker = runtime.worker_runtime._workers.get(worker_agent_id) or runtime.worker_runtime._worker_by_agent_id(  # noqa: SLF001
+        worker_agent_id,
+        session_id=session_id,
+    )
+    if worker is None:
+        raise AgentCoreError(ErrorCode.WORKER_NOT_AVAILABLE, f"worker not available: {worker_agent_id}")
+    if worker_pool_id is not None and worker.pool_id != worker_pool_id:
+        raise AgentCoreError(ErrorCode.WORKER_NOT_AVAILABLE, f"worker {worker_agent_id} is not in pool {worker_pool_id}")
+    queue = runtime._worker_queues[worker.worker_id]
+    if len(queue) >= runtime._worker_queue_limit:
+        raise AgentCoreError(ErrorCode.WORKER_QUEUE_FULL, "worker queue full", details={"worker_id": worker.worker_id})
+    from agent_core.types.common import utc_iso
+
+    future = asyncio.get_running_loop().create_future()
+    queue_id = new_id("worker_queue")
+    now = utc_iso()
+    item = {
+        "queue_id": queue_id,
+        "worker_id": worker.worker_id,
+        "worker_agent_id": worker_agent_id,
+        "session_id": session_id,
+        "parent_run_id": parent_run_id,
+        "parent_agent_id": parent_agent_id,
+        "task_id": task_id,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "future": future,
+        "cancelled": False,
+    }
+    queue.append(item)
+    await runtime._emit_child_run_event(
+        stream=None,
+        mirror_handle=parent_handle,
+        session_id=session_id,
+        agent_id=parent_agent_id,
+        run_id=parent_run_id,
+        event_type="worker_queued",
+        payload={
+            "queue_id": queue_id,
+            "worker_id": worker.worker_id,
+            "worker_agent_id": worker_agent_id,
+            "task_id": task_id,
+            "parent_run_id": parent_run_id,
+            "position": len(queue),
+        },
+    )
+    if worker.status == "idle":
+        _wake_next_worker_queue_item(runtime, worker.worker_id)
+    try:
+        return await future
+    except asyncio.CancelledError:
+        runtime.cancel_worker_queue_item(queue_id)
+        raise
+
+
+def _wake_next_worker_queue_item(runtime: Any, worker_id: str) -> None:
+    queue = runtime._worker_queues.get(worker_id)
+    if not queue:
+        return
+    from agent_core.types.common import utc_iso
+
+    while queue:
+        item = queue.popleft()
+        if item.get("cancelled"):
+            continue
+        item["status"] = "dequeued"
+        item["updated_at"] = utc_iso()
+        future = item.get("future")
+        if future is not None and not future.done():
+            future.set_result(item["worker_agent_id"])
+        break
+
+
+def _worker_selection_reason(*, worker_agent_id: str | None, queued: bool) -> str:
+    if queued:
+        return "queued_worker"
+    return "first_idle" if worker_agent_id is None else "specified_worker"

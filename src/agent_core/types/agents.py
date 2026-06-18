@@ -16,6 +16,5 @@ class AgentDefinition(StrictModel):
     suggested_tools: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     overrides: str | None = None
-    source: Literal["builtin", "user", "code"]
+    source: Literal["builtin", "user", "code", "json", "dynamic", "config"]
     metadata: dict[str, Any] = Field(default_factory=dict)
-

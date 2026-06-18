@@ -123,7 +123,7 @@ def test_wheel_build_config_includes_typed_marker_and_assets() -> None:
 
     assert scripts["agentcli"] == "agent_cli.cli:main"
     assert "soong-agent" not in scripts
-    assert wheel["packages"] == ["src/agent_core", "src/agent_cli"]
+    assert wheel["packages"] == ["src/agent_core", "src/agent_cli", "src/agent_hub"]
     assert "src/agent_core/py.typed" in wheel["include"]
     assert "src/agent_cli/py.typed" in wheel["include"]
     assert "src/agent_core/assets/**/*.md" in wheel["include"]
@@ -331,6 +331,7 @@ async def test_tui_slash_suggestions_filter_and_complete(isolated_dirs) -> None:
         assert suggestions.display is True
         text = str(suggestions.render())
         assert "/help" in text
+        assert "/plan" in text
         assert "/session" in text
 
         prompt.load_text("/z")
@@ -699,6 +700,41 @@ async def test_tui_bare_skill_slash_shows_usage_without_loading(isolated_dirs, m
         text = _tui_text(app)
         assert "usage: /review <message>" in text
         assert app.runtime is None
+
+
+@pytest.mark.asyncio
+async def test_tui_slash_plan_runs_plan_request_message(
+    isolated_dirs, monkeypatch, scripted_ollama: ScriptedOllama
+) -> None:
+    pytest.importorskip("textual")
+    from agent_cli.tui import PromptTextArea, SoongAgentTui
+
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    scripted_ollama.enqueue_text("plan queued")
+    scripted_ollama.enqueue_text(_memory_intent_response())
+    monkeypatch.setattr("agent_core.api.runtime.default_provider_registry", lambda: scripted_ollama.provider_registry())
+    args = type(
+        "Args",
+        (),
+        {"session_id": "sess_tui_plan", "orchestrator": False, "path": str(project), "debug_events": False},
+    )()
+    app = SoongAgentTui(args)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptTextArea)
+
+        prompt.load_text("/plan build auth flow")
+        await app._submit_prompt()
+        await pilot.pause()
+        await asyncio.wait_for(app.event_task, timeout=2)
+
+        text = _tui_text(app)
+        assert "/plan build auth flow" in text
+
+    request_text = "\n".join(str(message.get("content") or "") for message in scripted_ollama.requests[0].get("messages", []))
+    assert "Create a plan for: build auth flow." in request_text
+    assert "Use agent.plan_template" in request_text
+    assert "suggested project plan directory" in request_text
 
 
 @pytest.mark.asyncio

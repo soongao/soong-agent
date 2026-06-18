@@ -6,9 +6,11 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from agent_core.agents.dynamic import WorkerConfigView
 from agent_core.storage.codecs import event_from_row, model_dump, node_from_row
 from agent_core.storage.ids import sanitize_session_id
 from agent_core.storage.migrations import ensure_session_tables, migrate
+from agent_core.types.agents import AgentDefinition
 from agent_core.types.common import utc_iso, utc_now
 from agent_core.types.content import ContentBlock
 from agent_core.types.runtime import Node, RuntimeEvent
@@ -133,7 +135,15 @@ class SQLiteStore:
             )
             self._conn.commit()
 
-    async def create_run(self, *, run_id: str, session_id: str, agent_id: str, status: str) -> None:
+    async def create_run(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        agent_id: str,
+        status: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         async with self._lock:
             now = utc_iso()
             self._conn.execute(
@@ -141,9 +151,9 @@ class SQLiteStore:
                 INSERT INTO runs(
                     run_id, session_id, agent_id, status, start_node_id, end_node_id,
                     end_reason, turn_count, usage_json, error_json, metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, NULL, '{}', ?, ?)
+                ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, NULL, ?, ?, ?)
                 """,
-                (run_id, session_id, agent_id, status, now, now),
+                (run_id, session_id, agent_id, status, json.dumps(metadata or {}, ensure_ascii=False), now, now),
             )
             self._conn.commit()
 
@@ -327,6 +337,21 @@ class SQLiteStore:
             rows = self._conn.execute(
                 f"""
                 SELECT * FROM nodes_{session_id}
+                ORDER BY node_seq DESC
+                LIMIT ? OFFSET ?
+                """,
+                (max(limit, 0), max(offset, 0)),
+            ).fetchall()
+        return [node_from_row(row) for row in rows]
+
+    async def list_branchable_nodes(self, session_id: str, *, limit: int = 100, offset: int = 0) -> list[Node]:
+        session_id = sanitize_session_id(session_id)
+        async with self._lock:
+            ensure_session_tables(self._conn, session_id)
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM nodes_{session_id}
+                WHERE role = 'user' AND node_type = 'message'
                 ORDER BY node_seq DESC
                 LIMIT ? OFFSET ?
                 """,
@@ -602,6 +627,202 @@ class SQLiteStore:
             )
             self._conn.commit()
 
+    async def upsert_dynamic_agent_definition(self, definition: AgentDefinition, *, source: str = "dynamic") -> None:
+        async with self._lock:
+            now = utc_iso()
+            existing = self._conn.execute(
+                "SELECT created_at FROM agent_definitions_dynamic WHERE agent_definition_id=?",
+                (definition.agent_definition_id,),
+            ).fetchone()
+            metadata = dict(definition.metadata)
+            metadata.setdefault("stored_source", source)
+            model_profile = definition.model_profile if isinstance(definition.model_profile, str) else None
+            model_json = (
+                json.dumps(definition.model_profile, ensure_ascii=False, sort_keys=True)
+                if isinstance(definition.model_profile, dict)
+                else None
+            )
+            self._conn.execute(
+                """
+                INSERT INTO agent_definitions_dynamic(
+                    agent_definition_id, name, description, model_profile, model_json,
+                    system_prompt, suggested_tools_json, tags_json, enabled, deleted_at,
+                    source, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?)
+                ON CONFLICT(agent_definition_id) DO UPDATE SET
+                    name=excluded.name,
+                    description=excluded.description,
+                    model_profile=excluded.model_profile,
+                    model_json=excluded.model_json,
+                    system_prompt=excluded.system_prompt,
+                    suggested_tools_json=excluded.suggested_tools_json,
+                    tags_json=excluded.tags_json,
+                    enabled=1,
+                    deleted_at=NULL,
+                    source=excluded.source,
+                    metadata_json=excluded.metadata_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    definition.agent_definition_id,
+                    definition.name,
+                    definition.description,
+                    model_profile,
+                    model_json,
+                    definition.body,
+                    json.dumps(definition.suggested_tools, ensure_ascii=False),
+                    json.dumps(definition.tags, ensure_ascii=False),
+                    source,
+                    json.dumps(metadata, ensure_ascii=False),
+                    existing["created_at"] if existing is not None else now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+
+    async def list_dynamic_agent_definitions(
+        self,
+        *,
+        include_disabled: bool = False,
+        include_deleted: bool = False,
+    ) -> list[AgentDefinition]:
+        async with self._lock:
+            clauses = []
+            if not include_disabled:
+                clauses.append("enabled=1")
+            if not include_deleted:
+                clauses.append("deleted_at IS NULL")
+            where = "WHERE " + " AND ".join(clauses) if clauses else ""
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM agent_definitions_dynamic
+                {where}
+                ORDER BY agent_definition_id
+                """
+            ).fetchall()
+        return [_dynamic_agent_definition_from_row(row) for row in rows]
+
+    async def upsert_dynamic_worker_config(self, worker: WorkerConfigView, *, source: str = "dynamic") -> WorkerConfigView:
+        async with self._lock:
+            now = utc_iso()
+            existing = self._conn.execute(
+                "SELECT created_at FROM worker_configs_dynamic WHERE worker_id=?",
+                (worker.worker_id,),
+            ).fetchone()
+            created_at = existing["created_at"] if existing is not None else now
+            self._conn.execute(
+                """
+                INSERT INTO worker_configs_dynamic(
+                    worker_id, worker_pool_id, agent_definition_id, name, description,
+                    system_prompt, model_profile, model_json, allowed_tools_json,
+                    enabled, deleted_at, source, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(worker_id) DO UPDATE SET
+                    worker_pool_id=excluded.worker_pool_id,
+                    agent_definition_id=excluded.agent_definition_id,
+                    name=excluded.name,
+                    description=excluded.description,
+                    system_prompt=excluded.system_prompt,
+                    model_profile=excluded.model_profile,
+                    model_json=excluded.model_json,
+                    allowed_tools_json=excluded.allowed_tools_json,
+                    enabled=excluded.enabled,
+                    deleted_at=excluded.deleted_at,
+                    source=excluded.source,
+                    metadata_json=excluded.metadata_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    worker.worker_id,
+                    worker.worker_pool_id,
+                    worker.agent_definition_id,
+                    worker.name,
+                    worker.description,
+                    worker.system_prompt,
+                    worker.model_profile,
+                    json.dumps(worker.model, ensure_ascii=False, sort_keys=True) if worker.model is not None else None,
+                    json.dumps(worker.allowed_tools, ensure_ascii=False) if worker.allowed_tools is not None else None,
+                    1 if worker.enabled else 0,
+                    worker.deleted_at,
+                    source,
+                    json.dumps(worker.metadata, ensure_ascii=False),
+                    created_at,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        stored = await self.get_dynamic_worker_config(worker.worker_id, include_disabled=True, include_deleted=True)
+        assert stored is not None
+        return stored
+
+    async def get_dynamic_worker_config(
+        self,
+        worker_id: str,
+        *,
+        include_disabled: bool = True,
+        include_deleted: bool = True,
+    ) -> WorkerConfigView | None:
+        async with self._lock:
+            clauses = ["worker_id=?"]
+            if not include_disabled:
+                clauses.append("enabled=1")
+            if not include_deleted:
+                clauses.append("deleted_at IS NULL")
+            row = self._conn.execute(
+                f"SELECT * FROM worker_configs_dynamic WHERE {' AND '.join(clauses)}",
+                (worker_id,),
+            ).fetchone()
+        return _dynamic_worker_config_from_row(row) if row is not None else None
+
+    async def list_dynamic_worker_configs(
+        self,
+        *,
+        include_disabled: bool = True,
+        include_deleted: bool = False,
+    ) -> list[WorkerConfigView]:
+        async with self._lock:
+            clauses = []
+            if not include_disabled:
+                clauses.append("enabled=1")
+            if not include_deleted:
+                clauses.append("deleted_at IS NULL")
+            where = "WHERE " + " AND ".join(clauses) if clauses else ""
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM worker_configs_dynamic
+                {where}
+                ORDER BY worker_id
+                """
+            ).fetchall()
+        return [_dynamic_worker_config_from_row(row) for row in rows]
+
+    async def mark_dynamic_worker_enabled(self, worker_id: str, enabled: bool) -> WorkerConfigView | None:
+        async with self._lock:
+            self._conn.execute(
+                """
+                UPDATE worker_configs_dynamic
+                SET enabled=?, updated_at=?
+                WHERE worker_id=? AND deleted_at IS NULL
+                """,
+                (1 if enabled else 0, utc_iso(), worker_id),
+            )
+            self._conn.commit()
+        return await self.get_dynamic_worker_config(worker_id, include_disabled=True, include_deleted=True)
+
+    async def soft_delete_dynamic_worker_config(self, worker_id: str) -> WorkerConfigView | None:
+        async with self._lock:
+            now = utc_iso()
+            self._conn.execute(
+                """
+                UPDATE worker_configs_dynamic
+                SET enabled=0, deleted_at=COALESCE(deleted_at, ?), updated_at=?
+                WHERE worker_id=?
+                """,
+                (now, now, worker_id),
+            )
+            self._conn.commit()
+        return await self.get_dynamic_worker_config(worker_id, include_disabled=True, include_deleted=True)
+
     async def delete_artifact(self, artifact_id: str) -> None:
         async with self._lock:
             self._conn.execute("DELETE FROM artifacts WHERE artifact_id=?", (artifact_id,))
@@ -645,3 +866,63 @@ class SQLiteStore:
         async with self._lock:
             row = self._conn.execute("SELECT session_id FROM runs WHERE run_id=?", (run_id,)).fetchone()
             return row["session_id"] if row else None
+
+
+def _loads_json(value: str | None, default: Any) -> Any:
+    if value is None or value == "":
+        return default
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return default
+
+
+def _dynamic_agent_definition_from_row(row: sqlite3.Row) -> AgentDefinition:
+    model_json = _loads_json(row["model_json"], None)
+    model_profile = model_json if isinstance(model_json, dict) else row["model_profile"]
+    metadata = _loads_json(row["metadata_json"], {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata.update(
+        {
+            "enabled": bool(row["enabled"]),
+            "deleted_at": row["deleted_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+    )
+    return AgentDefinition(
+        agent_definition_id=row["agent_definition_id"],
+        name=row["name"],
+        description=row["description"],
+        body=row["system_prompt"] or "",
+        model_profile=model_profile,
+        suggested_tools=[str(item) for item in _loads_json(row["suggested_tools_json"], [])],
+        tags=[str(item) for item in _loads_json(row["tags_json"], [])],
+        overrides=None,
+        source="dynamic",
+        metadata=metadata,
+    )
+
+
+def _dynamic_worker_config_from_row(row: sqlite3.Row) -> WorkerConfigView:
+    metadata = _loads_json(row["metadata_json"], {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return WorkerConfigView(
+        worker_id=row["worker_id"],
+        worker_pool_id=row["worker_pool_id"],
+        agent_definition_id=row["agent_definition_id"],
+        name=row["name"] or row["worker_id"],
+        description=row["description"] or "",
+        system_prompt=row["system_prompt"],
+        model_profile=row["model_profile"],
+        model=_loads_json(row["model_json"], None),
+        allowed_tools=_loads_json(row["allowed_tools_json"], None),
+        enabled=bool(row["enabled"]),
+        deleted_at=row["deleted_at"],
+        source=row["source"],
+        metadata=metadata,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )

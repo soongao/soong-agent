@@ -23,6 +23,7 @@ class AnthropicProvider(ProviderAdapter):
         self.config = config
         self.base_url = (getattr(config, "base_url", None) or "https://api.anthropic.com").rstrip("/")
         self.model = getattr(config, "name", "")
+        self.api_key = getattr(config, "api_key", None) or ""
         self.api_key_env = getattr(config, "api_key_env", "") or ""
         self.retry = getattr(config, "retry", None)
         timeout_ms = getattr(config, "timeout_ms", 60000) or 60000
@@ -45,7 +46,7 @@ class AnthropicProvider(ProviderAdapter):
                 )
                 return
         else:
-            api_key = ""
+            api_key = self.api_key
         payload = build_anthropic_payload(request)
         known_names = {tool.name for tool in request.tools}
         headers = {

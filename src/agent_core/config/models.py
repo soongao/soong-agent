@@ -16,6 +16,7 @@ class RetryConfig(StrictModel):
 class ModelConfig(StrictModel):
     provider: Literal["openai", "anthropic", "ollama"] | str
     base_url: str | None = None
+    api_key: str | None = None
     api_key_env: str | None = ""
     name: str
     context_window: int = 8192

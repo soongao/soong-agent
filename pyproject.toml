@@ -15,6 +15,8 @@ dependencies = [
     "PyYAML>=6.0",
     "rich>=13",
     "textual>=0.85",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -25,9 +27,10 @@ test = [
 
 [project.scripts]
 agentcli = "agent_cli.cli:main"
+agenthub-backend = "agent_hub.backend.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agent_core", "src/agent_cli"]
+packages = ["src/agent_core", "src/agent_cli", "src/agent_hub"]
 include = [
     "src/agent_core/py.typed",
     "src/agent_cli/py.typed",

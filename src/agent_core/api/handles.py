@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from typing import Any
 from typing import TYPE_CHECKING
 
 from agent_core.events import EventStream
@@ -24,6 +25,7 @@ class RunHandle:
     _task: asyncio.Task | None = None
     _queued: bool = False
     _message: object | None = None
+    directives: dict[str, Any] | None = None
 
     def events(self, debug: bool = False) -> AsyncIterator[RuntimeEvent]:
         return _filtered_events(self._stream, debug=debug)

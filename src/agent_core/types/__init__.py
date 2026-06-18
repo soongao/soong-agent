@@ -1,3 +1,12 @@
+from agent_core.agents.dynamic import (
+    MentionedWorkerDirective,
+    RunDirectives,
+    WorkerConfigCreate,
+    WorkerConfigUpdate,
+    WorkerConfigView,
+    WorkerMentionResolution,
+    WorkerQueueItem,
+)
 from agent_core.types.agents import AgentDefinition
 from agent_core.types.common import ErrorPayload, StrictModel
 from agent_core.types.content import (
@@ -10,6 +19,7 @@ from agent_core.types.content import (
 )
 from agent_core.types.permissions import PermissionDecision, PermissionDecisionKind, PermissionRequest
 from agent_core.types.runtime import (
+    BranchableNodeView,
     CancelResult,
     CleanupResult,
     DeleteSessionResult,
@@ -32,6 +42,7 @@ from agent_core.types.tools import ToolCall, ToolDefinition, ToolResult
 __all__ = [
     "AgentDefinition",
     "ArtifactRefBlock",
+    "BranchableNodeView",
     "CancelResult",
     "CleanupResult",
     "ContentBlock",
@@ -41,11 +52,13 @@ __all__ = [
     "InspectResult",
     "JsonBlock",
     "LoadSkillResult",
+    "MentionedWorkerDirective",
     "Node",
     "PermissionDecision",
     "PermissionDecisionKind",
     "PermissionRequest",
     "ReplayResult",
+    "RunDirectives",
     "RunMode",
     "RunStatus",
     "RuntimeEvent",
@@ -61,4 +74,9 @@ __all__ = [
     "ToolResult",
     "ToolResultBlock",
     "UserMessage",
+    "WorkerConfigCreate",
+    "WorkerConfigUpdate",
+    "WorkerConfigView",
+    "WorkerMentionResolution",
+    "WorkerQueueItem",
 ]

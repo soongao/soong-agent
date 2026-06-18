@@ -74,6 +74,7 @@ async def execute_tool_calls(runtime: Any, handle: RunHandle, calls: list[ToolCa
             "agent_definitions": runtime.agent_definitions,
             "context_state": runtime._context_state_for_session(handle.session_id),
             "runtime": runtime,
+            "run_directives": handle.directives or {},
         },
         hooks=runtime._hooks,
     )

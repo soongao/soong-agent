@@ -6,6 +6,7 @@ SLASH_COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("clear", "/clear", "clear the transcript"),
     ("new", "/new [session_id]", "start a fresh session"),
     ("mode", "/mode [normal|orchestrator]", "show or set run mode"),
+    ("plan", "/plan <goal>", "create and write a plan for a goal"),
     ("session", "/session", "show current session details"),
     ("sessions", "/sessions [n]", "list recent sessions"),
     ("use", "/use <session_id>", "switch current session"),
@@ -50,3 +51,10 @@ def slash_help_text() -> str:
     rows.extend(f"{usage} - {description}" for _name, usage, description in SLASH_COMMANDS)
     rows.append("/<skill_name> <message> - load a skill and run the message")
     return "\n".join(rows)
+
+
+def plan_request_message(goal: str) -> str:
+    return (
+        f"Create a plan for: {goal}. "
+        "Use agent.plan_template, then write the plan Markdown to the suggested project plan directory."
+    )
