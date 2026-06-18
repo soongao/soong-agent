@@ -10,6 +10,7 @@ import pytest
 from agent_core import AgentRuntime
 from agent_core.agents.registry import AgentDefinitionRegistry
 from agent_core.agents.workers import WorkerPoolRuntime
+from agent_core.api.runtime_helpers.agents.worker_executor import WorkerExecutorContext, WorkerExecutorResult
 from agent_core.artifacts import ArtifactManager
 from agent_core.config import load_config, load_runtime_config
 from agent_core.errors import ConfigError
@@ -21,6 +22,7 @@ from agent_core.tools.agent_tools import register_agent_tools
 from agent_core.tools.execution import ToolExecutionContext
 from agent_core.tools.registry import ToolRegistry
 from agent_core.types.permissions import PermissionDecision, PermissionDecisionKind
+from agent_core.types.content import JsonBlock, ToolResultBlock
 from agent_core.types.tools import ToolCall
 from tests.conftest import write_config
 from tests.fixtures.scripted_ollama import ScriptedOllama, text_response, tool_call_response
@@ -199,11 +201,19 @@ def _payload_text(payload: dict) -> str:
 
 def _is_worker_payload(payload: dict) -> bool:
     text = _payload_text(payload)
-    return "Task id: task1" in text and "Worker pool:" in text
+    return "Task id:" in text and "Worker pool:" in text
 
 
 def _payload_tool_names(payload: dict) -> set[str]:
     return {tool["function"]["name"].replace("__", ".") for tool in payload.get("tools", [])}
+
+
+def _message_texts(payload: dict) -> list[str]:
+    return [str(message.get("content") or "") for message in payload.get("messages", [])]
+
+
+def _payload_json(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _worker_payloads(scripted_ollama: ScriptedOllama) -> list[dict]:
@@ -486,6 +496,7 @@ async def test_runtime_dispatch_worker_runs_worker_agent_and_updates_step(isolat
     replay_events = [event.event_type for event in replay.events]
     assert "worker_run_started" in replay_events
     assert "worker_run_completed" in replay_events
+    assert "worker_text_delta" in events
     assert "tool_completed" in events
     worker_requests = _worker_payloads(scripted_ollama)
     assert worker_requests
@@ -531,6 +542,206 @@ async def test_runtime_dispatch_worker_runs_worker_agent_and_updates_step(isolat
 
 
 @pytest.mark.asyncio
+async def test_worker_agent_restores_own_context_between_dispatches(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama, worker_pool=True)
+
+    async def allow(_request):
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
+        await runtime._ensure_started()
+        assert runtime.store and runtime.paths and runtime.config and runtime.artifacts
+        await runtime.store.ensure_session(
+            session_id="sess_worker_context",
+            cwd=str(project),
+            root_agent_id=runtime._root_agent_id(session_id="sess_worker_context", mode="orchestrator"),
+        )
+        root_agent_id = runtime._root_agent_id(session_id="sess_worker_context", mode="orchestrator")
+        parent_node = await runtime.store.add_node(
+            session_id="sess_worker_context",
+            parent_id=None,
+            agent_id=root_agent_id,
+            run_id="run_parent_1",
+            role="user",
+            node_type="message",
+            content=[JsonBlock(data={"prompt": "root"})],
+            make_active=True,
+        )
+        context = ToolExecutionContext(
+            session_id="sess_worker_context",
+            run_id="run_parent_1",
+            agent_id=root_agent_id,
+            agent_role="orchestrator",
+            project_dir=project,
+            home_dir=home,
+            config=runtime.config,
+            artifact_manager=runtime.artifacts,
+            permission_callback=allow,
+            permission_cache=PermissionSessionCache(),
+        )
+        runtime.task_service.create_task(
+            context,
+            {
+                "task_id": "task1",
+                "wal_name": "task1.wal.jsonl",
+                "title": "Task 1",
+                "summary": "",
+                "steps": [{"step_id": "s1", "title": "Step 1"}],
+            },
+        )
+        runtime.task_service.create_task(
+            context,
+            {
+                "task_id": "task2",
+                "wal_name": "task2.wal.jsonl",
+                "title": "Task 2",
+                "summary": "",
+                "steps": [{"step_id": "s2", "title": "Step 2"}],
+            },
+        )
+        scripted_ollama.enqueue_text("first worker answer")
+        first = await runtime.run_worker_agent(
+            session_id="sess_worker_context",
+            parent_run_id="run_parent_1",
+            parent_agent_id=root_agent_id,
+            task_id="task1",
+            instruction="remember alpha",
+        )
+        tool_anchor = await runtime.store.add_node(
+            session_id="sess_worker_context",
+            parent_id=parent_node.node_id,
+            agent_id=root_agent_id,
+            run_id="run_parent_1",
+            role="tool",
+            node_type="message",
+            content=[
+                ToolResultBlock(
+                    tool_call_id="dispatch",
+                    content=[JsonBlock(data={"worker_start_node_id": first["worker_start_node_id"], "worker_end_node_id": first["worker_end_node_id"]})],
+                )
+            ],
+            make_active=True,
+        )
+        scripted_ollama.enqueue_text("second worker answer")
+        await runtime.run_worker_agent(
+            session_id="sess_worker_context",
+            parent_run_id="run_parent_2",
+            parent_agent_id=root_agent_id,
+            task_id="task2",
+            instruction="use prior context",
+        )
+
+    worker_requests = _worker_payloads(scripted_ollama)
+    assert len(worker_requests) == 2
+    second_payload = _payload_json(worker_requests[1])
+    assert "remember alpha" in second_payload
+    assert "first worker answer" in second_payload
+    assert "use prior context" in second_payload
+    assert tool_anchor.node_id
+
+
+@pytest.mark.asyncio
+async def test_worker_agent_context_isolated_by_worker_id(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    config_path = _write_ollama_config(home, scripted_ollama, worker_pool=True)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + """
+
+[[agents.worker_pools.workers]]
+worker_id = "worker2"
+agent_definition_id = "default_worker_agent"
+allowed_tools = ["agent.task_get", "agent.task_query_steps", "agent.task_claim_step", "agent.task_update_step", "code.read_file"]
+""",
+        encoding="utf-8",
+    )
+
+    async def allow(_request):
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
+        await runtime._ensure_started()
+        assert runtime.store and runtime.paths and runtime.config and runtime.artifacts
+        session_id = "sess_worker_context_isolated"
+        root_agent_id = runtime._root_agent_id(session_id=session_id, mode="orchestrator")
+        await runtime.store.ensure_session(session_id=session_id, cwd=str(project), root_agent_id=root_agent_id)
+        parent_node = await runtime.store.add_node(
+            session_id=session_id,
+            parent_id=None,
+            agent_id=root_agent_id,
+            run_id="run_parent_1",
+            role="user",
+            node_type="message",
+            content=[JsonBlock(data={"prompt": "root"})],
+            make_active=True,
+        )
+        context = ToolExecutionContext(
+            session_id=session_id,
+            run_id="run_parent_1",
+            agent_id=root_agent_id,
+            agent_role="orchestrator",
+            project_dir=project,
+            home_dir=home,
+            config=runtime.config,
+            artifact_manager=runtime.artifacts,
+            permission_callback=allow,
+            permission_cache=PermissionSessionCache(),
+        )
+        for task_id, step_id in [("task1", "s1"), ("task2", "s2")]:
+            runtime.task_service.create_task(
+                context,
+                {
+                    "task_id": task_id,
+                    "wal_name": f"{task_id}.wal.jsonl",
+                    "title": task_id,
+                    "summary": "",
+                    "steps": [{"step_id": step_id, "title": step_id}],
+                },
+            )
+        scripted_ollama.enqueue_text("worker one private answer")
+        first = await runtime.run_worker_agent(
+            session_id=session_id,
+            parent_run_id="run_parent_1",
+            parent_agent_id=root_agent_id,
+            task_id="task1",
+            instruction="worker one private task",
+            worker_agent_id=runtime._worker_agent_id(session_id=session_id, worker_id="worker1"),
+        )
+        await runtime.store.add_node(
+            session_id=session_id,
+            parent_id=parent_node.node_id,
+            agent_id=root_agent_id,
+            run_id="run_parent_1",
+            role="tool",
+            node_type="message",
+            content=[
+                ToolResultBlock(
+                    tool_call_id="dispatch",
+                    content=[JsonBlock(data={"worker_start_node_id": first["worker_start_node_id"], "worker_end_node_id": first["worker_end_node_id"]})],
+                )
+            ],
+            make_active=True,
+        )
+        scripted_ollama.enqueue_text("worker two answer")
+        await runtime.run_worker_agent(
+            session_id=session_id,
+            parent_run_id="run_parent_2",
+            parent_agent_id=root_agent_id,
+            task_id="task2",
+            instruction="worker two new task",
+            worker_agent_id=runtime._worker_agent_id(session_id=session_id, worker_id="worker2"),
+        )
+
+    worker_requests = _worker_payloads(scripted_ollama)
+    assert len(worker_requests) == 2
+    second_payload = _payload_json(worker_requests[1])
+    assert "worker one private task" not in second_payload
+    assert "worker one private answer" not in second_payload
+    assert "worker two new task" in second_payload
+
+
+@pytest.mark.asyncio
 async def test_runtime_worker_cannot_claim_step_outside_dispatch_scope(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
     home, project = isolated_dirs
     _write_ollama_config(home, scripted_ollama, worker_pool=True)
@@ -559,6 +770,136 @@ async def test_runtime_worker_cannot_claim_step_outside_dispatch_scope(isolated_
     steps = {step["step_id"]: step for step in task_get["task"]["steps"]}
     assert steps["s1"]["status"] == "ready"
     assert steps["s2"]["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_runtime_dispatches_external_worker_executor_and_skips_core_tool_validation(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama, worker_pool=True)
+
+    async def allow(_request):
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    class RecordingExecutor:
+        def __init__(self) -> None:
+            self.contexts: list[WorkerExecutorContext] = []
+
+        async def run(self, _runtime, context: WorkerExecutorContext) -> WorkerExecutorResult:
+            self.contexts.append(context)
+            return WorkerExecutorResult(text="external worker result", metadata={"recording": True})
+
+    executor = RecordingExecutor()
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
+        await runtime.create_worker_config(
+            {
+                "worker_id": "external_worker",
+                "name": "External Worker",
+                "system_prompt": "External prompt.",
+                "allowed_tools": ["external.tool"],
+                "metadata": {"worker_executor": {"type": "recording_external", "config": {"flag": True}}},
+            }
+        )
+        runtime.register_worker_executor("recording_external", executor)
+        await runtime._ensure_started()
+        assert runtime.store and runtime.config and runtime.artifacts
+        session_id = "sess_external_worker"
+        root_agent_id = runtime._root_agent_id(session_id=session_id, mode="orchestrator")
+        await runtime.store.ensure_session(session_id=session_id, cwd=str(project), root_agent_id=root_agent_id)
+        context = ToolExecutionContext(
+            session_id=session_id,
+            run_id="run_parent",
+            agent_id=root_agent_id,
+            agent_role="orchestrator",
+            project_dir=project,
+            home_dir=home,
+            config=runtime.config,
+            artifact_manager=runtime.artifacts,
+            permission_callback=allow,
+            permission_cache=PermissionSessionCache(),
+        )
+        runtime.task_service.create_task(
+            context,
+            {
+                "task_id": "task_external",
+                "wal_name": "task_external.wal.jsonl",
+                "title": "Task",
+                "summary": "",
+                "steps": [{"step_id": "s1", "title": "Step"}],
+            },
+        )
+        result = await runtime.run_worker_agent(
+            session_id=session_id,
+            parent_run_id="run_parent",
+            parent_agent_id=root_agent_id,
+            task_id="task_external",
+            instruction="delegate",
+            worker_agent_id=runtime._worker_agent_id(session_id=session_id, worker_id="external_worker"),
+            allowed_tools=["external.tool"],
+        )
+
+    assert executor.contexts
+    assert executor.contexts[0].executor_config == {"flag": True}
+    assert result["worker_result"]["text"] == "external worker result"
+    assert result["claimed_step_id"] == "s1"
+    assert result["step_status"] == "completed"
+    assert scripted_ollama.requests == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_unknown_external_worker_executor_fails_step(isolated_dirs, scripted_ollama: ScriptedOllama) -> None:
+    home, project = isolated_dirs
+    _write_ollama_config(home, scripted_ollama, worker_pool=True)
+
+    async def allow(_request):
+        return PermissionDecision(decision=PermissionDecisionKind.ALLOW_ONCE)
+
+    async with _runtime(project, scripted_ollama, permission_callback=allow) as runtime:
+        await runtime.create_worker_config(
+            {
+                "worker_id": "missing_external",
+                "name": "Missing External",
+                "system_prompt": "External prompt.",
+                "metadata": {"worker_executor": {"type": "missing_executor"}},
+            }
+        )
+        await runtime._ensure_started()
+        assert runtime.store and runtime.config and runtime.artifacts
+        session_id = "sess_missing_external"
+        root_agent_id = runtime._root_agent_id(session_id=session_id, mode="orchestrator")
+        await runtime.store.ensure_session(session_id=session_id, cwd=str(project), root_agent_id=root_agent_id)
+        context = ToolExecutionContext(
+            session_id=session_id,
+            run_id="run_parent",
+            agent_id=root_agent_id,
+            agent_role="orchestrator",
+            project_dir=project,
+            home_dir=home,
+            config=runtime.config,
+            artifact_manager=runtime.artifacts,
+            permission_callback=allow,
+            permission_cache=PermissionSessionCache(),
+        )
+        runtime.task_service.create_task(
+            context,
+            {
+                "task_id": "task_missing_external",
+                "wal_name": "task_missing_external.wal.jsonl",
+                "title": "Task",
+                "summary": "",
+                "steps": [{"step_id": "s1", "title": "Step"}],
+            },
+        )
+        with pytest.raises(Exception) as exc:
+            await runtime.run_worker_agent(
+                session_id=session_id,
+                parent_run_id="run_parent",
+                parent_agent_id=root_agent_id,
+                task_id="task_missing_external",
+                instruction="delegate",
+                worker_agent_id=runtime._worker_agent_id(session_id=session_id, worker_id="missing_external"),
+            )
+
+    assert "worker executor not registered" in str(exc.value)
 
 
 @pytest.mark.asyncio

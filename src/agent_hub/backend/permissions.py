@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -19,6 +20,7 @@ class PermissionBridge:
         self._db = db
         self._events = events
         self._pending: dict[str, asyncio.Future[PermissionDecision]] = {}
+        self._external_pending: dict[str, asyncio.Future[str]] = {}
         self._session_conversations: dict[str, str] = {}
 
     def bind_session(self, *, core_session_id: str, conversation_id: str) -> None:
@@ -80,6 +82,75 @@ class PermissionBridge:
         finally:
             self._pending.pop(permission_request_id, None)
 
+    async def external_permission_callback(
+        self,
+        *,
+        core_session_id: str,
+        core_run_id: str | None,
+        tool_name: str,
+        permission: str,
+        args_summary: str,
+        target_scope: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        conversation_id = self._session_conversations.get(core_session_id)
+        if conversation_id is None:
+            return "reject"
+        permission_request_id = new_id("perm")
+        now = utc_iso()
+        request_metadata = {"source": "external_worker", **(metadata or {})}
+        await self._db.conn.execute(
+            """
+            INSERT INTO permission_requests(
+                permission_request_id, conversation_id, core_session_id, core_run_id,
+                tool_name, permission, target_scope, args_summary, status,
+                decision, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, ?)
+            """,
+            (
+                permission_request_id,
+                conversation_id,
+                core_session_id,
+                core_run_id,
+                tool_name,
+                permission,
+                target_scope,
+                args_summary,
+                json.dumps(request_metadata, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        await self._db.conn.commit()
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._external_pending[permission_request_id] = future
+        await self._events.publish(
+            "permission_requested",
+            conversation_id=conversation_id,
+            payload={
+                "permission_request_id": permission_request_id,
+                "tool_name": tool_name,
+                "permission": permission,
+                "target_scope": target_scope,
+                "args_summary": args_summary,
+                "suggested_decision": "deny",
+                "metadata": request_metadata,
+            },
+        )
+        logger.info(
+            "external permission requested permission_request_id=%s conversation_id=%s session_id=%s run_id=%s tool=%s permission=%s",
+            permission_request_id,
+            conversation_id,
+            core_session_id,
+            core_run_id,
+            tool_name,
+            permission,
+        )
+        try:
+            return await future
+        finally:
+            self._external_pending.pop(permission_request_id, None)
+
     async def decide(self, permission_request_id: str, decision: str) -> dict[str, Any]:
         row = await (
             await self._db.conn.execute(
@@ -96,11 +167,6 @@ class PermissionBridge:
                 f"Permission request already resolved: {permission_request_id}",
                 {"status": row["status"], "decision": row["decision"]},
             )
-        kind = {
-            "allow_once": PermissionDecisionKind.ALLOW_ONCE,
-            "allow_for_session": PermissionDecisionKind.ALLOW_FOR_SESSION,
-            "deny": PermissionDecisionKind.DENY,
-        }[decision]
         status = "allowed" if decision.startswith("allow") else "denied"
         await self._db.conn.execute(
             """
@@ -111,9 +177,18 @@ class PermissionBridge:
             (status, decision, utc_iso(), permission_request_id),
         )
         await self._db.conn.commit()
-        future = self._pending.get(permission_request_id)
-        if future is not None and not future.done():
-            future.set_result(PermissionDecision(decision=kind))
+        external_future = self._external_pending.get(permission_request_id)
+        if external_future is not None and not external_future.done():
+            external_future.set_result(_external_option_id(decision))
+        else:
+            kind = {
+                "allow_once": PermissionDecisionKind.ALLOW_ONCE,
+                "allow_for_session": PermissionDecisionKind.ALLOW_FOR_SESSION,
+                "deny": PermissionDecisionKind.DENY,
+            }[decision]
+            future = self._pending.get(permission_request_id)
+            if future is not None and not future.done():
+                future.set_result(PermissionDecision(decision=kind))
         await self._events.publish(
             "permission_resolved",
             conversation_id=row["conversation_id"],
@@ -157,5 +232,42 @@ class PermissionBridge:
                     permission_request_id,
                     row["conversation_id"],
                 )
+        for permission_request_id, future in list(self._external_pending.items()):
+            row = await (
+                await self._db.conn.execute(
+                    "SELECT conversation_id FROM permission_requests WHERE permission_request_id=?",
+                    (permission_request_id,),
+                )
+            ).fetchone()
+            if not future.done():
+                future.set_result("reject")
+            await self._db.conn.execute(
+                """
+                UPDATE permission_requests
+                SET status='cancelled', decision='deny', updated_at=?
+                WHERE permission_request_id=?
+                """,
+                (utc_iso(), permission_request_id),
+            )
+            if row is not None:
+                await self._events.publish(
+                    "permission_resolved",
+                    conversation_id=row["conversation_id"],
+                    payload={"permission_request_id": permission_request_id, "status": "cancelled", "decision": "deny"},
+                )
+                logger.info(
+                    "external permission cancelled on shutdown permission_request_id=%s conversation_id=%s",
+                    permission_request_id,
+                    row["conversation_id"],
+                )
         await self._db.conn.commit()
         self._pending.clear()
+        self._external_pending.clear()
+
+
+def _external_option_id(decision: str) -> str:
+    if decision == "allow_once":
+        return "allow_once"
+    if decision == "allow_for_session":
+        return "allow_always"
+    return "reject_once"

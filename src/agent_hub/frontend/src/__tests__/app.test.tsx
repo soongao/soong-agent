@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { AppStateProvider } from "../state/store";
+import type { WorkerView } from "../types";
 
 const mockHealth = {
   ok: true,
@@ -48,7 +49,7 @@ const forkedConversation = {
   last_message_preview: "forked",
 };
 
-const mockWorker = {
+const mockWorker: WorkerView = {
   worker_id: "reviewer",
   worker_pool_id: "default",
   agent_definition_id: "worker.reviewer",
@@ -66,6 +67,22 @@ const mockWorker = {
   current_step_id: null,
 };
 
+const mockExternalWorker: WorkerView = {
+  ...mockWorker,
+  worker_id: "opencode_worker",
+  agent_definition_id: "worker.opencode",
+  name: "OpenCode Worker",
+  description: "Uses an external executor.",
+  system_prompt: "External worker.",
+  allowed_tools: ["opencode.acp"],
+  metadata: {
+    worker_executor: {
+      type: "opencode",
+      config: { binary: "opencode", cwd: "/tmp/project", args: ["--pure"] },
+    },
+  },
+};
+
 let responses: Record<string, unknown>;
 
 function defaultResponses(): Record<string, unknown> {
@@ -73,6 +90,10 @@ function defaultResponses(): Record<string, unknown> {
     "/health": mockHealth,
     "/conversations": { conversations: [mockConversation, secondConversation] },
     "/workers": { workers: [mockWorker] },
+    "/conversations/conv_1/workers": { workers: [mockWorker] },
+    "/conversations/conv_2/workers": { workers: [] },
+    "/conversations/conv_new/workers": { workers: [] },
+    "/conversations/conv_fork/workers": { workers: [] },
     "/tools": {
       tools: [
         {
@@ -138,6 +159,7 @@ function defaultResponses(): Record<string, unknown> {
         },
       ],
     },
+    "/conversations/conv_new/messages": { messages: [] },
     "/conversations/conv_fork/messages": {
       messages: [
         {
@@ -237,6 +259,21 @@ beforeEach(() => {
         }
         return jsonResponse({ message_id: "msg_sent", conversation_id: "conv_1", core_session_id: "sess_1", core_run_id: "run_sent", status: "queued" });
       }
+      if (init?.method === "POST" && path.endsWith("/workers") && path.startsWith("/conversations/")) {
+        const payload = JSON.parse(String(init.body ?? "{}")) as { worker_id?: string };
+        const worker = workersResponse().find((item) => item.worker_id === payload.worker_id) ?? mockWorker;
+        const key = path;
+        const existing = ((responses[key] as { workers?: typeof mockWorker[] } | undefined)?.workers ?? []) as typeof mockWorker[];
+        responses[key] = { workers: [...existing.filter((item) => item.worker_id !== worker.worker_id), worker] };
+        return jsonResponse(worker);
+      }
+      if (init?.method === "DELETE" && path.startsWith("/conversations/") && path.includes("/workers/")) {
+        const workersPath = path.replace(/\/workers\/[^/]+$/, "/workers");
+        const workerId = decodeURIComponent(path.split("/").at(-1) ?? "");
+        const existing = ((responses[workersPath] as { workers?: typeof mockWorker[] } | undefined)?.workers ?? []) as typeof mockWorker[];
+        responses[workersPath] = { workers: existing.filter((item) => item.worker_id !== workerId) };
+        return jsonResponse({ removed: true, worker_id: workerId });
+      }
       if (init?.method === "POST" && path === "/conversations/conv_1/skills/brainstorming/load") {
         return jsonResponse({
           session_id: "sess_1",
@@ -257,13 +294,19 @@ beforeEach(() => {
         return jsonResponse({ cancelled: true });
       }
       if (init?.method === "POST" && path === "/workers/reviewer/disable") {
-        return jsonResponse({ ...mockWorker, enabled: false });
+        const worker = { ...mockWorker, enabled: false };
+        setWorkerResponses([worker]);
+        return jsonResponse(worker);
       }
       if (init?.method === "POST" && path === "/workers/reviewer/enable") {
-        return jsonResponse({ ...mockWorker, enabled: true });
+        const worker = { ...mockWorker, enabled: true };
+        setWorkerResponses([worker]);
+        return jsonResponse(worker);
       }
       if (init?.method === "DELETE" && path === "/workers/reviewer") {
-        return jsonResponse({ ...mockWorker, enabled: false, deleted_at: "2026-06-17T00:00:00Z" });
+        const worker = { ...mockWorker, enabled: false, deleted_at: "2026-06-17T00:00:00Z" };
+        setWorkerResponses([]);
+        return jsonResponse(worker);
       }
       if (init?.method === "PATCH" && path === "/workers/reviewer") {
         return jsonResponse(mockWorker);
@@ -289,23 +332,22 @@ describe("Agent Hub app", () => {
   });
 
   it("shows worker runtime and model summaries", async () => {
-    responses["/workers"] = {
-      workers: [
-        {
-          ...mockWorker,
-          status: "running",
-          queue_length: 2,
-          current_task_id: "task_review",
-          current_run_id: "run_review",
-          current_step_id: "step_review",
-          model: { provider: "openai", name: "qwen2.5:7b", api_key: "***" },
-        },
-      ],
+    const runningWorker = {
+      ...mockWorker,
+      status: "running",
+      queue_length: 2,
+      current_task_id: "task_review",
+      current_run_id: "run_review",
+      current_step_id: "step_review",
+      model: { provider: "openai", name: "qwen2.5:7b", api_key: "***" },
     };
+    setWorkerResponses([runningWorker]);
     renderApp();
-    expect(await screen.findByText("reviewer · running · queue 2")).toBeInTheDocument();
-    expect(await screen.findByText("task task_review · step step_review · run run_review")).toBeInTheDocument();
-    expect(await screen.findByText("openai · qwen2.5:7b")).toBeInTheDocument();
+    await screen.findByText("reviewer · running · queue 2");
+    const workerButton = screen.getByRole("button", { name: /View reviewer/i });
+    expect(within(workerButton).getByText("reviewer · running · queue 2")).toBeInTheDocument();
+    expect(within(workerButton).getByText("task task_review · step step_review · run run_review")).toBeInTheDocument();
+    expect(within(workerButton).getByText("openai · qwen2.5:7b")).toBeInTheDocument();
   });
 
   it("switches conversations and loads the selected message history", async () => {
@@ -372,6 +414,41 @@ describe("Agent Hub app", () => {
     expect(input).toHaveValue("@reviewer ");
   });
 
+  it("starts new conversations without workers and lets users add one", async () => {
+    renderApp();
+    fireEvent.click(await screen.findByLabelText("New conversation"));
+    expect(await screen.findByText("No workers added to this conversation.")).toBeInTheDocument();
+    const input = await screen.findByPlaceholderText("Message, @worker, or /help");
+    fireEvent.change(input, { target: { value: "@" } });
+    expect(await screen.findByText("@Orchestrator")).toBeInTheDocument();
+    expect(screen.queryByText("@reviewer")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Available workers/ }));
+    fireEvent.click(screen.getByLabelText("Add reviewer to conversation"));
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        "http://127.0.0.1:8765/conversations/conv_new/workers",
+        expect.objectContaining({ method: "POST", body: JSON.stringify({ worker_id: "reviewer" }) }),
+      );
+    });
+
+    fireEvent.change(input, { target: { value: "@r" } });
+    expect(await screen.findByText("@reviewer")).toBeInTheDocument();
+  });
+
+  it("collapses available workers by default and expands them on demand", async () => {
+    responses["/conversations/conv_1/workers"] = { workers: [] };
+    renderApp();
+    expect(await screen.findByText("No workers added to this conversation.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Conversation workers/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /Available workers/ })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByLabelText("Add reviewer to conversation")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Available workers/ }));
+    expect(screen.getByRole("button", { name: /Available workers/ })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByLabelText("Add reviewer to conversation")).toBeInTheDocument();
+  });
+
   it("shows backend send errors inline", async () => {
     renderApp();
     const input = await screen.findByPlaceholderText("Message, @worker, or /help");
@@ -379,6 +456,70 @@ describe("Agent Hub app", () => {
     fireEvent.click(screen.getByLabelText("Send"));
     expect(await screen.findByText("worker_not_found: worker not found: missing")).toBeInTheDocument();
     expect(input).toHaveValue("@missing inspect this");
+  });
+
+  it("shows sent messages immediately, reconciles SSE user messages, and labels empty running replies", async () => {
+    renderApp();
+    const input = await screen.findByPlaceholderText("Message, @worker, or /help");
+    fireEvent.change(input, { target: { value: "instant message" } });
+    fireEvent.click(screen.getByLabelText("Send"));
+
+    expect(await screen.findByText("instant message")).toBeInTheDocument();
+    expect(await screen.findByText("sending")).toBeInTheDocument();
+    await waitFor(() => expect(eventSources.length).toBeGreaterThan(0));
+
+    act(() => {
+      eventSources[0].dispatchEvent(
+        new MessageEvent("message_created", {
+          data: JSON.stringify({
+            id: "evt_user_sent",
+            type: "message_created",
+            conversation_id: "conv_1",
+            created_at: "2026-06-17T00:00:03Z",
+            payload: {
+              message_id: "msg_real_sent",
+              conversation_id: "conv_1",
+              sender_type: "user",
+              sender_name: "You",
+              target_type: "orchestrator",
+              target_id: "orchestrator",
+              original_text: "instant message",
+              display_text: "instant message",
+              status: "completed",
+              core_run_id: "run_sent",
+              created_at: "2026-06-17T00:00:03Z",
+              updated_at: "2026-06-17T00:00:03Z",
+            },
+          }),
+        }),
+      );
+      eventSources[0].dispatchEvent(
+        new MessageEvent("message_created", {
+          data: JSON.stringify({
+            id: "evt_empty_reply",
+            type: "message_created",
+            conversation_id: "conv_1",
+            created_at: "2026-06-17T00:00:04Z",
+            payload: {
+              message_id: "msg_empty_reply",
+              conversation_id: "conv_1",
+              sender_type: "orchestrator",
+              sender_name: "Orchestrator",
+              target_type: "none",
+              original_text: "",
+              display_text: "",
+              status: "running",
+              core_run_id: "run_sent",
+              created_at: "2026-06-17T00:00:04Z",
+              updated_at: "2026-06-17T00:00:04Z",
+            },
+          }),
+        }),
+      );
+    });
+
+    await waitFor(() => expect(screen.getAllByText("instant message")).toHaveLength(1));
+    expect(await screen.findByText("Generating...")).toBeInTheDocument();
   });
 
   it("validates empty mention body locally", async () => {
@@ -596,6 +737,96 @@ describe("Agent Hub app", () => {
     expect(await screen.findByText("review done")).toBeInTheDocument();
   });
 
+  it("opens an inline worker reply box and sends to that worker", async () => {
+    renderApp();
+    await screen.findByText("Test conversation");
+    act(() => {
+      eventSources[0].dispatchEvent(
+        new MessageEvent("worker_completed", {
+          data: JSON.stringify({
+            id: "evt_worker_completed_reply",
+            type: "worker_completed",
+            conversation_id: "conv_1",
+            created_at: "2026-06-17T00:00:02Z",
+            payload: {
+              message: {
+                message_id: "msg_worker_reply",
+                conversation_id: "conv_1",
+                sender_type: "worker",
+                sender_name: "Reviewer",
+                original_text: "",
+                display_text: "review done",
+                status: "completed",
+                core_run_id: "run_1",
+                worker_id: "reviewer",
+                created_at: "2026-06-17T00:00:01Z",
+                updated_at: "2026-06-17T00:00:02Z",
+              },
+            },
+          }),
+        }),
+      );
+    });
+    fireEvent.click(await screen.findByTitle("Reply to Reviewer"));
+    expect(await screen.findByText("Reply to Reviewer")).toBeInTheDocument();
+    const replyInput = screen.getByPlaceholderText("Message Reviewer");
+    await waitFor(() => expect(replyInput).toHaveFocus());
+    expect(screen.getByPlaceholderText("Message, @worker, or /help")).toHaveValue("");
+
+    fireEvent.change(replyInput, { target: { value: "please continue" } });
+    fireEvent.click(screen.getByLabelText("Send reply to Reviewer"));
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        "http://127.0.0.1:8765/conversations/conv_1/messages",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ text: "@reviewer please continue" }),
+        }),
+      );
+    });
+    expect(screen.queryByText("Reply to Reviewer")).not.toBeInTheDocument();
+  });
+
+  it("restarts the inline reply box when the same reply button is clicked again", async () => {
+    renderApp();
+    await screen.findByText("Test conversation");
+    act(() => {
+      eventSources[0].dispatchEvent(
+        new MessageEvent("worker_completed", {
+          data: JSON.stringify({
+            id: "evt_worker_completed_repeat_reply",
+            type: "worker_completed",
+            conversation_id: "conv_1",
+            created_at: "2026-06-17T00:00:02Z",
+            payload: {
+              message: {
+                message_id: "msg_worker_repeat_reply",
+                conversation_id: "conv_1",
+                sender_type: "worker",
+                sender_name: "Reviewer",
+                original_text: "",
+                display_text: "review done",
+                status: "completed",
+                core_run_id: "run_1",
+                worker_id: "reviewer",
+                created_at: "2026-06-17T00:00:01Z",
+                updated_at: "2026-06-17T00:00:02Z",
+              },
+            },
+          }),
+        }),
+      );
+    });
+    fireEvent.click(await screen.findByTitle("Reply to Reviewer"));
+    const replyInput = screen.getByPlaceholderText("Message Reviewer");
+    fireEvent.change(replyInput, { target: { value: "unsent text" } });
+
+    fireEvent.click(screen.getByTitle("Reply to Reviewer"));
+
+    expect(await screen.findByText("Reply to Reviewer")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Message Reviewer")).toHaveValue("");
+  });
+
   it("shows worker target on user messages", async () => {
     renderApp();
     expect(await screen.findByText("You -> Reviewer")).toBeInTheDocument();
@@ -663,7 +894,7 @@ describe("Agent Hub app", () => {
   it("validates worker editor safe ids and tool list", async () => {
     renderApp();
     await screen.findByText("Reviewer");
-    fireEvent.click(screen.getByRole("button", { name: "New Worker" }));
+    fireEvent.click(screen.getByRole("button", { name: "New Internal" }));
     const dialog = await screen.findByRole("dialog", { name: "Create Worker" });
     fireEvent.click(within(dialog).getByRole("button", { name: "JSON" }));
     const editor = await within(dialog).findByLabelText("Worker JSON");
@@ -695,7 +926,7 @@ describe("Agent Hub app", () => {
   it("accepts inline agent worker JSON", async () => {
     renderApp();
     await screen.findByText("Reviewer");
-    fireEvent.click(screen.getByRole("button", { name: "New Worker" }));
+    fireEvent.click(screen.getByRole("button", { name: "New Internal" }));
     const dialog = await screen.findByRole("dialog", { name: "Create Worker" });
     fireEvent.click(within(dialog).getByRole("button", { name: "JSON" }));
     const editor = await within(dialog).findByLabelText("Worker JSON");
@@ -733,8 +964,9 @@ describe("Agent Hub app", () => {
   it("submits model fields from worker form", async () => {
     renderApp();
     await screen.findByText("Reviewer");
-    fireEvent.click(screen.getByRole("button", { name: "New Worker" }));
+    fireEvent.click(screen.getByRole("button", { name: "New Internal" }));
     const dialog = await screen.findByRole("dialog", { name: "Create Worker" });
+    expect(within(dialog).queryByLabelText("Executor Type")).not.toBeInTheDocument();
     fireEvent.change(within(dialog).getByLabelText("Worker ID"), { target: { value: "model_worker" } });
     fireEvent.change(within(dialog).getByLabelText("System Prompt"), { target: { value: "Model worker prompt." } });
     fireEvent.change(within(dialog).getByLabelText("Provider"), { target: { value: "openai" } });
@@ -766,6 +998,65 @@ describe("Agent Hub app", () => {
         max_output_tokens: 4096,
       },
     });
+  });
+
+  it("submits generic external executor fields from worker form", async () => {
+    renderApp();
+    await screen.findByText("Reviewer");
+    fireEvent.click(screen.getByRole("button", { name: "New External" }));
+    const dialog = await screen.findByRole("dialog", { name: "Create Worker" });
+    expect(within(dialog).queryByLabelText("Provider")).not.toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Supported external workers")).toHaveTextContent("OpenCode");
+    expect(within(dialog).getByLabelText("Supported external workers")).toHaveTextContent("Codex");
+    expect(within(dialog).getByText("Other external workers need an adapter first.")).toBeInTheDocument();
+    fireEvent.change(within(dialog).getByLabelText("Worker ID"), { target: { value: "external_worker" } });
+    fireEvent.change(within(dialog).getByLabelText("System Prompt"), { target: { value: "External worker prompt." } });
+    fireEvent.change(within(dialog).getByLabelText("Executor Type"), { target: { value: "custom_executor" } });
+    fireEvent.change(within(dialog).getByLabelText("Executor Config JSON"), {
+      target: { value: JSON.stringify({ command: ["custom-agent", "acp"], cwd: "/tmp/project" }, null, 2) },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Allowed Tools Override"), { target: { value: "external.tool\nopencode.acp" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create Worker" }));
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(
+        "http://127.0.0.1:8765/workers",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+    const workerCall = vi.mocked(fetch).mock.calls.find(([input, init]) => String(input) === "http://127.0.0.1:8765/workers" && init?.method === "POST");
+    expect(JSON.parse(String(workerCall?.[1]?.body))).toMatchObject({
+      worker_id: "external_worker",
+      system_prompt: "External worker prompt.",
+      allowed_tools: ["external.tool", "opencode.acp"],
+      metadata: {
+        worker_executor: {
+          type: "custom_executor",
+          config: { command: ["custom-agent", "acp"], cwd: "/tmp/project" },
+        },
+      },
+    });
+  });
+
+  it("fills the codex external executor type from the supported worker option", async () => {
+    renderApp();
+    await screen.findByText("Reviewer");
+    fireEvent.click(screen.getByRole("button", { name: "New External" }));
+    const dialog = await screen.findByRole("dialog", { name: "Create Worker" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Use Codex external worker" }));
+    expect(within(dialog).getByLabelText("Executor Type")).toHaveValue("codex_pty");
+  });
+
+  it("loads existing external executor worker config into the form", async () => {
+    responses["/workers"] = { workers: [mockExternalWorker] };
+    renderApp();
+    fireEvent.click(await screen.findByRole("button", { name: /Available workers/ }));
+    await screen.findByText("OpenCode Worker");
+    fireEvent.click(screen.getByLabelText("Edit opencode_worker"));
+    const dialog = await screen.findByRole("dialog", { name: "Edit opencode_worker" });
+    expect(within(dialog).queryByLabelText("Provider")).not.toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Executor Type")).toHaveValue("opencode");
+    expect((within(dialog).getByLabelText("Executor Config JSON") as HTMLTextAreaElement).value).toContain('"binary": "opencode"');
+    expect(within(dialog).getByLabelText("Allowed Tools Override")).toHaveValue("opencode.acp");
   });
 
   it("calls worker enable disable and delete APIs", async () => {
@@ -829,4 +1120,15 @@ function jsonResponse(data: unknown, init?: { ok?: boolean; status?: number; sta
     statusText: init?.statusText ?? "OK",
     json: async () => data,
   } as Response);
+}
+
+function workersResponse(): WorkerView[] {
+  return ((responses["/workers"] as { workers?: WorkerView[] } | undefined)?.workers ?? []) as WorkerView[];
+}
+
+function setWorkerResponses(workers: WorkerView[]) {
+  responses["/workers"] = { workers };
+  responses["/conversations/conv_1/workers"] = {
+    workers: workers.filter((worker) => worker.worker_id === "reviewer" && !worker.deleted_at),
+  };
 }

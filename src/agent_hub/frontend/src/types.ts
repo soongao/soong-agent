@@ -72,6 +72,10 @@ export type WorkerView = {
   metadata?: Record<string, unknown>;
 };
 
+export type ConversationWorkerListResponse = {
+  workers: WorkerView[];
+};
+
 export type WorkerInlineAgentConfig = {
   id?: string;
   agent_definition_id?: string;

@@ -7,6 +7,7 @@ type AppState = {
   conversations: Conversation[];
   activeConversationId: string | null;
   messagesByConversation: Record<string, Message[]>;
+  conversationWorkersByConversation: Record<string, WorkerView[]>;
   workers: WorkerView[];
   tools: ToolView[];
   permissionsByConversation: Record<string, PermissionRequest[]>;
@@ -19,6 +20,7 @@ type Action =
   | { type: "conversations"; conversations: Conversation[] }
   | { type: "activeConversation"; conversationId: string | null }
   | { type: "messages"; conversationId: string; messages: Message[] }
+  | { type: "conversationWorkers"; conversationId: string; workers: WorkerView[] }
   | { type: "workers"; workers: WorkerView[] }
   | { type: "tools"; tools: ToolView[] }
   | { type: "eventConnection"; status: AppState["eventConnection"] }
@@ -31,6 +33,7 @@ const initialState: AppState = {
   conversations: [],
   activeConversationId: null,
   messagesByConversation: {},
+  conversationWorkersByConversation: {},
   workers: [],
   tools: [],
   permissionsByConversation: {},
@@ -56,6 +59,11 @@ function reducer(state: AppState, action: Action): AppState {
         ...state,
         messagesByConversation: { ...state.messagesByConversation, [action.conversationId]: action.messages },
       };
+    case "conversationWorkers":
+      return {
+        ...state,
+        conversationWorkersByConversation: { ...state.conversationWorkersByConversation, [action.conversationId]: action.workers },
+      };
     case "workers":
       return { ...state, workers: action.workers };
     case "tools":
@@ -68,7 +76,7 @@ function reducer(state: AppState, action: Action): AppState {
         ...state,
         messagesByConversation: {
           ...state.messagesByConversation,
-          [action.conversationId]: sortMessages([...current, action.message]),
+          [action.conversationId]: sortMessages(mergeById(current, action.message, "message_id")),
         },
       };
     }
@@ -116,7 +124,7 @@ function applyHubEvent(state: AppState, event: HubEvent): AppState {
       ...state,
       messagesByConversation: {
         ...state.messagesByConversation,
-        [event.conversation_id]: sortMessages(mergeById(current, message, "message_id")),
+        [event.conversation_id]: sortMessages(upsertMessage(current, message)),
       },
     };
   }
@@ -128,7 +136,7 @@ function applyHubEvent(state: AppState, event: HubEvent): AppState {
       ...state,
       messagesByConversation: {
         ...state.messagesByConversation,
-        [event.conversation_id]: sortMessages(mergeById(current, message, "message_id")),
+        [event.conversation_id]: appendMessageDelta(current, message, String(payload.delta ?? "")),
       },
     };
   }
@@ -173,11 +181,13 @@ function applyHubEvent(state: AppState, event: HubEvent): AppState {
 function removeConversation(state: AppState, conversationId: string): AppState {
   const conversations = state.conversations.filter((conversation) => conversation.conversation_id !== conversationId);
   const { [conversationId]: _messages, ...messagesByConversation } = state.messagesByConversation;
+  const { [conversationId]: _conversationWorkers, ...conversationWorkersByConversation } = state.conversationWorkersByConversation;
   const { [conversationId]: _permissions, ...permissionsByConversation } = state.permissionsByConversation;
   return {
     ...state,
     conversations,
     messagesByConversation,
+    conversationWorkersByConversation,
     permissionsByConversation,
     activeConversationId: state.activeConversationId === conversationId ? conversations[0]?.conversation_id ?? null : state.activeConversationId,
   };
@@ -187,6 +197,31 @@ function mergeById<T extends Record<string, unknown>>(items: T[], item: T, key: 
   const index = items.findIndex((existing) => existing[key] === item[key]);
   if (index === -1) return [...items, item];
   return items.map((existing, i) => (i === index ? { ...existing, ...item } : existing));
+}
+
+function appendMessageDelta(messages: Message[], message: Message, delta: string): Message[] {
+  const index = messages.findIndex((existing) => existing.message_id === message.message_id);
+  if (index === -1) return [...messages, message];
+  return messages.map((existing, i) => {
+    if (i !== index) return existing;
+    const nextText = message.display_text || (delta ? `${existing.display_text ?? ""}${delta}` : existing.display_text);
+    return { ...existing, ...message, display_text: nextText };
+  });
+}
+
+function upsertMessage(messages: Message[], message: Message): Message[] {
+  const withoutOptimistic = message.sender_type === "user" ? removeMatchingOptimisticUserMessage(messages, message) : messages;
+  return mergeById(withoutOptimistic, message, "message_id");
+}
+
+function removeMatchingOptimisticUserMessage(messages: Message[], message: Message): Message[] {
+  return messages.filter((existing) => {
+    if (existing.message_id === message.message_id) return true;
+    if (existing.sender_type !== "user" || existing.metadata?.optimistic !== true) return true;
+    const sameText = existing.original_text === message.original_text || existing.display_text === message.display_text;
+    const sameTarget = !message.target_id || !existing.target_id || existing.target_id === message.target_id;
+    return !(sameText && sameTarget);
+  });
 }
 
 function sortMessages(messages: Message[]): Message[] {

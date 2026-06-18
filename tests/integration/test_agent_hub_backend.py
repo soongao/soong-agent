@@ -18,6 +18,7 @@ from agent_hub.backend.events import HubEventHub, sse_encode
 from agent_hub.backend.permissions import PermissionBridge
 from agent_hub.backend.app import create_app
 from agent_hub.backend.runtime import HubRuntimeBridge
+from agent_hub.backend.workers.pty import PtySessionKey
 from tests.conftest import write_config
 
 
@@ -249,6 +250,68 @@ allowed_tools = ["agent.task_get", "agent.task_query_steps", "agent.task_claim_s
         assert deleted_worker["status"] == "deleted"
 
 
+
+@pytest.mark.asyncio
+async def test_hub_database_external_worker_session_mapping(isolated_dirs) -> None:
+    home, _project = isolated_dirs
+    db = HubDatabase(home / "hub" / "hub.db")
+    await db.open()
+    try:
+        stored = await db.upsert_external_worker_session(
+            core_session_id="sess_external",
+            worker_id="opencode_worker",
+            executor_type="opencode",
+            external_session_id="oc_session_1",
+            metadata={"cwd": "/tmp/project"},
+        )
+        assert stored["external_session_id"] == "oc_session_1"
+        assert stored["metadata"] == {"cwd": "/tmp/project"}
+        fetched = await db.get_external_worker_session(
+            core_session_id="sess_external",
+            worker_id="opencode_worker",
+            executor_type="opencode",
+        )
+        assert fetched is not None
+        assert fetched["external_session_id"] == "oc_session_1"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_bridge_external_permission_maps_decisions(isolated_dirs) -> None:
+    home, _project = isolated_dirs
+    db = HubDatabase(home / "hub" / "hub.db")
+    await db.open()
+    events = HubEventHub()
+    bridge = PermissionBridge(db, events)
+    try:
+        conversation = await db.create_conversation(core_session_id="sess_external_perm")
+        bridge.bind_session(core_session_id=conversation.core_session_id, conversation_id=conversation.conversation_id)
+        task = asyncio.create_task(
+            bridge.external_permission_callback(
+                core_session_id=conversation.core_session_id,
+                core_run_id="run_worker",
+                tool_name="opencode.Edit",
+                permission="write",
+                target_scope="file.txt",
+                args_summary="edit file.txt",
+                metadata={"source": "opencode_acp"},
+            )
+        )
+        for _ in range(50):
+            row = await (await db.conn.execute("SELECT permission_request_id, metadata_json FROM permission_requests WHERE status='pending'")).fetchone()
+            if row is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert row is not None
+        assert json.loads(row["metadata_json"])["source"] == "opencode_acp"
+        resolved = await bridge.decide(row["permission_request_id"], "allow_for_session")
+        assert resolved["status"] == "allowed"
+        assert await task == "allow_always"
+    finally:
+        await bridge.shutdown()
+        await db.close()
+
 def test_agent_hub_seeds_editable_default_workers_once(isolated_dirs, scripted_ollama) -> None:
     home, project = isolated_dirs
     write_config(home, base_url=scripted_ollama.base_url)
@@ -256,11 +319,15 @@ def test_agent_hub_seeds_editable_default_workers_once(isolated_dirs, scripted_o
     with TestClient(app) as client:
         workers = client.get("/workers").json()["workers"]
         seeded = {worker["worker_id"]: worker for worker in workers}
-        assert {"code_reviewer", "doc_writer", "test_writer"} <= set(seeded)
+        assert {"code_reviewer", "doc_writer", "test_writer", "opencode_worker", "codex_pty_worker"} <= set(seeded)
         assert seeded["code_reviewer"]["source"] == "dynamic"
         assert seeded["code_reviewer"]["metadata"]["agenthub_default_worker"] is True
         assert seeded["doc_writer"]["allowed_tools"] == ["code.read_file", "code.list_dir", "code.search", "code.write_file", "code.edit_file"]
         assert seeded["test_writer"]["enabled"] is True
+        assert seeded["opencode_worker"]["metadata"]["worker_executor"]["type"] == "opencode"
+        assert seeded["opencode_worker"]["allowed_tools"] == ["opencode.acp"]
+        assert seeded["codex_pty_worker"]["metadata"]["worker_executor"]["type"] == "codex_pty"
+        assert seeded["codex_pty_worker"]["allowed_tools"] == ["codex.pty"]
 
         renamed = client.patch(
             "/workers/code_reviewer",
@@ -281,6 +348,75 @@ def test_agent_hub_seeds_editable_default_workers_once(isolated_dirs, scripted_o
         deleted_workers = client.get("/workers", params={"include_deleted": True}).json()["workers"]
         deleted_by_id = {worker["worker_id"]: worker for worker in deleted_workers}
         assert deleted_by_id["doc_writer"]["status"] == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_hub_runtime_routes_worker_reply_to_active_pty_session(isolated_dirs, scripted_ollama) -> None:
+    home, project = isolated_dirs
+    write_config(home, base_url=scripted_ollama.base_url)
+    db = HubDatabase(home / "hub" / "hub.db")
+    await db.open()
+    events = HubEventHub()
+    bridge = HubRuntimeBridge(
+        db=db,
+        events=events,
+        permission_bridge=PermissionBridge(db, events),
+        project_dir=project,
+        home_dir=home,
+        provider_registry=scripted_ollama.provider_registry(),
+    )
+    try:
+        await bridge.start()
+        conversation = await bridge.create_conversation(title="PTY reply")
+        await bridge.runtime.create_worker_config(
+            {
+                "worker_id": "pty_worker",
+                "name": "PTY Worker",
+                "system_prompt": "PTY worker.",
+                "metadata": {"worker_executor": {"type": "codex_pty", "config": {}}},
+            }
+        )
+        await db.add_conversation_worker(conversation.conversation_id, "pty_worker")
+
+        class FakePtySession:
+            def __init__(self) -> None:
+                self.received: list[str] = []
+
+            @property
+            def running(self) -> bool:
+                return True
+
+            async def close(self) -> None:
+                return None
+
+            async def write_to_active(self, text: str):
+                self.received.append(text)
+                from agent_hub.backend.workers.pty import PtyInputReceipt
+
+                return PtyInputReceipt(
+                    core_session_id=conversation.core_session_id,
+                    worker_id="pty_worker",
+                    executor_type="codex_pty",
+                    worker_run_id="run_worker_active",
+                )
+
+        fake = FakePtySession()
+        bridge._pty_manager._sessions[
+            PtySessionKey(conversation.core_session_id, "pty_worker", "codex_pty")
+        ] = fake  # type: ignore[assignment]
+
+        message, run_id, status = await bridge.send_message(conversation, "@pty_worker Y")
+        messages = await db.list_messages(conversation.conversation_id)
+    finally:
+        await bridge.close()
+        await db.close()
+
+    assert fake.received == ["Y"]
+    assert run_id == "run_worker_active"
+    assert status == "completed"
+    assert message.metadata["pty_reply"] is True
+    assert [item.sender_type for item in messages] == ["user"]
+    assert scripted_ollama.requests == []
 
 
 def test_agent_hub_worker_api_redacts_direct_api_key(isolated_dirs, scripted_ollama) -> None:
@@ -572,6 +708,14 @@ allowed_tools = ["agent.task_get", "agent.task_query_steps", "agent.task_claim_s
             json={"worker_id": "hub_worker", "name": "Hub Worker Name", "system_prompt": "Hub worker prompt."},
         )
         assert created.status_code == 200
+        added = client.post(
+            f"/conversations/{conversation['conversation_id']}/workers",
+            json={"worker_id": "hub_worker"},
+        )
+        assert added.status_code == 200
+        listed_workers = client.get(f"/conversations/{conversation['conversation_id']}/workers")
+        assert listed_workers.status_code == 200
+        assert [worker["worker_id"] for worker in listed_workers.json()["workers"]] == ["hub_worker"]
         sent = client.post(f"/conversations/{conversation['conversation_id']}/messages", json={"text": "@hub_worker inspect this"})
         assert sent.status_code == 200
         hub_db_path = home / "hub" / "hub.db"
@@ -615,13 +759,20 @@ def test_agent_hub_worker_mention_errors_do_not_start_runs(isolated_dirs, script
         assert empty_body.status_code == 400
         assert empty_body.json()["error"]["code"] == "validation_error"
 
+        client.post("/workers", json={"worker_id": "global_only_worker", "name": "Global Only Worker", "system_prompt": "Global prompt."})
+        not_added = client.post(f"/conversations/{conversation_id}/messages", json={"text": "@global_only_worker inspect this"})
+        assert not_added.status_code == 409
+        assert not_added.json()["error"]["code"] == "worker_not_added"
+
         client.post("/workers", json={"worker_id": "disabled_worker", "name": "Disabled Worker", "system_prompt": "Disabled prompt."})
+        client.post(f"/conversations/{conversation_id}/workers", json={"worker_id": "disabled_worker"})
         client.post("/workers/disabled_worker/disable")
         disabled = client.post(f"/conversations/{conversation_id}/messages", json={"text": "@disabled_worker inspect this"})
         assert disabled.status_code == 409
         assert disabled.json()["error"]["code"] == "worker_disabled"
 
         client.post("/workers", json={"worker_id": "deleted_worker", "name": "Deleted Worker", "system_prompt": "Deleted prompt."})
+        client.post(f"/conversations/{conversation_id}/workers", json={"worker_id": "deleted_worker"})
         client.delete("/workers/deleted_worker")
         deleted = client.post(f"/conversations/{conversation_id}/messages", json={"text": "@deleted_worker inspect this"})
         assert deleted.status_code == 409
@@ -629,6 +780,8 @@ def test_agent_hub_worker_mention_errors_do_not_start_runs(isolated_dirs, script
 
         client.post("/workers", json={"worker_id": "ambiguous_one", "name": "ambiguous", "system_prompt": "First prompt."})
         client.post("/workers", json={"worker_id": "ambiguous_two", "name": "ambiguous", "system_prompt": "Second prompt."})
+        client.post(f"/conversations/{conversation_id}/workers", json={"worker_id": "ambiguous_one"})
+        client.post(f"/conversations/{conversation_id}/workers", json={"worker_id": "ambiguous_two"})
         ambiguous = client.post(f"/conversations/{conversation_id}/messages", json={"text": "@ambiguous inspect this"})
         assert ambiguous.status_code == 409
         assert ambiguous.json()["error"]["code"] == "worker_ambiguous"

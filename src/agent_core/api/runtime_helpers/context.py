@@ -99,7 +99,7 @@ def _apply_system_block_budget(system_blocks: list[SystemBlock], dynamic_system_
 def _protected_message_suffix_start(messages: list[ModelMessage]) -> int:
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
-        if message.role == ModelRole.USER and message.node_type in {"message", "hook_context"}:
+        if message.role == ModelRole.USER and message.node_type in {"message", "hook_context", "worker_dispatch"}:
             return index
     return max(len(messages) - 1, 0)
 

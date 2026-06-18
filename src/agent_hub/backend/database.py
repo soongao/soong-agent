@@ -113,6 +113,31 @@ class HubDatabase:
             )
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_worker_sessions (
+              core_session_id TEXT NOT NULL,
+              worker_id TEXT NOT NULL,
+              executor_type TEXT NOT NULL,
+              external_session_id TEXT NOT NULL,
+              metadata_json TEXT NOT NULL DEFAULT '{}',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(core_session_id, worker_id, executor_type)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversation_workers (
+              conversation_id TEXT NOT NULL,
+              worker_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY(conversation_id, worker_id),
+              FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+            )
+            """
+        )
         await conn.commit()
 
     async def create_conversation(self, *, core_session_id: str, title: str = "New conversation") -> ConversationView:
@@ -169,6 +194,36 @@ class HubDatabase:
 
     async def soft_delete_conversation(self, conversation_id: str) -> ConversationView | None:
         return await self.update_conversation(conversation_id, status="deleted")
+
+    async def add_conversation_worker(self, conversation_id: str, worker_id: str) -> dict[str, Any]:
+        now = utc_iso()
+        await self.conn.execute(
+            """
+            INSERT OR IGNORE INTO conversation_workers(conversation_id, worker_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (conversation_id, worker_id, now),
+        )
+        await self.conn.commit()
+        return {"conversation_id": conversation_id, "worker_id": worker_id, "created_at": now}
+
+    async def remove_conversation_worker(self, conversation_id: str, worker_id: str) -> None:
+        await self.conn.execute(
+            "DELETE FROM conversation_workers WHERE conversation_id=? AND worker_id=?",
+            (conversation_id, worker_id),
+        )
+        await self.conn.commit()
+
+    async def list_conversation_worker_ids(self, conversation_id: str) -> list[str]:
+        cursor = await self.conn.execute(
+            """
+            SELECT worker_id FROM conversation_workers
+            WHERE conversation_id=?
+            ORDER BY created_at ASC, worker_id ASC
+            """,
+            (conversation_id,),
+        )
+        return [str(row["worker_id"]) for row in await cursor.fetchall()]
 
     async def create_message(
         self,
@@ -393,6 +448,73 @@ class HubDatabase:
         )
         await self.conn.commit()
         return snapshot_id
+
+    async def get_external_worker_session(
+        self,
+        *,
+        core_session_id: str,
+        worker_id: str,
+        executor_type: str,
+    ) -> dict[str, Any] | None:
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM external_worker_sessions
+            WHERE core_session_id=? AND worker_id=? AND executor_type=?
+            """,
+            (core_session_id, worker_id, executor_type),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "core_session_id": row["core_session_id"],
+            "worker_id": row["worker_id"],
+            "executor_type": row["executor_type"],
+            "external_session_id": row["external_session_id"],
+            "metadata": _loads_json(row["metadata_json"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def upsert_external_worker_session(
+        self,
+        *,
+        core_session_id: str,
+        worker_id: str,
+        executor_type: str,
+        external_session_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = utc_iso()
+        await self.conn.execute(
+            """
+            INSERT INTO external_worker_sessions(
+                core_session_id, worker_id, executor_type, external_session_id,
+                metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(core_session_id, worker_id, executor_type) DO UPDATE SET
+                external_session_id=excluded.external_session_id,
+                metadata_json=excluded.metadata_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                core_session_id,
+                worker_id,
+                executor_type,
+                external_session_id,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        await self.conn.commit()
+        row = await self.get_external_worker_session(
+            core_session_id=core_session_id,
+            worker_id=worker_id,
+            executor_type=executor_type,
+        )
+        assert row is not None
+        return row
 
 
 def _loads_json(value: str | None) -> dict[str, Any]:

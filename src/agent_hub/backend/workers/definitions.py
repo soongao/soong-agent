@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import logging
-
 from agent_core.types import WorkerConfigCreate
-
-logger = logging.getLogger(__name__)
 
 
 DEFAULT_HUB_WORKERS: tuple[WorkerConfigCreate, ...] = (
@@ -41,21 +37,38 @@ DEFAULT_HUB_WORKERS: tuple[WorkerConfigCreate, ...] = (
         allowed_tools=["code.read_file", "code.list_dir", "code.search", "code.write_file", "code.edit_file", "code.run_command"],
         metadata={"agenthub_default_worker": True},
     ),
+    WorkerConfigCreate(
+        worker_id="opencode_worker",
+        name="OpenCode Worker",
+        description="Delegates coding tasks to the local OpenCode ACP agent while preserving an OpenCode session per Hub conversation.",
+        system_prompt=(
+            "You are an external OpenCode worker. Treat the orchestrator dispatch as the user's request, "
+            "work in the current project, and return the result clearly."
+        ),
+        allowed_tools=["opencode.acp"],
+        metadata={
+            "agenthub_default_worker": True,
+            "worker_executor": {
+                "type": "opencode",
+                "config": {},
+            },
+        },
+    ),
+    WorkerConfigCreate(
+        worker_id="codex_pty_worker",
+        name="Codex PTY Worker",
+        description="Delegates tasks to the local Codex interactive CLI through a reusable PTY session with streamed output.",
+        system_prompt=(
+            "You are an external Codex PTY worker. Treat the orchestrator dispatch as the user's request. "
+            "The Hub streams your terminal output to the user; if you need permission input, wait for the user's reply."
+        ),
+        allowed_tools=["codex.pty"],
+        metadata={
+            "agenthub_default_worker": True,
+            "worker_executor": {
+                "type": "codex_pty",
+                "config": {},
+            },
+        },
+    ),
 )
-
-
-async def seed_default_workers(runtime) -> list[str]:
-    created: list[str] = []
-    for worker in DEFAULT_HUB_WORKERS:
-        existing = await runtime.get_worker_config(worker.worker_id)
-        if existing is not None:
-            continue
-        try:
-            await runtime.create_worker_config(worker)
-        except Exception:
-            logger.exception("failed to seed default Hub worker worker_id=%s", worker.worker_id)
-            raise
-        created.append(worker.worker_id)
-    if created:
-        logger.info("seeded default Hub workers worker_ids=%s", ",".join(created))
-    return created

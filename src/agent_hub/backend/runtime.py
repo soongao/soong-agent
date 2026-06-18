@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from agent_core import AgentRuntime
+from agent_core.agents.dynamic import WorkerMentionResolution
+from agent_core.agents.workers import worker_agent_id_for_session
 from agent_core.providers import ProviderRegistry
 from agent_core.storage import new_id
 from agent_core.types import Node, RunMode, RunStatus, RuntimeEvent
@@ -16,6 +18,9 @@ from agent_hub.backend.events import HubEventHub
 from agent_hub.backend.models import ConversationView, MessageView
 from agent_hub.backend.permissions import PermissionBridge
 from agent_hub.backend.services.workers import redact_worker_payload
+from agent_hub.backend.workers.executors.codex_pty import CodexPtyWorkerExecutor
+from agent_hub.backend.workers.executors.opencode import OpenCodeWorkerExecutor
+from agent_hub.backend.workers.pty import PtySessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,13 @@ class HubRuntimeBridge:
             permission_callback=permission_bridge.permission_callback,
             provider_registry=provider_registry,
         )
+        self._pty_manager = PtySessionManager()
+        self._external_executors = [
+            OpenCodeWorkerExecutor(db=db, permission_bridge=permission_bridge, project_dir=project_dir),
+            CodexPtyWorkerExecutor(pty_manager=self._pty_manager, project_dir=project_dir),
+        ]
+        self.runtime.register_worker_executor("opencode", self._external_executors[0])
+        self.runtime.register_worker_executor("codex_pty", self._external_executors[1])
         self._run_tasks: dict[str, asyncio.Task[Any]] = {}
 
     async def start(self) -> None:
@@ -67,6 +79,9 @@ class HubRuntimeBridge:
             task.cancel()
         if self._run_tasks:
             await asyncio.gather(*self._run_tasks.values(), return_exceptions=True)
+        for executor in self._external_executors:
+            await executor.close()
+        await self._pty_manager.close()
         await self.runtime.close()
 
     async def create_conversation(self, *, title: str = "New conversation") -> ConversationView:
@@ -85,7 +100,10 @@ class HubRuntimeBridge:
         return conversation
 
     async def send_message(self, conversation: ConversationView, text: str) -> tuple[MessageView, str, str]:
-        parsed = self._parse_mention(conversation.core_session_id, text)
+        parsed = await self._parse_mention(conversation, text)
+        pty_reply = await self._try_send_pty_reply(conversation, parsed, original_text=text)
+        if pty_reply is not None:
+            return pty_reply
         title_updates: dict[str, str] = {}
         if conversation.title == "New conversation":
             title_updates["title"] = _title_from_text(parsed.display_text)
@@ -148,6 +166,54 @@ class HubRuntimeBridge:
             )
         )
         return user_message, handle.run_id, orchestrator.status
+
+    async def _try_send_pty_reply(
+        self,
+        conversation: ConversationView,
+        parsed: ParsedMention,
+        *,
+        original_text: str,
+    ) -> tuple[MessageView, str, str] | None:
+        if parsed.target_type != "worker" or not parsed.target_id:
+            return None
+        receipt = await self._pty_manager.write_to_active(
+            core_session_id=conversation.core_session_id,
+            worker_id=parsed.target_id,
+            text=parsed.display_text,
+        )
+        if receipt is None:
+            return None
+        user_message = await self.db.create_message(
+            conversation_id=conversation.conversation_id,
+            sender_type="user",
+            sender_id="user",
+            sender_name="You",
+            target_type=parsed.target_type,
+            target_id=parsed.target_id,
+            original_text=original_text,
+            display_text=parsed.display_text,
+            status="completed",
+            core_session_id=conversation.core_session_id,
+            core_run_id=receipt.worker_run_id,
+            metadata={
+                "target_name": parsed.target_name,
+                "pty_reply": True,
+                "executor_type": receipt.executor_type,
+            },
+        )
+        await self.db.update_conversation(
+            conversation.conversation_id,
+            last_message_preview=parsed.display_text[:160],
+        )
+        await self.events.publish("message_created", conversation_id=conversation.conversation_id, payload=user_message.model_dump(mode="json"))
+        logger.info(
+            "pty reply forwarded conversation_id=%s core_session_id=%s worker_id=%s worker_run_id=%s",
+            conversation.conversation_id,
+            conversation.core_session_id,
+            parsed.target_id,
+            receipt.worker_run_id,
+        )
+        return user_message, receipt.worker_run_id, "completed"
 
     async def cancel_conversation_run(
         self,
@@ -241,7 +307,7 @@ class HubRuntimeBridge:
                     return handle
         return None
 
-    def _parse_mention(self, core_session_id: str, text: str) -> ParsedMention:
+    async def _parse_mention(self, conversation: ConversationView, text: str) -> ParsedMention:
         stripped = text.strip()
         if not stripped:
             raise_hub_error(400, "validation_error", "Message text is required.")
@@ -256,9 +322,16 @@ class HubRuntimeBridge:
             return ParsedMention("orchestrator", "orchestrator", "Orchestrator", display_text, None)
         if not display_text:
             raise_hub_error(400, "validation_error", f"Message text is required after @{name}.")
-        resolution = self.runtime.resolve_worker_mention(name, session_id=core_session_id)
+        allowed_worker_ids = set(await self.db.list_conversation_worker_ids(conversation.conversation_id))
+        workers = await self.runtime.list_worker_configs(include_disabled=True, include_deleted=True)
+        resolution = _resolve_conversation_worker_mention(
+            name,
+            workers=workers,
+            allowed_worker_ids=allowed_worker_ids,
+            session_id=conversation.core_session_id,
+        )
         if not resolution.resolved:
-            status_code = 409 if resolution.error_code in {"worker_ambiguous", "worker_disabled", "worker_deleted"} else 404
+            status_code = 409 if resolution.error_code in {"worker_ambiguous", "worker_disabled", "worker_deleted", "worker_not_added"} else 404
             raise_hub_error(
                 status_code,
                 resolution.error_code or "worker_not_found",
@@ -303,6 +376,28 @@ class HubRuntimeBridge:
                     "message_delta",
                     conversation_id=conversation_id,
                     payload={"message_id": orchestrator_message_id, "delta": delta, "message": message.model_dump(mode="json") if message else None},
+                )
+        elif event.event_type == "worker_text_delta":
+            child_run_id = str(event.payload.get("child_run_id") or event.run_id or "")
+            worker_id = str(event.payload.get("worker_id") or "")
+            message = await self.db.latest_worker_message(
+                conversation_id=conversation_id,
+                child_run_id=child_run_id,
+                worker_id=worker_id,
+            )
+            if message is not None:
+                delta = str(event.payload.get("text") or "")
+                existing_text = message.display_text or ""
+                placeholder = existing_text == (message.task_id or "") or existing_text == "Worker task started"
+                updated = await self.db.update_message(
+                    message.message_id,
+                    display_text=delta if placeholder else existing_text + delta,
+                    status="running",
+                )
+                await self.events.publish(
+                    "message_updated",
+                    conversation_id=conversation_id,
+                    payload=updated.model_dump(mode="json") if updated else {},
                 )
         elif event.event_type == "run_dequeued":
             logger.info("run dequeued session_id=%s run_id=%s", event.session_id, event.run_id)
@@ -568,6 +663,9 @@ def _node_text(node: Node) -> str:
 
 
 def _worker_summary_text(payload: dict[str, Any]) -> str:
+    worker_result = payload.get("worker_result")
+    if isinstance(worker_result, dict) and worker_result.get("text"):
+        return str(worker_result["text"])
     if payload.get("step_result_summary"):
         return str(payload["step_result_summary"])
     summary = payload.get("summary")
@@ -577,3 +675,80 @@ def _worker_summary_text(payload: dict[str, Any]) -> str:
                 return str(summary[key])
     task_id = payload.get("task_id")
     return f"Worker completed {task_id}" if task_id else "Worker completed"
+
+
+def _resolve_conversation_worker_mention(
+    mention: str,
+    *,
+    workers: list[Any],
+    allowed_worker_ids: set[str],
+    session_id: str,
+) -> WorkerMentionResolution:
+    normalized = mention.strip()
+    if normalized.startswith("@"):
+        normalized = normalized[1:]
+    if not normalized:
+        return WorkerMentionResolution(
+            mention=mention,
+            status="missing",
+            error_code="worker_not_found",
+            error_message="worker mention is empty",
+        )
+    allowed_workers = [worker for worker in workers if worker.worker_id in allowed_worker_ids]
+    by_id = [worker for worker in allowed_workers if worker.worker_id == normalized]
+    if by_id:
+        return _conversation_worker_resolution_from_match(mention, by_id[0], session_id=session_id)
+    by_name = [worker for worker in allowed_workers if worker.name == normalized]
+    if len(by_name) == 1:
+        return _conversation_worker_resolution_from_match(mention, by_name[0], session_id=session_id)
+    if len(by_name) > 1:
+        return WorkerMentionResolution(
+            mention=mention,
+            status="ambiguous",
+            error_code="worker_ambiguous",
+            error_message=f"worker mention is ambiguous: {mention}",
+        )
+    global_by_id = [worker for worker in workers if worker.worker_id == normalized]
+    global_by_name = [worker for worker in workers if worker.name == normalized]
+    if global_by_id or global_by_name:
+        return WorkerMentionResolution(
+            mention=mention,
+            status="not_added",
+            error_code="worker_not_added",
+            error_message=f"worker is not added to this conversation: {mention}",
+        )
+    return WorkerMentionResolution(
+        mention=mention,
+        status="missing",
+        error_code="worker_not_found",
+        error_message=f"worker not found: {mention}",
+    )
+
+
+def _conversation_worker_resolution_from_match(mention: str, worker: Any, *, session_id: str) -> WorkerMentionResolution:
+    if worker.deleted_at is not None:
+        return WorkerMentionResolution(
+            mention=mention,
+            worker_id=worker.worker_id,
+            name=worker.name,
+            status="deleted",
+            error_code="worker_deleted",
+            error_message=f"worker is deleted: {mention}",
+        )
+    if not worker.enabled:
+        return WorkerMentionResolution(
+            mention=mention,
+            worker_id=worker.worker_id,
+            name=worker.name,
+            status="disabled",
+            error_code="worker_disabled",
+            error_message=f"worker is disabled: {mention}",
+        )
+    return WorkerMentionResolution(
+        mention=mention,
+        worker_id=worker.worker_id,
+        worker_agent_id=worker_agent_id_for_session(session_id=session_id, worker_id=worker.worker_id),
+        worker_pool_id=worker.worker_pool_id,
+        name=worker.name,
+        status="resolved",
+    )

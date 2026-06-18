@@ -17,8 +17,8 @@ from agent_hub.backend.events import HubEventHub
 from agent_hub.backend.permissions import PermissionBridge
 from agent_hub.backend.routes import conversations, events, health, permissions, tools, workers
 from agent_hub.backend.runtime import HubRuntimeBridge
-from agent_hub.backend.services.default_workers import seed_default_workers
 from agent_hub.backend.state import HubAppState
+from agent_hub.backend.workers import seed_default_workers
 
 logger = logging.getLogger(__name__)
 

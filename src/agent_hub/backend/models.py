@@ -89,6 +89,14 @@ class WorkerListResponse(StrictModel):
     workers: list[dict[str, Any]]
 
 
+class ConversationWorkerListResponse(StrictModel):
+    workers: list[dict[str, Any]]
+
+
+class ConversationWorkerAddRequest(StrictModel):
+    worker_id: str
+
+
 class BranchableNodeResponse(StrictModel):
     nodes: list[dict[str, Any]]
 

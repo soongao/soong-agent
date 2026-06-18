@@ -1,4 +1,4 @@
-import type { BranchableNode, Conversation, HealthStatus, Message, ToolView, WorkerConfigPayload, WorkerQueueItem, WorkerView } from "../types";
+import type { BranchableNode, Conversation, ConversationWorkerListResponse, HealthStatus, Message, ToolView, WorkerConfigPayload, WorkerQueueItem, WorkerView } from "../types";
 
 function configuredBackendBaseUrl(): string {
   const injected = window.agentHub?.backendBaseUrl?.trim();
@@ -57,6 +57,15 @@ export const api = {
   createConversation: (title = "New conversation") =>
     request<Conversation>("/conversations", { method: "POST", body: JSON.stringify({ title }) }),
   deleteConversation: (conversationId: string) => request<Conversation>(`/conversations/${conversationId}`, { method: "DELETE" }),
+  conversationWorkers: (conversationId: string) =>
+    request<ConversationWorkerListResponse>(`/conversations/${conversationId}/workers`),
+  addConversationWorker: (conversationId: string, workerId: string) =>
+    request<WorkerView>(`/conversations/${conversationId}/workers`, {
+      method: "POST",
+      body: JSON.stringify({ worker_id: workerId }),
+    }),
+  removeConversationWorker: (conversationId: string, workerId: string) =>
+    request<Record<string, unknown>>(`/conversations/${conversationId}/workers/${encodeURIComponent(workerId)}`, { method: "DELETE" }),
   messages: (conversationId: string) => request<{ messages: Message[] }>(`/conversations/${conversationId}/messages`),
   sendMessage: (conversationId: string, text: string) =>
     request<{ message_id: string; conversation_id: string; core_session_id: string; core_run_id: string; status: string }>(

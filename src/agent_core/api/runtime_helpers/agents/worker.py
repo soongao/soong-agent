@@ -6,10 +6,15 @@ from typing import Any
 from agent_core.api.handles import RunHandle
 from agent_core.api.runtime_helpers.agents.tools import (
     execute_worker_tool_calls,
+    worker_tool_context,
     worker_step_summary,
 )
 from agent_core.api.runtime_helpers.agents.worker_lifecycle import fail_unclosed_worker_step
-from agent_core.api.runtime_helpers.context import _context_build_report
+from agent_core.api.runtime_helpers.agents.worker_executor import (
+    WorkerExecutorContext,
+    worker_executor_config,
+)
+from agent_core.api.runtime_helpers.context import _apply_context_budget, _context_build_report
 from agent_core.api.runtime_helpers.model import (
     _child_timeout_seconds,
     _collect_model_completion,
@@ -20,14 +25,17 @@ from agent_core.api.runtime_helpers.model import (
 from agent_core.api.runtime_helpers.tools import _agent_definition_body_with_default
 from agent_core.api.runtime_helpers.views import _summary_from_step
 from agent_core.config.loader import resolve_model_config
-from agent_core.context import build_system_blocks
+from agent_core.context import build_context_messages, build_system_blocks
 from agent_core.errors import AgentCoreError
 from agent_core.errors.codes import ErrorCode
 from agent_core.providers import ModelMessage, ModelRequest, SystemBlock
 from agent_core.providers.base import ModelRole
 from agent_core.storage import new_id
 from agent_core.tools.execution import ToolExecutionContext
-from agent_core.types import ErrorPayload, RunStatus, TextBlock, ToolCallBlock, ToolResultBlock
+from agent_core.types import ErrorPayload, Node, RunStatus, TextBlock, ToolCallBlock, ToolResultBlock
+
+
+WORKER_CONTEXT_NODE_TYPES = {"worker_dispatch", "worker_message", "worker_tool_result"}
 
 
 async def run_worker_agent(
@@ -81,6 +89,7 @@ async def run_worker_agent(
     definition = self.agent_definitions.get(worker.agent_definition_id)
     if definition is None:
         raise AgentCoreError(ErrorCode.INVALID_AGENT_DEFINITION, f"worker agent definition not found: {worker.agent_definition_id}")
+    executor_config = worker_executor_config(definition.metadata)
     preflight_context = ToolExecutionContext(
         session_id=session_id,
         run_id=parent_run_id,
@@ -115,23 +124,24 @@ async def run_worker_agent(
         }
     base_tools = self._effective_tools(agent_role="worker")
     base_names = {tool.name for tool in base_tools}
-    worker_allowed = worker.allowed_tools
-    if worker_allowed is not None:
-        unknown = [name for name in worker_allowed if self.tool_registry.get(name) is None]
-        if unknown:
-            raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"worker allowed_tools contains unavailable tools: {unknown}")
-        excluded = [name for name in worker_allowed if name not in base_names]
-        if excluded:
-            raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"worker allowed_tools contains tools outside effective set: {excluded}")
-        base_names &= set(worker_allowed)
-    if allowed_tools is not None:
-        unknown = [name for name in allowed_tools if self.tool_registry.get(name) is None]
-        if unknown:
-            raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"allowed_tools contains unavailable tools: {unknown}")
-        excluded = [name for name in allowed_tools if name not in base_names]
-        if excluded:
-            raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"allowed_tools contains tools outside worker effective set: {excluded}")
-        base_names &= set(allowed_tools)
+    if executor_config is None:
+        worker_allowed = worker.allowed_tools
+        if worker_allowed is not None:
+            unknown = [name for name in worker_allowed if self.tool_registry.get(name) is None]
+            if unknown:
+                raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"worker allowed_tools contains unavailable tools: {unknown}")
+            excluded = [name for name in worker_allowed if name not in base_names]
+            if excluded:
+                raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"worker allowed_tools contains tools outside effective set: {excluded}")
+            base_names &= set(worker_allowed)
+        if allowed_tools is not None:
+            unknown = [name for name in allowed_tools if self.tool_registry.get(name) is None]
+            if unknown:
+                raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"allowed_tools contains unavailable tools: {unknown}")
+            excluded = [name for name in allowed_tools if name not in base_names]
+            if excluded:
+                raise AgentCoreError(ErrorCode.VALIDATION_ERROR, f"allowed_tools contains tools outside worker effective set: {excluded}")
+            base_names &= set(allowed_tools)
     tools = [tool for tool in base_tools if tool.name in base_names]
 
     run_id = new_id("run_worker")
@@ -208,159 +218,272 @@ async def run_worker_agent(
         },
     )
     worker_scope = {"task_id": task_id, "allowed_step_ids": step_scope, "worker_pool_id": worker.pool_id}
-    messages = [
-        ModelMessage(
-            role=ModelRole.USER,
-            content=[TextBlock(text=worker_prompt)],
-            node_type="worker_dispatch",
-            metadata={"node_id": start_node.node_id},
-        )
-    ]
+    messages = await _worker_context_messages(
+        self,
+        session_id=session_id,
+        worker_agent_id=agent_id,
+        start_node=start_node,
+    )
     end_node_id: str | None = start_node.node_id
     final_text = ""
     worker_result: dict[str, Any] | None = None
     error_payload: ErrorPayload | None = None
     try:
-        model_config = resolve_model_config(self.config, definition.model_profile)
-        async with asyncio.timeout(_child_timeout_seconds(self.config, timeout_ms)):
-            for _turn in range(self.config.runtime.max_turns):
-                system_blocks = build_system_blocks(
-                    home_dir=self.paths.home_dir,
-                    project_dir=self.paths.project_dir,
-                    context_state=self._context_state_for_session(session_id),
-                    memory_enabled=self.config.memory.enabled,
-                    memory_dir_template=self.config.memory.memory_dir,
-                ) + [
-                    SystemBlock(
-                        block_id=f"agent_definition.{worker.agent_definition_id}",
-                        source="agent_definition",
-                        content=_agent_definition_body_with_default(
-                            self.agent_definitions,
-                            definition,
-                            default_id="default_worker_agent",
-                        ),
-                        priority=900,
-                        dynamic=True,
-                        metadata={
-                            "agent_definition_id": worker.agent_definition_id,
-                            "fallback_default_id": None if definition.body else "default_worker_agent",
-                        },
-                    )
-                ]
-                await self._emit_child_run_event(
-                    stream=worker_stream,
-                    mirror_handle=parent_handle,
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    event_type="context_built",
-                    payload=_context_build_report(messages, system_blocks, tools) | {"model": model_config.name},
-                )
-                request = ModelRequest(
-                    model=model_config.name,
-                    system=system_blocks,
-                    messages=messages,
-                    tools=tools,
-                    temperature=model_config.temperature,
-                    max_output_tokens=model_config.max_output_tokens,
-                    metadata={"session_id": session_id, "run_id": run_id, "parent_run_id": parent_run_id, "worker_id": worker.worker_id},
-                )
-                provider = self._provider_for_model(model_config)
-                _ensure_provider_supports_request(provider, request)
-                completed, text_parts = await _collect_model_completion(
-                    provider,
-                    request,
-                    provider_failure_message="worker provider failed",
-                    on_model_event=lambda event: self._emit_child_model_event(
-                        stream=worker_stream,
-                        session_id=session_id,
-                        agent_id=agent_id,
-                        run_id=run_id,
-                        event=event,
-                    ),
-                    on_completed=lambda event: self._persist_run_debug_artifact(
-                        session_id=session_id,
-                        agent_id=agent_id,
-                        run_id=run_id,
-                        model_event=event,
-                        node_id=None,
-                    ),
-                )
-                final_text += "".join(text_parts)
-                assistant_content = list(completed.content)
-                for block in completed.content:
-                    if getattr(block, "type", None) == "text":
-                        final_text = getattr(block, "text", final_text)
-                for call in completed.tool_calls:
-                    assistant_content.append(ToolCallBlock(tool_call_id=call.tool_call_id, name=call.name, arguments=call.arguments, metadata=call.metadata))
-                assistant_node = await self.store.add_node(
-                    session_id=session_id,
-                    parent_id=end_node_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    role="assistant",
-                    node_type="worker_message",
-                    content=assistant_content,
-                    metadata={"stop_reason": completed.stop_reason.value if completed.stop_reason else None},
-                    make_active=False,
-                )
-                end_node_id = assistant_node.node_id
-                messages.append(
-                    ModelMessage(
-                        role=ModelRole.ASSISTANT,
-                        content=assistant_content,
-                        node_type="worker_message",
-                        metadata={"node_id": assistant_node.node_id},
-                    )
-                )
-                if not completed.tool_calls:
-                    _validate_expected_output_schema(final_text, expected_output_schema)
-                    worker_result = {"text": final_text}
-                    break
-                tool_results = await execute_worker_tool_calls(
+        if executor_config is not None:
+            executor = self._worker_executors.get(executor_config.type)
+            if executor is None:
+                raise AgentCoreError(ErrorCode.WORKER_NOT_AVAILABLE, f"worker executor not registered: {executor_config.type}")
+            step_context = worker_tool_context(
+                self,
+                session_id=session_id,
+                run_id=run_id,
+                agent_id=agent_id,
+                parent_agent_id=parent_agent_id,
+                parent_run_id=parent_run_id,
+                worker_scope=worker_scope,
+                allowed_tool_names=set(),
+            )
+            claimed = self.task_service.claim_step(step_context, {"task_id": task_id, "step_id": dispatchable_steps[0].step_id})
+            self.task_service.update_step(
+                step_context,
+                {"task_id": task_id, "step_id": claimed["step"]["step_id"], "status": "running"},
+            )
+            async with asyncio.timeout(_child_timeout_seconds(self.config, timeout_ms)):
+                result = await executor.run(
                     self,
-                    session_id=session_id,
-                    run_id=run_id,
-                    agent_id=agent_id,
-                    parent_agent_id=parent_agent_id,
-                    parent_run_id=parent_run_id,
-                    calls=completed.tool_calls,
-                    worker_scope=worker_scope,
-                    allowed_tool_names=base_names,
-                    stream=worker_stream,
+                    WorkerExecutorContext(
+                        session_id=session_id,
+                        parent_run_id=parent_run_id,
+                        parent_agent_id=parent_agent_id,
+                        task_id=task_id,
+                        instruction=instruction,
+                        dispatch_context=dispatch_context,
+                        constraints=constraints,
+                        allowed_step_ids=step_scope,
+                        allowed_tools=allowed_tools,
+                        expected_output_schema=expected_output_schema,
+                        timeout_ms=timeout_ms,
+                        worker=worker,
+                        worker_agent_id=agent_id,
+                        worker_run_id=run_id,
+                        worker_start_node=start_node,
+                        worker_stream=worker_stream,
+                        executor_config=executor_config.config,
+                        agent_definition=definition,
+                        parent_handle=parent_handle,
+                    ),
                 )
-                tool_content = [
-                    ToolResultBlock(
-                        tool_call_id=result.tool_call_id,
-                        is_error=result.is_error,
-                        content=result.content,
-                        error=result.error,
-                        metadata={**result.metadata, "tool_name": result.tool_name},
+            final_text = result.text
+            worker_result = result.as_worker_result()
+            assistant_node = await self.store.add_node(
+                session_id=session_id,
+                parent_id=end_node_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                role="assistant",
+                node_type="worker_message",
+                content=[TextBlock(text=final_text)],
+                metadata={"executor_type": executor_config.type, **(result.metadata or {})},
+                make_active=False,
+            )
+            end_node_id = assistant_node.node_id
+            _validate_expected_output_schema(final_text, expected_output_schema)
+            self.task_service.update_step(
+                step_context,
+                {
+                    "task_id": task_id,
+                    "step_id": claimed["step"]["step_id"],
+                    "status": "completed",
+                    "result_summary": final_text.strip()[:500] or "external worker completed",
+                },
+            )
+        else:
+            model_config = resolve_model_config(self.config, definition.model_profile)
+            async with asyncio.timeout(_child_timeout_seconds(self.config, timeout_ms)):
+                for _turn in range(self.config.runtime.max_turns):
+                    system_blocks = build_system_blocks(
+                        home_dir=self.paths.home_dir,
+                        project_dir=self.paths.project_dir,
+                        context_state=self._context_state_for_session(session_id),
+                        memory_enabled=self.config.memory.enabled,
+                        memory_dir_template=self.config.memory.memory_dir,
+                    ) + [
+                        SystemBlock(
+                            block_id=f"agent_definition.{worker.agent_definition_id}",
+                            source="agent_definition",
+                            content=_agent_definition_body_with_default(
+                                self.agent_definitions,
+                                definition,
+                                default_id="default_worker_agent",
+                            ),
+                            priority=900,
+                            dynamic=True,
+                            metadata={
+                                "agent_definition_id": worker.agent_definition_id,
+                                "fallback_default_id": None if definition.body else "default_worker_agent",
+                            },
+                        )
+                    ]
+                    context_bundle = _apply_context_budget(
+                        messages=messages,
+                        system_blocks=system_blocks,
+                        context_config=self.config.context,
+                        model_config=model_config,
                     )
-                    for result in tool_results
-                ]
-                tool_node = await self.store.add_node(
-                    session_id=session_id,
-                    parent_id=end_node_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    role="tool",
-                    node_type="worker_tool_result",
-                    content=tool_content,
-                    metadata={},
-                    make_active=False,
-                )
-                end_node_id = tool_node.node_id
-                messages.append(
-                    ModelMessage(
-                        role=ModelRole.TOOL,
-                        content=tool_content,
+                    await self._emit_child_run_event(
+                        stream=worker_stream,
+                        mirror_handle=parent_handle,
+                        session_id=session_id,
+                        agent_id=agent_id,
+                        run_id=run_id,
+                        event_type="context_built",
+                        payload=_context_build_report(
+                            context_bundle["messages"],
+                            system_blocks,
+                            tools,
+                            trimmed_node_ids=context_bundle["trimmed_node_ids"],
+                            budget=context_bundle["budget"],
+                            tokens_before_trim=context_bundle["tokens_before_trim"],
+                            tokens_after_trim=context_bundle["tokens_after_trim"],
+                            non_system_tokens_before_trim=context_bundle["non_system_tokens_before_trim"],
+                            non_system_tokens_after_trim=context_bundle["non_system_tokens_after_trim"],
+                            too_long=context_bundle["too_long"],
+                        )
+                        | {"model": model_config.name},
+                    )
+                    if context_bundle["too_long"]:
+                        raise AgentCoreError(
+                            ErrorCode.VALIDATION_ERROR,
+                            "prompt_too_long",
+                            details={
+                                "end_reason": "prompt_too_long",
+                                "estimated_input_tokens": context_bundle["tokens_after_trim"],
+                                "non_system_budget": context_bundle["budget"],
+                            },
+                        )
+                    request = ModelRequest(
+                        model=model_config.name,
+                        system=system_blocks,
+                        messages=context_bundle["messages"],
+                        tools=tools,
+                        temperature=model_config.temperature,
+                        max_output_tokens=model_config.max_output_tokens,
+                        metadata={"session_id": session_id, "run_id": run_id, "parent_run_id": parent_run_id, "worker_id": worker.worker_id},
+                    )
+                    provider = self._provider_for_model(model_config)
+                    _ensure_provider_supports_request(provider, request)
+                    async def on_worker_model_event(event: Any) -> None:
+                        await self._emit_child_model_event(
+                            stream=worker_stream,
+                            session_id=session_id,
+                            agent_id=agent_id,
+                            run_id=run_id,
+                            event=event,
+                        )
+                        if event.event_type == "model_text_delta" and event.text_delta:
+                            await self._emit_child_run_event(
+                                stream=worker_stream,
+                                mirror_handle=parent_handle,
+                                session_id=session_id,
+                                agent_id=agent_id,
+                                run_id=run_id,
+                                event_type="worker_text_delta",
+                                payload={
+                                    "text": event.text_delta,
+                                    "worker_id": worker.worker_id,
+                                    "worker_agent_id": agent_id,
+                                    "child_run_id": run_id,
+                                },
+                            )
+
+                    completed, text_parts = await _collect_model_completion(
+                        provider,
+                        request,
+                        provider_failure_message="worker provider failed",
+                        on_model_event=on_worker_model_event,
+                        on_completed=lambda event: self._persist_run_debug_artifact(
+                            session_id=session_id,
+                            agent_id=agent_id,
+                            run_id=run_id,
+                            model_event=event,
+                            node_id=None,
+                        ),
+                    )
+                    final_text += "".join(text_parts)
+                    assistant_content = list(completed.content)
+                    for block in completed.content:
+                        if getattr(block, "type", None) == "text":
+                            final_text = getattr(block, "text", final_text)
+                    for call in completed.tool_calls:
+                        assistant_content.append(ToolCallBlock(tool_call_id=call.tool_call_id, name=call.name, arguments=call.arguments, metadata=call.metadata))
+                    assistant_node = await self.store.add_node(
+                        session_id=session_id,
+                        parent_id=end_node_id,
+                        agent_id=agent_id,
+                        run_id=run_id,
+                        role="assistant",
+                        node_type="worker_message",
+                        content=assistant_content,
+                        metadata={"stop_reason": completed.stop_reason.value if completed.stop_reason else None},
+                        make_active=False,
+                    )
+                    end_node_id = assistant_node.node_id
+                    messages.append(
+                        ModelMessage(
+                            role=ModelRole.ASSISTANT,
+                            content=assistant_content,
+                            node_type="worker_message",
+                            metadata={"node_id": assistant_node.node_id},
+                        )
+                    )
+                    if not completed.tool_calls:
+                        _validate_expected_output_schema(final_text, expected_output_schema)
+                        worker_result = {"text": final_text}
+                        break
+                    tool_results = await execute_worker_tool_calls(
+                        self,
+                        session_id=session_id,
+                        run_id=run_id,
+                        agent_id=agent_id,
+                        parent_agent_id=parent_agent_id,
+                        parent_run_id=parent_run_id,
+                        calls=completed.tool_calls,
+                        worker_scope=worker_scope,
+                        allowed_tool_names=base_names,
+                        stream=worker_stream,
+                    )
+                    tool_content = [
+                        ToolResultBlock(
+                            tool_call_id=result.tool_call_id,
+                            is_error=result.is_error,
+                            content=result.content,
+                            error=result.error,
+                            metadata={**result.metadata, "tool_name": result.tool_name},
+                        )
+                        for result in tool_results
+                    ]
+                    tool_node = await self.store.add_node(
+                        session_id=session_id,
+                        parent_id=end_node_id,
+                        agent_id=agent_id,
+                        run_id=run_id,
+                        role="tool",
                         node_type="worker_tool_result",
-                        metadata={"node_id": tool_node.node_id},
+                        content=tool_content,
+                        metadata={},
+                        make_active=False,
                     )
-                )
-            else:
-                raise AgentCoreError(ErrorCode.INTERNAL_ERROR, "worker max turns exceeded")
+                    end_node_id = tool_node.node_id
+                    messages.append(
+                        ModelMessage(
+                            role=ModelRole.TOOL,
+                            content=tool_content,
+                            node_type="worker_tool_result",
+                            metadata={"node_id": tool_node.node_id},
+                        )
+                    )
+                else:
+                    raise AgentCoreError(ErrorCode.INTERNAL_ERROR, "worker max turns exceeded")
         if error_payload:
             raise AgentCoreError(error_payload.code, error_payload.message, details=error_payload.details)
         fallback = fail_unclosed_worker_step(
@@ -399,6 +522,7 @@ async def run_worker_agent(
                 "worker_agent_id": agent_id,
                 "child_run_id": run_id,
                 "stream_id": run_id,
+                "worker_result": worker_result or {"text": final_text},
             },
         )
         await self.store.update_agent(
@@ -415,6 +539,8 @@ async def run_worker_agent(
             "worker_agent_id": agent_id,
             "worker_id": worker.worker_id,
             "child_run_id": run_id,
+            "worker_start_node_id": start_node.node_id,
+            "worker_end_node_id": end_node_id,
             "stream_id": run_id,
             "selection_reason": _worker_selection_reason(worker_agent_id=worker_agent_id, queued=queued),
             "worker_result": worker_result or {"text": final_text},
@@ -627,6 +753,44 @@ async def _wait_for_worker_queue_turn(
     except asyncio.CancelledError:
         runtime.cancel_worker_queue_item(queue_id)
         raise
+
+
+async def _worker_context_messages(runtime: Any, *, session_id: str, worker_agent_id: str, start_node: Node) -> list[ModelMessage]:
+    active_path = await _active_path(runtime, session_id)
+    context_nodes = await _worker_history_nodes_from_active_path(runtime, session_id=session_id, worker_agent_id=worker_agent_id, active_path=active_path)
+    context_nodes.append(start_node)
+    return build_context_messages(context_nodes)
+
+
+async def _active_path(runtime: Any, session_id: str) -> list[Node]:
+    active_node_id = await runtime.store.active_node_id(session_id)
+    if not active_node_id:
+        return []
+    return await runtime.store.get_session_node_path(session_id, active_node_id)
+
+
+async def _worker_history_nodes_from_active_path(runtime: Any, *, session_id: str, worker_agent_id: str, active_path: list[Node]) -> list[Node]:
+    end_node_ids = _worker_end_node_ids_from_active_path(active_path)
+    by_id: dict[str, Node] = {}
+    for end_node_id in end_node_ids:
+        path = await runtime.store.get_session_node_path(session_id, end_node_id)
+        for node in path:
+            if node.agent_id == worker_agent_id and node.node_type in WORKER_CONTEXT_NODE_TYPES:
+                by_id[node.node_id] = node
+    return list(by_id.values())
+
+
+def _worker_end_node_ids_from_active_path(active_path: list[Node]) -> list[str]:
+    node_ids: list[str] = []
+    for node in active_path:
+        for block in node.content:
+            if getattr(block, "type", None) != "tool_result":
+                continue
+            for item in getattr(block, "content", []):
+                data = getattr(item, "data", None)
+                if isinstance(data, dict) and data.get("worker_end_node_id"):
+                    node_ids.append(str(data["worker_end_node_id"]))
+    return list(dict.fromkeys(node_ids))
 
 
 def _wake_next_worker_queue_item(runtime: Any, worker_id: str) -> None:

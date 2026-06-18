@@ -1,24 +1,47 @@
-import { GitBranch, GitFork, Square } from "lucide-react";
-import { KeyboardEvent, useEffect, useState } from "react";
+import { GitBranch, GitFork, Reply, Send, Square, X } from "lucide-react";
+import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api/client";
+import { failedLocalMessage, localUserMessage } from "../../messages/localMessages";
 import { useAppDispatch, useAppState } from "../../state/store";
-import type { BranchableNode, PermissionRequest } from "../../types";
+import type { BranchableNode, Message, PermissionRequest } from "../../types";
 
 export function MessageStream() {
-  const { activeConversationId, messagesByConversation, permissionsByConversation } = useAppState();
+  const { activeConversationId, conversationWorkersByConversation, messagesByConversation, permissionsByConversation } = useAppState();
   const dispatch = useAppDispatch();
   const messages = activeConversationId ? messagesByConversation[activeConversationId] ?? [] : [];
   const permissions = activeConversationId ? permissionsByConversation[activeConversationId] ?? [] : [];
+  const conversationWorkers = activeConversationId ? conversationWorkersByConversation[activeConversationId] ?? [] : [];
+  const streamEndRef = useRef<HTMLDivElement | null>(null);
+  const scrollKey = useMemo(
+    () => messages.map((message) => `${message.message_id}:${message.updated_at}:${message.display_text.length}:${message.status}`).join("|"),
+    [messages],
+  );
   const [branchNodes, setBranchNodes] = useState<BranchableNode[]>([]);
   const [branchMode, setBranchMode] = useState<"branch" | "fork">("branch");
   const [showBranchPicker, setShowBranchPicker] = useState(false);
   const [selectedNode, setSelectedNode] = useState(0);
+  const [replyingToMessageId, setReplyingToMessageId] = useState<string | null>(null);
+  const [replyText, setReplyText] = useState("");
+  const [replyError, setReplyError] = useState<string | null>(null);
+  const replyInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     setShowBranchPicker(false);
     setBranchNodes([]);
     setSelectedNode(0);
+    setReplyingToMessageId(null);
+    setReplyText("");
+    setReplyError(null);
   }, [activeConversationId]);
+
+  useEffect(() => {
+    streamEndRef.current?.scrollIntoView?.({ block: "end" });
+  }, [activeConversationId, permissions.length, scrollKey]);
+
+  useEffect(() => {
+    if (!replyingToMessageId) return;
+    requestAnimationFrame(() => replyInputRef.current?.focus());
+  }, [replyingToMessageId]);
 
   async function refreshMessages() {
     if (!activeConversationId) return;
@@ -84,6 +107,29 @@ export function MessageStream() {
     }
   }
 
+  function openWorkerReply(message: Message) {
+    setReplyingToMessageId(message.message_id);
+    setReplyText("");
+    setReplyError(null);
+  }
+
+  async function sendWorkerReply(event: FormEvent, replyTarget: WorkerReplyTarget) {
+    event.preventDefault();
+    if (!activeConversationId || !replyText.trim()) return;
+    const outgoingText = `@${replyTarget.workerId} ${replyText.trim()}`;
+    const pendingMessage = localUserMessage(activeConversationId, outgoingText, conversationWorkers);
+    try {
+      setReplyError(null);
+      dispatch({ type: "localMessage", conversationId: activeConversationId, message: pendingMessage });
+      setReplyText("");
+      setReplyingToMessageId(null);
+      await api.sendMessage(activeConversationId, outgoingText);
+    } catch (err) {
+      dispatch({ type: "localMessage", conversationId: activeConversationId, message: failedLocalMessage(pendingMessage, err) });
+      setReplyError(err instanceof Error ? err.message : "Failed to send reply.");
+    }
+  }
+
   return (
     <div className="message-stream">
       <div className="stream-toolbar">
@@ -144,37 +190,89 @@ export function MessageStream() {
         </div>
       ) : null}
       {messages.length === 0 ? <div className="empty-state">No messages yet.</div> : null}
-      {messages.map((message) => (
-        <article key={message.message_id} className={`message-bubble ${message.sender_type}`}>
-          <div className="message-meta">
-            <span>{messageTitle(message)}</span>
-            <span>{message.status}</span>
-          </div>
-          <p>{message.display_text || message.original_text}</p>
-          {message.sender_type !== "user" && ["queued", "running"].includes(message.status) ? (
-            <div className="message-actions">
-              <button onClick={() => cancelMessage(message.core_run_id, message.queue_id)} title="Cancel">
-                <Square size={14} />
-              </button>
+      {messages.map((message) => {
+        const replyTarget = workerReplyTarget(message);
+        return (
+          <article key={message.message_id} className={`message-bubble ${message.sender_type}`}>
+            <div className="message-meta">
+              <span>{messageTitle(message)}</span>
+              <span>{message.status}</span>
             </div>
-          ) : null}
-          {message.sender_type === "user" && message.core_node_id ? (
-            <div className="message-actions">
-              <button onClick={() => branchFrom(message.core_node_id!)} title="Branch from here">
-                <GitBranch size={14} />
-              </button>
-              <button onClick={() => forkFrom(message.core_node_id!)} title="Fork conversation">
-                <GitFork size={14} />
-              </button>
-            </div>
-          ) : null}
-        </article>
-      ))}
+            <p className={messageText(message) ? undefined : "message-placeholder"}>{messageText(message) || placeholderText(message)}</p>
+            {message.sender_type !== "user" && ["queued", "running"].includes(message.status) ? (
+              <div className="message-actions">
+                <button onClick={() => cancelMessage(message.core_run_id, message.queue_id)} title="Cancel">
+                  <Square size={14} />
+                </button>
+              </div>
+            ) : null}
+            {replyTarget ? (
+              <div className="message-actions">
+                <button
+                  type="button"
+                  className="reply-action"
+                  onClick={() => openWorkerReply(message)}
+                  title={`Reply to ${replyTarget.name}`}
+                >
+                  <Reply size={14} />
+                  <span>Reply</span>
+                </button>
+              </div>
+            ) : null}
+            {replyingToMessageId === message.message_id && replyTarget ? (
+              <form className="inline-reply" onSubmit={(event) => sendWorkerReply(event, replyTarget)}>
+                {replyError ? <div className="inline-reply-error">{replyError}</div> : null}
+                <div className="inline-reply-header">
+                  <span>Reply to {replyTarget.name}</span>
+                  <button type="button" onClick={() => setReplyingToMessageId(null)} aria-label="Cancel reply">
+                    <X size={14} />
+                  </button>
+                </div>
+                <div className="inline-reply-row">
+                  <input
+                    ref={replyInputRef}
+                    value={replyText}
+                    onChange={(event) => {
+                      setReplyText(event.target.value);
+                      setReplyError(null);
+                    }}
+                    placeholder={`Message ${replyTarget.name}`}
+                  />
+                  <button type="submit" disabled={!replyText.trim()} aria-label={`Send reply to ${replyTarget.name}`}>
+                    <Send size={14} />
+                  </button>
+                </div>
+              </form>
+            ) : null}
+            {message.sender_type === "user" && message.core_node_id ? (
+              <div className="message-actions">
+                <button onClick={() => branchFrom(message.core_node_id!)} title="Branch from here">
+                  <GitBranch size={14} />
+                </button>
+                <button onClick={() => forkFrom(message.core_node_id!)} title="Fork conversation">
+                  <GitFork size={14} />
+                </button>
+              </div>
+            ) : null}
+          </article>
+        );
+      })}
       {permissions.map((permission) => (
         <PermissionCard key={permission.permission_request_id} permission={permission} />
       ))}
+      <div ref={streamEndRef} aria-hidden="true" />
     </div>
   );
+}
+
+function messageText(message: { display_text: string; original_text: string }) {
+  return message.display_text || message.original_text;
+}
+
+function placeholderText(message: { sender_type: string; status: string }) {
+  if (message.sender_type !== "user" && ["queued", "running"].includes(message.status)) return "Generating...";
+  if (message.status === "sending") return "Sending...";
+  return "No content.";
 }
 
 function messageTitle(message: { sender_name: string; sender_type: string; target_type?: string | null; metadata?: Record<string, unknown> }) {
@@ -189,6 +287,35 @@ function messageTitle(message: { sender_name: string; sender_type: string; targe
     }
   }
   return message.sender_name;
+}
+
+type WorkerReplyTarget = {
+  workerId: string;
+  name: string;
+};
+
+function workerReplyTarget(message: Message): WorkerReplyTarget | null {
+  if (message.sender_type === "user" || ["queued", "running"].includes(message.status)) return null;
+  const metadata = message.metadata ?? {};
+  const snapshot = metadata.worker_snapshot && typeof metadata.worker_snapshot === "object" && !Array.isArray(metadata.worker_snapshot)
+    ? (metadata.worker_snapshot as Record<string, unknown>)
+    : {};
+  const workerId = firstString(message.worker_id, metadata.worker_id, metadata.target_worker_id, snapshot.worker_id);
+  if (!workerId) return null;
+  const name = firstString(
+    message.sender_type === "worker" && message.sender_name !== "Worker" ? message.sender_name : undefined,
+    metadata.target_worker_name,
+    snapshot.name,
+    workerId,
+  );
+  return { workerId, name: name ?? workerId };
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
 }
 
 function PermissionCard({ permission }: { permission: PermissionRequest }) {

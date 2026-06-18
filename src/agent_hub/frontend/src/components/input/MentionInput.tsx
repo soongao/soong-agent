@@ -1,6 +1,7 @@
 import { Send } from "lucide-react";
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api/client";
+import { failedLocalMessage, localUserMessage } from "../../messages/localMessages";
 import { useAppDispatch, useAppState } from "../../state/store";
 import type { Message } from "../../types";
 
@@ -29,7 +30,7 @@ const SLASH_COMMANDS: SlashOption[] = [
 ];
 
 export function MentionInput() {
-  const { activeConversationId, conversations, health, messagesByConversation, workers } = useAppState();
+  const { activeConversationId, conversationWorkersByConversation, conversations, health, messagesByConversation, workers } = useAppState();
   const dispatch = useAppDispatch();
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -39,7 +40,11 @@ export function MentionInput() {
   const activeConversation = conversations.find((conversation) => conversation.conversation_id === activeConversationId);
   const showMentionMenu = text.startsWith("@") && !text.includes(" ");
   const showSlashMenu = text.startsWith("/") && !text.includes(" ");
-  const options = useMemo(() => ["Orchestrator", ...workers.filter((worker) => worker.enabled && !worker.deleted_at).map((worker) => worker.worker_id)], [workers]);
+  const conversationWorkers = activeConversationId ? conversationWorkersByConversation[activeConversationId] ?? [] : [];
+  const options = useMemo(
+    () => ["Orchestrator", ...conversationWorkers.filter((worker) => worker.enabled && !worker.deleted_at).map((worker) => worker.worker_id)],
+    [conversationWorkers],
+  );
   const slashOptions = useMemo(() => buildSlashOptions(text, health?.context?.skills ?? []), [health?.context?.skills, text]);
 
   useEffect(() => {
@@ -60,13 +65,15 @@ export function MentionInput() {
       await handleSlashCommand(trimmed);
       return;
     }
+    const pendingMessage = localUserMessage(activeConversationId, text, conversationWorkers);
     try {
-      await api.sendMessage(activeConversationId, text);
-      const messages = await api.messages(activeConversationId);
-      dispatch({ type: "messages", conversationId: activeConversationId, messages: messages.messages });
+      dispatch({ type: "localMessage", conversationId: activeConversationId, message: pendingMessage });
       setText("");
+      await api.sendMessage(activeConversationId, text);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to send message.");
+      dispatch({ type: "localMessage", conversationId: activeConversationId, message: failedLocalMessage(pendingMessage, err) });
+      setText(text);
     }
   }
 
@@ -103,6 +110,7 @@ export function MentionInput() {
     const [command = "", ...rest] = commandText.split(/\s+/);
     const argument = rest.join(" ").trim();
     const skillNames = new Set((health?.context?.skills ?? []).map((skill) => skill.name));
+    let pendingMessage: Message | null = null;
     try {
       if (command === "help") {
         addSystemMessage(slashHelpText(health?.context?.skills ?? []));
@@ -148,10 +156,11 @@ export function MentionInput() {
           setError("usage: /plan <goal>");
           return;
         }
-        await api.sendMessage(activeConversationId!, planRequestMessage(argument));
-        const messages = await api.messages(activeConversationId!);
-        dispatch({ type: "messages", conversationId: activeConversationId!, messages: messages.messages });
+        const outgoing = planRequestMessage(argument);
+        pendingMessage = localUserMessage(activeConversationId!, outgoing, conversationWorkers);
+        dispatch({ type: "localMessage", conversationId: activeConversationId!, message: pendingMessage });
         setText("");
+        await api.sendMessage(activeConversationId!, outgoing);
         return;
       }
       if (command === "branch") {
@@ -223,15 +232,19 @@ export function MentionInput() {
           setError(`Message text is required after /${command}.`);
           return;
         }
+        pendingMessage = localUserMessage(activeConversationId!, argument, conversationWorkers);
+        dispatch({ type: "localMessage", conversationId: activeConversationId!, message: pendingMessage });
+        setText("");
         await api.loadSkill(activeConversationId!, command);
         await api.sendMessage(activeConversationId!, argument);
-        const messages = await api.messages(activeConversationId!);
-        dispatch({ type: "messages", conversationId: activeConversationId!, messages: messages.messages });
-        setText("");
         return;
       }
       setError(`Unknown slash command: /${command}. Use /help for commands.`);
     } catch (err) {
+      if (pendingMessage) {
+        dispatch({ type: "localMessage", conversationId: activeConversationId!, message: failedLocalMessage(pendingMessage, err) });
+        setText(trimmed);
+      }
       setError(err instanceof Error ? err.message : "Slash command failed.");
     }
   }

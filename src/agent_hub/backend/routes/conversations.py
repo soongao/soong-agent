@@ -8,12 +8,15 @@ from agent_hub.backend.models import (
     ConversationCancelRequest,
     ConversationCreateRequest,
     ConversationListResponse,
+    ConversationWorkerAddRequest,
+    ConversationWorkerListResponse,
     ForkRequest,
     MessageListResponse,
     MessageSendRequest,
     MessageSendResponse,
     SkillLoadRequest,
 )
+from agent_hub.backend.services.workers import redact_worker_payload, worker_runtime_status
 from agent_hub.backend.services.conversations import fork_conversation, get_active_conversation, switch_branch, validate_skill_load_name
 from agent_hub.backend.state import HubAppState, require_runtime_bridge
 
@@ -52,6 +55,43 @@ async def list_messages(conversation_id: str, request: Request, limit: int = 100
     state: HubAppState = request.app.state.hub
     await get_active_conversation(state, conversation_id)
     return MessageListResponse(messages=await state.db.list_messages(conversation_id, limit=limit))
+
+
+@router.get("/{conversation_id}/workers")
+async def list_conversation_workers(conversation_id: str, request: Request) -> ConversationWorkerListResponse:
+    state: HubAppState = request.app.state.hub
+    runtime = require_runtime_bridge(state).runtime
+    conversation = await get_active_conversation(state, conversation_id)
+    worker_ids = set(await state.db.list_conversation_worker_ids(conversation.conversation_id))
+    workers = [
+        redact_worker_payload(worker.model_dump(mode="json") | worker_runtime_status(runtime, worker))
+        for worker in await runtime.list_worker_configs(include_disabled=True, include_deleted=False)
+        if worker.worker_id in worker_ids
+    ]
+    return ConversationWorkerListResponse(workers=workers)
+
+
+@router.post("/{conversation_id}/workers")
+async def add_conversation_worker(conversation_id: str, payload: ConversationWorkerAddRequest, request: Request) -> dict:
+    state: HubAppState = request.app.state.hub
+    runtime = require_runtime_bridge(state).runtime
+    conversation = await get_active_conversation(state, conversation_id)
+    worker = await runtime.get_worker_config(payload.worker_id)
+    if worker is None or worker.deleted_at is not None:
+        from agent_hub.backend.errors import raise_hub_error
+
+        raise_hub_error(404, "worker_not_found", f"Worker not found: {payload.worker_id}")
+    await state.db.add_conversation_worker(conversation.conversation_id, worker.worker_id)
+    return redact_worker_payload(worker.model_dump(mode="json") | worker_runtime_status(runtime, worker))
+
+
+@router.delete("/{conversation_id}/workers/{worker_id}")
+async def remove_conversation_worker(conversation_id: str, worker_id: str, request: Request) -> dict:
+    state: HubAppState = request.app.state.hub
+    require_runtime_bridge(state)
+    conversation = await get_active_conversation(state, conversation_id)
+    await state.db.remove_conversation_worker(conversation.conversation_id, worker_id)
+    return {"conversation_id": conversation.conversation_id, "worker_id": worker_id, "removed": True}
 
 
 @router.post("/{conversation_id}/messages")

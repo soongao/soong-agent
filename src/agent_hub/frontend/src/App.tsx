@@ -24,9 +24,10 @@ export function App() {
 
   useEffect(() => {
     if (!activeConversationId) return;
-    void api.messages(activeConversationId).then((response) =>
-      dispatch({ type: "messages", conversationId: activeConversationId, messages: response.messages }),
-    );
+    void Promise.all([api.messages(activeConversationId), api.conversationWorkers(activeConversationId)]).then(([messages, conversationWorkers]) => {
+      dispatch({ type: "messages", conversationId: activeConversationId, messages: messages.messages });
+      dispatch({ type: "conversationWorkers", conversationId: activeConversationId, workers: conversationWorkers.workers });
+    });
     dispatch({ type: "eventConnection", status: "connecting" });
     const events = api.eventSource(activeConversationId);
     events.onopen = () => dispatch({ type: "eventConnection", status: "open" });

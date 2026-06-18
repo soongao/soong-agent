@@ -42,6 +42,7 @@ from agent_core.api.runtime_helpers.agents import child as runtime_child
 from agent_core.api.runtime_helpers.agents import compact as runtime_compact
 from agent_core.api.runtime_helpers.agents import tools as runtime_agent_tools
 from agent_core.api.runtime_helpers.agents import worker as runtime_worker
+from agent_core.api.runtime_helpers.agents.worker_executor import WorkerExecutor
 from agent_core.api.runtime_helpers import artifacts as runtime_artifacts
 from agent_core.api.runtime_helpers.tools import execute_tool_calls
 from agent_core.api.runtime_helpers.views import (
@@ -164,6 +165,7 @@ class AgentRuntime:
         self._worker_queue_limit = 20
         self._worker_run_tasks: dict[str, asyncio.Task[Any]] = {}
         self._worker_run_meta: dict[str, dict[str, Any]] = {}
+        self._worker_executors: dict[str, WorkerExecutor] = {}
         self._child_managers: dict[str, ChildAgentManager] = {}
         self._child_run_streams: dict[str, EventStream] = {}
         self._session_child_counts: dict[str, int] = defaultdict(int)
@@ -207,6 +209,12 @@ class AgentRuntime:
 
     def register_tool(self, definition: ToolDefinition, handler: Any) -> None:
         self.tool_registry.register_tool(definition, handler)
+
+    def register_worker_executor(self, executor_type: str, executor: WorkerExecutor) -> None:
+        key = str(executor_type).strip()
+        if not key:
+            raise AgentCoreError(ErrorCode.VALIDATION_ERROR, "worker executor type cannot be empty")
+        self._worker_executors[key] = executor
 
     def register_agent_definition(self, definition: AgentDefinition, source: Literal["code"] = "code") -> None:
         missing = [name for name in definition.suggested_tools if self.tool_registry.get(name) is None]
