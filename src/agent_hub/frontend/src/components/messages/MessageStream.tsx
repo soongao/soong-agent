@@ -194,6 +194,7 @@ export function MessageStream() {
         const replyTarget = workerReplyTarget(message);
         return (
           <article key={message.message_id} className={`message-bubble ${message.sender_type}`}>
+            <div className="message-rail" aria-hidden="true" />
             <div className="message-meta">
               <span>{messageTitle(message)}</span>
               <span>{message.status}</span>
