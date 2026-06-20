@@ -18,6 +18,7 @@ from agent_hub.backend.events import HubEventHub
 from agent_hub.backend.models import ConversationView, MessageView
 from agent_hub.backend.permissions import PermissionBridge
 from agent_hub.backend.services.workers import redact_worker_payload
+from agent_hub.backend.workers.executors.claude_code_pty import ClaudeCodePtyWorkerExecutor
 from agent_hub.backend.workers.executors.codex_pty import CodexPtyWorkerExecutor
 from agent_hub.backend.workers.executors.opencode import OpenCodeWorkerExecutor
 from agent_hub.backend.workers.pty import PtySessionManager
@@ -59,9 +60,11 @@ class HubRuntimeBridge:
         self._external_executors = [
             OpenCodeWorkerExecutor(db=db, permission_bridge=permission_bridge, project_dir=project_dir),
             CodexPtyWorkerExecutor(pty_manager=self._pty_manager, project_dir=project_dir),
+            ClaudeCodePtyWorkerExecutor(pty_manager=self._pty_manager, project_dir=project_dir),
         ]
         self.runtime.register_worker_executor("opencode", self._external_executors[0])
         self.runtime.register_worker_executor("codex_pty", self._external_executors[1])
+        self.runtime.register_worker_executor("claude_code_pty", self._external_executors[2])
         self._run_tasks: dict[str, asyncio.Task[Any]] = {}
 
     async def start(self) -> None:

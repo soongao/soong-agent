@@ -51,6 +51,11 @@ const supportedExternalExecutors = [
     type: "codex_pty",
     description: "Codex PTY adapter",
   },
+  {
+    label: "Claude Code",
+    type: "claude_code_pty",
+    description: "Claude Code PTY adapter",
+  },
 ];
 
 export function WorkerEditorDialog({ worker, kind, tools, onClose, onSaved }: WorkerEditorDialogProps) {

@@ -71,4 +71,21 @@ DEFAULT_HUB_WORKERS: tuple[WorkerConfigCreate, ...] = (
             },
         },
     ),
+    WorkerConfigCreate(
+        worker_id="claude_code_pty_worker",
+        name="Claude Code PTY Worker",
+        description="Delegates tasks to the local Claude Code interactive CLI through a reusable PTY session with streamed output.",
+        system_prompt=(
+            "You are an external Claude Code PTY worker. Treat the orchestrator dispatch as the user's request. "
+            "The Hub streams your terminal output to the user; if you need permission input, wait for the user's reply."
+        ),
+        allowed_tools=["claude_code.pty"],
+        metadata={
+            "agenthub_default_worker": True,
+            "worker_executor": {
+                "type": "claude_code_pty",
+                "config": {},
+            },
+        },
+    ),
 )

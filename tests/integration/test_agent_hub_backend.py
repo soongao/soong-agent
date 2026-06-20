@@ -319,7 +319,7 @@ def test_agent_hub_seeds_editable_default_workers_once(isolated_dirs, scripted_o
     with TestClient(app) as client:
         workers = client.get("/workers").json()["workers"]
         seeded = {worker["worker_id"]: worker for worker in workers}
-        assert {"code_reviewer", "doc_writer", "test_writer", "opencode_worker", "codex_pty_worker"} <= set(seeded)
+        assert {"code_reviewer", "doc_writer", "test_writer", "opencode_worker", "codex_pty_worker", "claude_code_pty_worker"} <= set(seeded)
         assert seeded["code_reviewer"]["source"] == "dynamic"
         assert seeded["code_reviewer"]["metadata"]["agenthub_default_worker"] is True
         assert seeded["doc_writer"]["allowed_tools"] == ["code.read_file", "code.list_dir", "code.search", "code.write_file", "code.edit_file"]
@@ -328,6 +328,8 @@ def test_agent_hub_seeds_editable_default_workers_once(isolated_dirs, scripted_o
         assert seeded["opencode_worker"]["allowed_tools"] == ["opencode.acp"]
         assert seeded["codex_pty_worker"]["metadata"]["worker_executor"]["type"] == "codex_pty"
         assert seeded["codex_pty_worker"]["allowed_tools"] == ["codex.pty"]
+        assert seeded["claude_code_pty_worker"]["metadata"]["worker_executor"]["type"] == "claude_code_pty"
+        assert seeded["claude_code_pty_worker"]["allowed_tools"] == ["claude_code.pty"]
 
         renamed = client.patch(
             "/workers/code_reviewer",

@@ -7,6 +7,7 @@ import pytest
 
 from agent_core.agents.workers import WorkerRuntimeState
 from agent_core.api.runtime_helpers.agents.worker_executor import WorkerExecutorContext
+from agent_hub.backend.workers.executors.claude_code_pty.executor import _claude_code_command
 from agent_hub.backend.workers.executors.codex_pty.executor import _codex_command, _prompt_text
 from agent_hub.backend.workers.executors.codex_pty import CodexPtyWorkerExecutor
 from agent_hub.backend.workers.pty import PtySessionKey, PtySessionManager
@@ -190,6 +191,49 @@ def test_codex_command_splits_string_override() -> None:
         "--no-alt-screen",
         "--cd",
         "/tmp",
+        "hello world",
+    ]
+
+
+def test_claude_code_command_uses_help_confirmed_interactive_flags(tmp_path) -> None:
+    command = _claude_code_command(
+        {
+            "binary": "/usr/local/bin/claude",
+            "model": "sonnet",
+            "permission_mode": "plan",
+            "args": ["--add-dir", str(tmp_path / "docs")],
+        },
+        cwd=tmp_path,
+        initial_prompt="hello\nworld",
+    )
+
+    assert command == [
+        "/usr/local/bin/claude",
+        "--ax-screen-reader",
+        "--model",
+        "sonnet",
+        "--permission-mode",
+        "plan",
+        "--add-dir",
+        str(tmp_path / "docs"),
+        "hello\nworld",
+    ]
+
+
+def test_claude_code_command_can_disable_ax_screen_reader(tmp_path) -> None:
+    command = _claude_code_command(
+        {"binary": "claude", "ax_screen_reader": False},
+        cwd=tmp_path,
+        initial_prompt=None,
+    )
+
+    assert command == ["claude"]
+
+
+def test_claude_code_command_splits_string_override() -> None:
+    assert _claude_code_command({"command": "claude --safe-mode"}, cwd=Path("/ignored"), initial_prompt="hello world") == [
+        "claude",
+        "--safe-mode",
         "hello world",
     ]
 

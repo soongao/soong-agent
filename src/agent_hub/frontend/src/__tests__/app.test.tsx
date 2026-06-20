@@ -1008,6 +1008,7 @@ describe("Agent Hub app", () => {
     expect(within(dialog).queryByLabelText("Provider")).not.toBeInTheDocument();
     expect(within(dialog).getByLabelText("Supported external workers")).toHaveTextContent("OpenCode");
     expect(within(dialog).getByLabelText("Supported external workers")).toHaveTextContent("Codex");
+    expect(within(dialog).getByLabelText("Supported external workers")).toHaveTextContent("Claude Code");
     expect(within(dialog).getByText("Other external workers need an adapter first.")).toBeInTheDocument();
     fireEvent.change(within(dialog).getByLabelText("Worker ID"), { target: { value: "external_worker" } });
     fireEvent.change(within(dialog).getByLabelText("System Prompt"), { target: { value: "External worker prompt." } });
@@ -1044,6 +1045,15 @@ describe("Agent Hub app", () => {
     const dialog = await screen.findByRole("dialog", { name: "Create Worker" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Use Codex external worker" }));
     expect(within(dialog).getByLabelText("Executor Type")).toHaveValue("codex_pty");
+  });
+
+  it("fills the claude code external executor type from the supported worker option", async () => {
+    renderApp();
+    await screen.findByText("Reviewer");
+    fireEvent.click(screen.getByRole("button", { name: "New External" }));
+    const dialog = await screen.findByRole("dialog", { name: "Create Worker" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Use Claude Code external worker" }));
+    expect(within(dialog).getByLabelText("Executor Type")).toHaveValue("claude_code_pty");
   });
 
   it("loads existing external executor worker config into the form", async () => {
