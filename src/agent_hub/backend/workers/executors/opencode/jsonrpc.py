@@ -20,10 +20,12 @@ class JsonRpcProcess:
         command: list[str],
         reverse_request_handler: ReverseRequestHandler,
         notification_handler: NotificationHandler,
+        log_name: str = "jsonrpc",
     ) -> None:
         self.command = command
         self._reverse_request_handler = reverse_request_handler
         self._notification_handler = notification_handler
+        self._log_name = log_name
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -65,6 +67,9 @@ class JsonRpcProcess:
         await self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
         return await future
 
+    async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        await self._send({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
     async def _send_result(self, request_id: Any, result: Any) -> None:
         await self._send({"jsonrpc": "2.0", "id": request_id, "result": result if result is not None else {}})
 
@@ -93,7 +98,7 @@ class JsonRpcProcess:
             try:
                 message = json.loads(line.decode("utf-8"))
             except Exception:
-                logger.warning("ignoring malformed JSON-RPC line from opencode: %r", line[:500])
+                logger.warning("ignoring malformed JSON-RPC line from %s: %r", self._log_name, line[:500])
                 continue
             await self._handle_message(message)
 
@@ -105,7 +110,7 @@ class JsonRpcProcess:
                 return
             text = line.decode("utf-8", errors="replace").rstrip()
             self._stderr_lines.append(text)
-            logger.debug("opencode acp stderr: %s", text)
+            logger.debug("%s stderr: %s", self._log_name, text)
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
         if "id" in message and ("result" in message or "error" in message) and "method" not in message:

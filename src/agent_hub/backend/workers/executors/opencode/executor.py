@@ -98,6 +98,7 @@ class OpenCodeWorkerExecutor:
             command=command,
             reverse_request_handler=on_reverse_request,
             notification_handler=on_notification,
+            log_name="opencode acp",
         )
         try:
             await process.start()

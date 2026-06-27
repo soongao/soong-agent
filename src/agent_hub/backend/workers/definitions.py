@@ -55,6 +55,26 @@ DEFAULT_HUB_WORKERS: tuple[WorkerConfigCreate, ...] = (
         },
     ),
     WorkerConfigCreate(
+        worker_id="codex_mcp_worker",
+        name="Codex MCP Worker",
+        description="Delegates tasks to the local Codex MCP server with structured events and Agent Hub permission prompts.",
+        system_prompt=(
+            "You are an external Codex MCP worker. Treat the orchestrator dispatch as the user's request, "
+            "work in the current project, and return the final result clearly. Request permission through the Hub when needed."
+        ),
+        allowed_tools=["codex.mcp"],
+        metadata={
+            "agenthub_default_worker": True,
+            "worker_executor": {
+                "type": "codex_mcp",
+                "config": {
+                    "sandbox": "read-only",
+                    "approval_policy": "on-request",
+                },
+            },
+        },
+    ),
+    WorkerConfigCreate(
         worker_id="codex_pty_worker",
         name="Codex PTY Worker",
         description="Delegates tasks to the local Codex interactive CLI through a reusable PTY session with streamed output.",
