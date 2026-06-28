@@ -1,0 +1,1 @@
+{"id":"sample_weather_0","question":"Use the available function to get the weather in Beijing.","function":[{"name":"get_weather","description":"Get weather by city.","parameters":{"type":"object","properties":{"city":{"type":"string","description":"City name"}},"required":["city"]}}]}
